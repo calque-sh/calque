@@ -1,0 +1,312 @@
+{
+  "version": 1,
+  "wire": {
+    "packages": ["sync.change.v1", "sync.mutation.v1"],
+    "framing": "u32-big-endian-length-prefix",
+    "maximum_frame_payload_bytes": 4194304,
+    "producers": ["rust", "typescript"]
+  },
+  "fixtures": [
+    {
+      "file": "change-request.frame.hex",
+      "bytes": 323,
+      "sha256": "ce9267c43a0c8693df26fb9a9f1e9a6a7f2e6c1605f0476b966b742dcb61bee7",
+      "coverage": [
+        "minimal optional state",
+        "all optional state",
+        "fixed-fence and live-continuation request shapes",
+        "change request upper semantic limits",
+        "revocation-barrier negotiation unset and set",
+        "a live request that asks for a stream"
+      ]
+    },
+    {
+      "file": "change-stream.frame.hex",
+      "bytes": 2066,
+      "sha256": "f17139550aa4d0a44db279f9fd64c9a4e218db01802591809ed151acc6c477c2",
+      "coverage": [
+        "all six ChangeStreamFrame bodies",
+        "all four operation kinds and payloads",
+        "all fourteen ordinary-row CellValue kinds",
+        "all nine nonzero StreamErrorCode values",
+        "present and absent optional batch-start cursors",
+        "body SHA-256 v2 over body tags 10 through 15",
+        "batch-end acknowledgements, frame count and frames digest"
+      ]
+    },
+    {
+      "file": "mutation-request.frame.hex",
+      "bytes": 401,
+      "sha256": "b2f75fb3878a74d13c728c1b9444748b05bafe4f68bff04f4824744da7e0ae57",
+      "coverage": [
+        "minimal required mutation footprint",
+        "full expected-version and row footprint",
+        "unsigned 64-bit value above JavaScript safe integer range"
+      ]
+    },
+    {
+      "file": "mutation-response.frame.hex",
+      "bytes": 402,
+      "sha256": "c2c105232ce3d38a3fac368a79c60b96c44320085a13242daaef4f376cdda727",
+      "coverage": [
+        "all eight nonzero MutationOutcomeCode values",
+        "accepted transaction UUID width",
+        "already-canonical cursor",
+        "full conflict rows and application payload",
+        "retry-after"
+      ]
+    },
+    {
+      "file": "mutation-marker.frame.hex",
+      "bytes": 48,
+      "sha256": "fa9f06cb6ffaac0bd611a2ea5b217a5b7797682e2373b4d35a5fdf0078c03b60",
+      "coverage": [
+        "logical marker",
+        "multiple mutation IDs",
+        "transaction UUID width"
+      ]
+    },
+    {
+      "file": "primary-key.hex",
+      "bytes": 54,
+      "sha256": "d5416984c27ee90a26aab55fa15a601095a4726908477ce40c3e985b01d46d16",
+      "coverage": ["signed integer key", "boolean key", "blob key", "UUID key"]
+    },
+    {
+      "file": "primary-key-text.hex",
+      "bytes": 25,
+      "sha256": "8316a52ade75230f08aa9ae586ae89a250e5004be57100ab51122d493fdaf0db",
+      "coverage": [
+        "composite key with a text part",
+        "multi-byte and astral UTF-8 text key"
+      ]
+    },
+    {
+      "file": "revocation-barrier.frame.hex",
+      "bytes": 611,
+      "sha256": "2bad512f1a712ef18228b3999277038e433659fb1239e8c900f20e17d547b276",
+      "coverage": [
+        "one batch that delivers a transaction, then the ordered barrier, then ends on it",
+        "authenticated Ed25519 barrier over the frozen v1 preimage",
+        "batch end standing exactly on the barrier cursor",
+        "the frame body a pre-change v1 reader must fail closed on"
+      ]
+    }
+  ],
+  "negative_fixtures": [
+    {
+      "file": "duplicate-change-request.frame.hex",
+      "bytes": 100,
+      "sha256": "b07a82c57a8f8ff7ff2ae3e235ea3c047e00d610919c792f34bfa0a449915cd0",
+      "expectation": "semantic validator rejects duplicate table identifiers"
+    },
+    {
+      "file": "exact-limit-change-request.frame.hex",
+      "bytes": 24426,
+      "sha256": "5498665ac2914ae1263088e1016e5cb5ba59455b1b0c20b4b2cdb12dc2c91ed9",
+      "expectation": "semantic validator accepts every populated exact public change-request limit"
+    },
+    {
+      "file": "fragment-gap.frame.hex",
+      "bytes": 295,
+      "sha256": "3006188cf7a228029773d041153cb263527ce8f470e75685f9145b42c01d167e",
+      "expectation": "stream state accepts start then rejects a transaction beginning at fragment one"
+    },
+    {
+      "file": "framing-malformed-protobuf.hex",
+      "bytes": 5,
+      "sha256": "2154d079f27acabc9b54a50fbef22ea3b9c58b11bf625a0636ad423a65dc3660",
+      "expectation": "frame decoder rejects malformed protobuf and becomes poisoned"
+    },
+    {
+      "file": "framing-oversized.hex",
+      "bytes": 4,
+      "sha256": "3b6042b0e6b0b5632ba6d918b08c929cc49cdec5713e4f540c3d171fd2b89347",
+      "expectation": "frame decoder rejects a declared 4 MiB plus one payload before allocation"
+    },
+    {
+      "file": "framing-truncated-prefix.hex",
+      "bytes": 3,
+      "sha256": "709e80c88487a2411e1ee4dfb9f22a861492d20c4765150c0c794abd70f8147c",
+      "expectation": "frame decoder rejects a truncated prefix and becomes poisoned"
+    },
+    {
+      "file": "missing-oneof.frame.hex",
+      "bytes": 41,
+      "sha256": "d413a74bb4c4091ac89783d8b6b4670d7728661e4241c9fb72c0a5b628aa297c",
+      "expectation": "semantic validator rejects a missing required frame body"
+    },
+    {
+      "file": "order-before-start.frame.hex",
+      "bytes": 57,
+      "sha256": "7824d838b5167ea207ebbab17b5ae29e77ad242a1909b5599c55ef94c8d16317",
+      "expectation": "stream state rejects a heartbeat before batch start"
+    },
+    {
+      "file": "over-limit-change-request.frame.hex",
+      "bytes": 24427,
+      "sha256": "bd372f6db8c2dd6a0c257a1aed22d24a06f780f352a6b166123d44d953434cae",
+      "expectation": "semantic validator rejects an 8 KiB plus one change authorization token"
+    },
+    {
+      "file": "primary-key-noncanonical.hex",
+      "bytes": 57,
+      "sha256": "242e8ac60d5a2caf0b542a23dbb97322f432d0884f7c303591203e21a31a8463",
+      "expectation": "primary-key decoder rejects unknown-field noncanonical bytes"
+    },
+    {
+      "file": "primary-key-text-invalid-utf8.hex",
+      "bytes": 11,
+      "sha256": "0a471f40433cd5f5b7ac6515759c2d593c9146bedeb856f4d88593495c3801e4",
+      "expectation": "primary-key decoder rejects a text part that is not UTF-8"
+    },
+    {
+      "file": "revocation-barrier-cross-epoch.frame.hex",
+      "bytes": 379,
+      "sha256": "629bccc623c825d2239de2ad509908a290d0755c6d399e1237613fd5cfb76915",
+      "expectation": "stream state rejects a validly signed barrier retiring another authorization generation"
+    },
+    {
+      "file": "revocation-barrier-duplicated.frame.hex",
+      "bytes": 577,
+      "sha256": "86dbbc317dd65efdd044bcb5946b447e451a0bd6b601f292b8536d570ae87f9e",
+      "expectation": "stream state rejects a second barrier delivered after the first"
+    },
+    {
+      "file": "revocation-barrier-malformed.frame.hex",
+      "bytes": 197,
+      "sha256": "8d4dc40f00cc6c520d18b3e2acd788181cce303cb057b4cdce9fe9335ded6f3a",
+      "expectation": "semantic validator rejects a barrier signature that is not 64 bytes"
+    },
+    {
+      "file": "revocation-barrier-oversized.hex",
+      "bytes": 198,
+      "sha256": "2a00b919296a2e6ed554baf92f5332ca64f7b8b706892dfa07cd990bf105579b",
+      "expectation": "frame decoder rejects a barrier payload declared above the 4 MiB limit before allocating"
+    },
+    {
+      "file": "revocation-barrier-reordered.frame.hex",
+      "bytes": 510,
+      "sha256": "e42aaa1deec3d997b3e47bb54c47b4e1523515ae58d6db05b21b102529df6142",
+      "expectation": "stream state rejects a transaction fragment delivered after the barrier"
+    },
+    {
+      "file": "revocation-barrier-truncated.hex",
+      "bytes": 190,
+      "sha256": "2bed48417304db67ba6efa2878ce26c00ed3cfbc0021db48901bfa5c11db2b7c",
+      "expectation": "frame decoder rejects a barrier frame cut short of its declared payload"
+    },
+    {
+      "file": "unknown-enum.frame.hex",
+      "bytes": 110,
+      "sha256": "666d164ac7df8bc60baca2ddf1d1015bc340bce79999c4c06ed5826f59612496",
+      "expectation": "semantic validator rejects an unknown operation enum"
+    },
+    {
+      "file": "wrong-checksum.frame.hex",
+      "bytes": 57,
+      "sha256": "e38a274871d2b77caf56300834880bd0473e05f134cf5cafa1e17704759be83b",
+      "expectation": "integrity validator rejects a wrong body SHA-256"
+    }
+  ],
+  "negative_recipes": [
+    {
+      "id": "framing",
+      "cases": [
+        "truncated prefix at 1/2/3 bytes",
+        "zero length",
+        "maximum plus one",
+        "truncated payload",
+        "malformed protobuf",
+        "two frames in single-frame decode",
+        "poisoned decoder continuation"
+      ]
+    },
+    {
+      "id": "unknown-semantics",
+      "cases": [
+        "unsupported top-level versions",
+        "missing and unknown required body",
+        "unknown operation/error/null/outcome enums",
+        "missing and mismatched payload oneofs",
+        "missing cursor/value/footprint"
+      ]
+    },
+    {
+      "id": "integrity",
+      "cases": [
+        "digest width 31 and 33",
+        "wrong digest",
+        "body mutation after digest"
+      ]
+    },
+    {
+      "id": "primary-key-canonicality",
+      "cases": [
+        "unknown field",
+        "alternate field order",
+        "duplicate scalar field",
+        "non-minimal varint",
+        "unsupported version",
+        "zero and 33 parts",
+        "8193 bytes",
+        "all disallowed key kinds",
+        "UUID width 15 and 17"
+      ]
+    },
+    {
+      "id": "duplicates",
+      "cases": [
+        "request/start tables",
+        "row columns",
+        "batch-end/marker/outcome mutation IDs",
+        "expected-version keys",
+        "footprint tables and rows"
+      ]
+    },
+    {
+      "id": "stream-order-fragmentation",
+      "cases": [
+        "frame loss, reordering and miscount at batch end",
+        "body before start and duplicate start",
+        "fragment index gap/duplicate",
+        "transaction identity/provenance change",
+        "heartbeat/end interleaving",
+        "open transaction at end",
+        "frame after terminal",
+        "counter/fence/plan/table/generation mismatch"
+      ]
+    },
+    {
+      "id": "exact-public-limits",
+      "cases": [
+        "4 MiB frame",
+        "8 KiB key and 32 parts",
+        "1024 change tables and 256 pending IDs",
+        "1024..16 MiB batch bytes and 1..10000 transactions",
+        "0/1000..120000 long poll",
+        "8 KiB change token",
+        "1024-byte client/device ID",
+        "100 mutations and 1/4 MiB input",
+        "1024 expected versions/rows and 256 footprint tables",
+        "128-byte command/conflict kind and 8 KiB conflict payload"
+      ]
+    },
+    {
+      "id": "revocation-barrier",
+      "cases": [
+        "forged signature",
+        "signature width 63 and 65",
+        "unknown signing key id",
+        "no configured verification key",
+        "replayed and cross-epoch generation",
+        "another scope hash",
+        "reordered delivery after the barrier",
+        "duplicate barrier after the first",
+        "batch end off the barrier cursor",
+        "truncated and oversized barrier frame",
+        "pre-change v1 reader sees an unknown body"
+      ]
+    }
+  ]
+}

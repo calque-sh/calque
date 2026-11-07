@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": []
+  },
+  "include": [
+    "../internal-api.consumer.ts",
+    "../public-api.consumer.ts",
+    "../calque.generated.ts"
+  ]
+}

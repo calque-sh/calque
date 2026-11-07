@@ -1,0 +1,122 @@
+{
+  "name": "@calque/client",
+  "version": "0.1.0",
+  "description": "Calque's browser client: syncs complete, authorized PostgreSQL collections and queries them locally through typed facades.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/calque-sh/calque",
+    "directory": "client/packages/client"
+  },
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js"
+      },
+      "./generated": {
+        "types": "./dist/generated.d.ts",
+        "import": "./dist/generated.js"
+      },
+      "./bootstrap-start": {
+        "types": "./dist/bootstrap-start-entry.d.ts",
+        "import": "./dist/bootstrap-start-entry.js"
+      },
+      "./bootstrap-render": {
+        "types": "./dist/bootstrap-render-entry.d.ts",
+        "import": "./dist/bootstrap-render-entry.js"
+      },
+      "./vite": {
+        "types": "./dist/vite.d.ts",
+        "import": "./dist/vite.js"
+      }
+    }
+  },
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./generated": {
+      "types": "./dist/generated.d.ts",
+      "import": "./dist/generated.js"
+    },
+    "./internal": {
+      "types": "./dist/internal.d.ts",
+      "import": "./dist/internal.js"
+    },
+    "./bootstrap-start": {
+      "types": "./dist/bootstrap-start-entry.d.ts",
+      "import": "./dist/bootstrap-start-entry.js"
+    },
+    "./bootstrap-render": {
+      "types": "./dist/bootstrap-render-entry.d.ts",
+      "import": "./dist/bootstrap-render-entry.js"
+    },
+    "./vite": {
+      "types": "./dist/vite.d.ts",
+      "import": "./dist/vite.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/internal.*"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.vite.json && tsc -p tsconfig.build.json",
+    "api:check": "pnpm build && node --import ../../../scripts/register.mjs ../../../scripts/verify-client-public-api.ts && node --import ../../../scripts/register.mjs ../../../scripts/verify-client-duplicate-package.ts",
+    "duplicate:check": "node --import ../../../scripts/register.mjs ../../../scripts/verify-client-duplicate-package.ts",
+    "consumer:build": "vite build tests/browser-consumer --outDir ../../../../../target/client-browser-consumer --emptyOutDir && pnpm manual:build && pnpm selfhost:build && pnpm serve-mutation:build && pnpm serve-revocation:build && pnpm serve-tenants:build",
+    "consumer:runtime": "node --import ../../../scripts/register.mjs ../../../scripts/verify-client-browser-consumer.ts",
+    "consumer:check": "pnpm consumer:build && pnpm consumer:runtime",
+    "manual:build": "tsc -p tests/demo/tsconfig.json --noEmit && vite build tests/demo",
+    "manual:dev": "vite tests/demo --host 127.0.0.1 --port 5173 --strictPort",
+    "selfhost:build": "tsc -p tests/selfhost-compose/tsconfig.json --noEmit && vite build tests/selfhost-compose",
+    "serve-mutation:build": "tsc -p tests/serve-mutation/tsconfig.json --noEmit && vite build tests/serve-mutation",
+    "serve-revocation:build": "tsc -p tests/serve-revocation/tsconfig.json --noEmit && vite build tests/serve-revocation",
+    "serve-tenants:build": "tsc -p tests/serve-tenants/tsconfig.json --noEmit && vite build tests/serve-tenants",
+    "generate:check": "node --import ../../../scripts/register.mjs ../../../scripts/check-client-generated-schema-fixture.ts",
+    "generate:bindings:check": "pnpm --filter @calque/config build && node --import ../../../scripts/register.mjs ../../../scripts/check-client-bindings-fixture.ts",
+    "format": "prettier --write .",
+    "lint": "eslint . --max-warnings 0 && prettier --check .",
+    "test": "vitest run",
+    "typecheck": "../../../node_modules/.bin/tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.12.1",
+    "@calque/core": "workspace:*",
+    "@calque/protocol": "workspace:*",
+    "@calque/worker": "workspace:*"
+  },
+  "peerDependencies": {
+    "@calque/config": "workspace:^",
+    "vite": "^8.1.4"
+  },
+  "peerDependenciesMeta": {
+    "@calque/config": {
+      "optional": true
+    },
+    "vite": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@calque/config": "workspace:*",
+    "@vitest/browser-playwright": "^4.1.0",
+    "@eslint/js": "^9.31.0",
+    "@types/node": "^24.0.0",
+    "eslint": "^9.31.0",
+    "jiti": "^2.7.0",
+    "playwright": "^1.59.0",
+    "prettier": "^3.6.0",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.38.0",
+    "vite": "8.1.4",
+    "vitest": "^4.1.0"
+  }
+}

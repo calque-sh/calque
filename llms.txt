@@ -1,0 +1,134 @@
+# Calque
+
+> Calque syncs the complete, authorized contents of PostgreSQL 18 tables into the browser, keeps them current through logical replication, and answers the page's queries locally through TypeScript bindings generated from the tables. It is pre-alpha: PostgreSQL 18 is the only source and Chromium-based browsers the only client.
+
+This file walks a coding agent through adding Calque to a web application, from an empty database to a page with a live query. Run the steps in order.
+
+## Before you start
+
+- There is no SQL API and no server-side pagination. The page holds every row of each collection its grant allows, and every query runs locally through `client.db.<collection>`.
+- A collection is one PostgreSQL table with a primary key. `calque inspect` refuses any table or column Calque cannot serve and names the reason; [docs/postgresql.md](docs/postgresql.md) lists the supported types.
+- Every column of an enrolled table reaches the browser. If a table holds anything a user must not read, such as a password hash or an internal note, enroll a projection table that leaves it out.
+- A grant gives a page whole tables, or one tenant's rows of them by a tenant column that leads the primary key. Visibility per user or per team needs a projection table the application maintains.
+- `int8` columns are `bigint` in TypeScript, so a key is `1n`, not `1`, and `sum()` over any integer column is a `bigint`.
+- `query().run()` returns the whole result or rejects with `RESULT_TOO_LARGE`: by default over 1,000 rows or 4 MiB, and at most 10,000 rows and 16 MiB with `run({ maxRows, maxBytes })`. For more, read a window with `window(offset, count)` or subscribe to one.
+- A write shows at once and stays optimistic until its change comes back from PostgreSQL.
+- The page must be bundled, because the client starts module workers. With Vite, use the `calque()` plugin from `@calque/client/vite`.
+- Other browsers, Firefox and Safari among them, get `UNSUPPORTED_BROWSER`.
+
+## 1. PostgreSQL
+
+The database must be PostgreSQL 18 with `wal_level=logical`, a free replication slot and WAL sender for each Calque server, UTF-8, ISO dates, `timezone=UTC` and hex `bytea` output. Calque connects as a role that is not a superuser, has `REPLICATION` and `CREATE` on the database, and owns the tables it serves. `calque inspect` reads the tables through a publication you create. For a database on this machine, write `127.0.0.1` in the connection string: any host name, `localhost` included, needs `sslmode=verify-full&sslrootcert=<absolute path of a CA file>`, as [docs/postgresql.md](docs/postgresql.md#the-database-url) shows. A managed database needs logical replication turned on and its direct endpoint, not a transaction pooler.
+
+As a superuser, in the application's database:
+
+```sql
+CREATE ROLE calque_sync LOGIN PASSWORD 'calque_sync' REPLICATION;
+GRANT CREATE ON DATABASE app TO calque_sync;
+GRANT CREATE, USAGE ON SCHEMA public TO calque_sync;
+```
+
+Then as `calque_sync`, so that it owns the tables (an existing table takes `ALTER TABLE ... OWNER TO calque_sync`):
+
+```sql
+CREATE TABLE tasks (id bigint PRIMARY KEY, title text NOT NULL, done boolean NOT NULL DEFAULT false);
+CREATE PUBLICATION calque_app FOR TABLE public.tasks;
+```
+
+## 2. The server
+
+`calque` is one Rust binary built from the repository. It needs Rust through rustup, a C compiler, and libpq with `pg_config` on `PATH`.
+
+```sh
+git clone https://github.com/calque-sh/calque
+cargo install --locked --path calque/server/apps/calque
+```
+
+## 3. The packages
+
+```sh
+npm install @calque/client @calque/react
+npm install -D @calque/config
+```
+
+`@calque/react` is only for React pages. `@calque/config` renders the typed schema, for the Vite plugin and as `calque-bindings`.
+
+## 4. The typed schema
+
+Every command that connects reads the connection string from `CALQUE_DATABASE_URL`.
+
+```sh
+export CALQUE_DATABASE_URL='postgresql://calque_sync:calque_sync@127.0.0.1:5432/app'
+calque inspect --source primary --publication calque_app --table public.tasks > calque.inspection.json
+calque init --from-inspection calque.inspection.json --application-id my-app
+```
+
+The Vite plugin of step 6 renders `calque.config.json` into `calque.generated.ts` and `calque.start.generated.ts` when `vite` starts, whenever the file changes, and before `vite build`, and writes a file only when its render changes; `calque({ bindings: { config, out } })` names other files. Without Vite, `npx calque-bindings` renders them, and its `--config` and `--out` name other files. After the tables change, run both commands again, with `calque init --force`. `calque-bindings --check` writes nothing and exits 1 when either generated file is out of date, for CI. `calque serve` refuses to start when the tables no longer match `calque.config.json`.
+
+## 5. A development server
+
+`calque dev` enrolls a disposable database and serves it on loopback with a development bearer instead of signed grants. It creates its own publication, replication slot and `calque_control` schema in that database, and writes its endpoint and bearer to `.calque-dev/client.env`. Run it from the application's root, because the Vite plugin reads the nearest `.calque-dev` at or above the page's root:
+
+```sh
+calque dev --table public.tasks \
+  --public-base-url http://127.0.0.1:5173/_calque/ \
+  --acknowledge-disposable-source
+```
+
+It allows the origin `http://127.0.0.1:5173` unless `--allow-origin` names another, and `--public-base-url` is the Vite proxy's address, which every URL it hands the page names. `calque destroy --state-dir .calque-dev --yes` removes what it created.
+
+## 6. The page
+
+```ts
+// vite.config.ts
+import { calque } from "@calque/client/vite";
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  plugins: [calque()],
+  server: { host: "127.0.0.1", port: 5173 },
+});
+```
+
+Under `vite`, the plugin renders the connection into the page and proxies `/_calque/` to `calque dev`, so the page never holds the development bearer:
+
+```ts
+// main.ts
+import { createSyncClient, eq } from "@calque/client";
+import { renderedConnection } from "@calque/client/bootstrap-start";
+import { schema } from "./calque.generated.js";
+
+const { endpoint, bearerToken } = renderedConnection();
+const client = createSyncClient({
+  endpoint,
+  auth: () => ({ bearerToken }),
+  schema,
+});
+
+const open = await client.db.tasks.query().where(eq("done", false)).run();
+
+const live = client.db.tasks.query().orderBy("id").subscribe();
+live.subscribe(() => {
+  const snapshot = live.getSnapshot();
+  if (snapshot.status === "ready") render(snapshot.result);
+});
+
+await client.db.tasks.update({ id: 1n }, { done: true });
+```
+
+In React, put the client in `SyncProvider` and read with `useLiveQuery`; see [client/packages/react/README.md](client/packages/react/README.md).
+
+## 7. Production
+
+`calque serve` replaces `calque dev`. It verifies short-lived grants that the application's backend signs with an Ed25519 key, and mints none. The page's `auth()` returns the grant as `bearerToken`, and the client is created with `grantVerificationKey`, the public half of that signing key, so a revocation empties the page at once. [docs/self-host.md](docs/self-host.md) runs it behind HTTPS from a clean checkout; [spec/dataset-grant-v1.md](spec/dataset-grant-v1.md) defines the grant, and [client/examples/grant-issuer](client/examples/grant-issuer) signs one with `node:crypto`.
+
+## Docs
+
+- [README.md](README.md): what Calque does, what it commits to, and what is missing.
+- [client/packages/client/README.md](client/packages/client/README.md): the grant verification key, starting the load early, and bundling.
+- [client/packages/react/README.md](client/packages/react/README.md): the React hooks.
+- [docs/cli.md](docs/cli.md): every `calque` subcommand, `inspect` and `init` in detail, and the container image.
+- [docs/postgresql.md](docs/postgresql.md): the settings, the role, the tables and the column types Calque needs.
+- [docs/self-host.md](docs/self-host.md): `calque serve` with signed grants behind HTTPS.
+- [docs/design/operations.md](docs/design/operations.md): every server setting, revocation, backup and restore.
+- [client/examples/quickstart](client/examples/quickstart): the smallest page, one live query.

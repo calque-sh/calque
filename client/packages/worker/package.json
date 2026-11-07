@@ -1,0 +1,72 @@
+{
+  "name": "@calque/worker",
+  "version": "0.1.0",
+  "description": "The engine, hasher and decoder Web Workers that @calque/client runs.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/calque-sh/calque",
+    "directory": "client/packages/worker"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "type": "module",
+  "exports": {
+    "./columnar": {
+      "types": "./dist/columnar-worker-client.d.ts",
+      "import": "./dist/columnar-worker-client.js"
+    },
+    "./columnar-worker-entry": {
+      "import": "./dist/columnar-worker-entry.js"
+    },
+    "./columnar-hasher-entry": {
+      "import": "./dist/columnar-hasher-entry.js"
+    },
+    "./columnar-decoder-entry": {
+      "import": "./dist/columnar-decoder-entry.js"
+    },
+    "./columnar-decoder-worker": {
+      "types": "./dist/columnar-decoder-worker.d.ts",
+      "import": "./dist/columnar-decoder-worker.js"
+    },
+    "./brotli-decoder.wasm": "./wasm/brotli-decoder.wasm",
+    "./columnar-live": {
+      "types": "./dist/columnar-live.d.ts",
+      "import": "./dist/columnar-live.js"
+    }
+  },
+  "files": [
+    "dist",
+    "wasm"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "format": "prettier --write .",
+    "lint": "eslint . --max-warnings 0 && prettier --check .",
+    "test": "vitest run",
+    "test:browser": "vitest run --project browser",
+    "test:unit": "vitest run --project unit",
+    "typecheck": "../../../node_modules/.bin/tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.12.1",
+    "@calque/core": "workspace:*",
+    "@calque/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.31.0",
+    "@types/node": "^24.0.0",
+    "@vitest/browser-playwright": "^4.1.0",
+    "eslint": "^9.31.0",
+    "jiti": "^2.7.0",
+    "playwright": "^1.59.0",
+    "prettier": "^3.6.0",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.38.0",
+    "vitest": "^4.1.0"
+  }
+}

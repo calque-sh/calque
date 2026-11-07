@@ -1,0 +1,29 @@
+# The TLS edge of docker-compose.selfhost.yml: every browser request to Calque
+# -- bootstrap, artifacts, the change stream and mutations -- arrives here over
+# HTTPS and is forwarded to `calque serve`, which speaks plaintext HTTP on the
+# composition's own network.
+#
+# CALQUE_PUBLIC_HOST is the only name this site answers. Caddy picks the
+# certificate from it: `localhost`, `*.localhost`, `*.internal` and IP
+# addresses get a certificate from Caddy's own local CA (what `tls internal`
+# would select), and any other name gets one from a public ACME CA, which
+# requires that name's DNS to point at this host and port 443 to be reachable
+# from the internet. The local CA's root is
+# /data/caddy/pki/authorities/local/root.crt, on the `caddy-data` volume; a
+# browser has to trust it before it will talk to the local site.
+{
+	# Caddy would otherwise try to add its local root to this container's own
+	# trust store, which nothing reads.
+	skip_install_trust
+}
+
+{$CALQUE_PUBLIC_HOST} {
+	reverse_proxy calque:8787 {
+		# `calque serve` compares Host byte for byte against --expected-host.
+		# A browser sends the port only when it is not 443, so the public
+		# host is forwarded without it and the comparison has one value on
+		# every port. Caddy has already matched the name to this site, and the
+		# certificate binds it.
+		header_up Host {host}
+	}
+}

@@ -1,0 +1,7 @@
+dist
+coverage
+target
+# Rendered by calque-bindings and pinned byte for byte.
+tests/typed-consumer/calque.generated.ts
+tests/demo/calque.generated.ts
+tests/serve-tenants/calque.generated.ts

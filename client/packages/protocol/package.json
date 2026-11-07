@@ -1,0 +1,59 @@
+{
+  "name": "@calque/protocol",
+  "version": "0.1.0",
+  "description": "Wire framing, validation and generated protobuf messages for Calque's change stream and mutations.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/calque-sh/calque",
+    "directory": "client/packages/protocol"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./generated/change_stream": {
+      "types": "./dist/gen/change_stream_pb.d.ts",
+      "import": "./dist/gen/change_stream_pb.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "compatibility:check": "buf breaking ../../../spec --against ../../../spec/compat/protocol-v1.binpb",
+    "fixtures:check": "node scripts/check-protocol-fixtures.mjs",
+    "format": "prettier --write .",
+    "generate": "buf generate --template buf.gen.yaml && prettier --write src/gen",
+    "generate:check": "node scripts/check-generated.mjs",
+    "lint": "eslint . --max-warnings 0 && prettier --check .",
+    "schema:lint": "buf lint ../../../spec",
+    "test": "vitest run",
+    "typecheck": "../../../node_modules/.bin/tsc -p tsconfig.json --noEmit",
+    "verify:protocol": "pnpm schema:lint && pnpm generate:check && pnpm compatibility:check && pnpm typecheck && pnpm build && pnpm fixtures:check && pnpm lint && pnpm test"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.12.1"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "1.71.0",
+    "@bufbuild/protoc-gen-es": "2.12.1",
+    "@eslint/js": "^9.31.0",
+    "@types/node": "^24.0.0",
+    "eslint": "^9.31.0",
+    "jiti": "^2.7.0",
+    "prettier": "^3.6.0",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.38.0",
+    "vitest": "^4.1.0"
+  }
+}

@@ -1,0 +1,41 @@
+// The verification harness's TypeScript project. `pnpm typecheck:harness`
+// typechecks it with the root `typescript` (7.0.2, the Go-native compiler).
+// `scripts/register.mjs` runs it from source through oxc, which strips types
+// without checking them, so this typecheck is the only one the harness gets.
+//
+// Two compilers are installed. The root `tsc` 7.0.2 also typechecks every
+// client package, through each package's `typecheck` script. Each package's
+// own `tsc` 5.9.x builds it, and typescript-eslint lints it with that same
+// compiler: typescript-eslint 8.64 declares `typescript >=4.8.4 <6.1.0`, and
+// TypeScript 7 does not export the JS API it consumes. A package's own
+// compiler moves to 7 once typescript-eslint supports it.
+//
+// `allowImportingTsExtensions` lets a harness import, which runs straight
+// from source, name the file on disk: `./lib/thing.ts`, not `./lib/thing.js`.
+//
+// `noEmit`: nothing in scripts/** is built, so the harness that runs is the
+// source in the working tree, never an output directory that may be stale.
+//
+// `noUnusedLocals` and `noUnusedParameters` are the only unused-code check
+// scripts/** gets, since no package's eslint run covers it.
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ESNext"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "useUnknownInCatchVariables": true,
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "skipLibCheck": false,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules"]
+}

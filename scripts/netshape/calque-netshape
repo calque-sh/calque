@@ -1,0 +1,181 @@
+#!/bin/sh
+# calque-netshape: shape loopback TCP for the Calque benchmark, and nothing else.
+#
+# Install root:wheel 0755 at /usr/local/libexec/calque-netshape and allow it
+# through one sudoers rule. Everything it changes lives in kernel memory and
+# is gone after a reboot:
+#   - one pf anchor, com.apple/calque-netshape (pf.conf's com.apple/* anchor
+#     points already evaluate it, so no system file is edited);
+#   - two dummynet pipes, 55601 and 55602;
+#   - one pf enable reference, released by `down`.
+#
+#   calque-netshape up <Mbit/s> <RTT ms> <port> [<port> ...]
+#   calque-netshape down
+#   calque-netshape status
+#
+# `up` shapes TCP to and from the listed ports on lo0 only, through one pair of
+# pipes that all the ports share: <Mbit/s> in total each way, half the RTT of
+# delay each way, a drop-tail queue of about one bandwidth-delay product
+# (64 KiB to 1 MiB), and the MSS clamped to 1460 so loopback's 16 KB MTU does
+# not hide TCP slow start. Mbit/s is 1-2000 (dnctl keeps bits/s in a signed
+# int), the RTT an even number of ms from 0 to 1000, and each port 45600-45699,
+# below the ephemeral range so no client socket can draw one, at most eight
+# distinct ports.
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+LC_ALL=C
+export PATH LC_ALL
+umask 077
+
+ANCHOR=com.apple/calque-netshape
+PIPE_TO_PORT=55601
+PIPE_FROM_PORT=55602
+PORT_MIN=45600
+PORT_MAX=45699
+TOKEN_FILE=/var/run/calque-netshape.token
+LOCK_FILE=/var/run/calque-netshape.lock
+
+usage() {
+  echo "usage: calque-netshape up <Mbit/s> <RTT ms> <port>... | down | status" >&2
+  exit 64
+}
+
+# A decimal integer of at most five digits, without sign or leading zero, in [min, max].
+in_range() {
+  case $1 in '' | 0?* | *[!0123456789]*) return 1 ;; esac
+  [ ${#1} -le 5 ] && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
+}
+
+shape_down() {
+  # Loading an empty ruleset replaces only this anchor's rules. Never `-F
+  # states`: the state table is global.
+  printf '' | pfctl -q -a "$ANCHOR" -f - 2>/dev/null || true
+  dnctl -q pipe delete "$PIPE_TO_PORT" "$PIPE_FROM_PORT" 2>/dev/null || true
+  if [ -f "$TOKEN_FILE" ] && [ ! -L "$TOKEN_FILE" ]; then
+    token=$(cat "$TOKEN_FILE")
+    case $token in
+      '' | *[!0123456789]*) ;;
+      *) pfctl -q -X "$token" 2>/dev/null || true ;;
+    esac
+  fi
+  rm -f "$TOKEN_FILE"
+}
+
+[ $# -ge 1 ] || usage
+command=$1
+shift
+
+# One run at a time, so two `up`s cannot interleave rule loads or overwrite
+# each other's enable token and leak a pf reference.
+exec 9>>"$LOCK_FILE"
+lockf -s -t 30 9 || { echo "calque-netshape: another run holds the lock" >&2; exit 75; }
+
+case $command in
+  up)
+    [ $# -ge 3 ] && [ $# -le 10 ] || usage
+    mbit=$1
+    rtt=$2
+    shift 2
+    in_range "$mbit" 1 2000 || { echo "calque-netshape: Mbit/s must be 1-2000" >&2; exit 64; }
+    in_range "$rtt" 0 1000 && [ $((rtt % 2)) -eq 0 ] ||
+      { echo "calque-netshape: RTT must be an even number of ms, 0-1000" >&2; exit 64; }
+    # A port listed twice matches two dummynet rules, and pf re-evaluates a
+    # packet past its first match when dummynet hands it back, so it would be
+    # delayed twice.
+    seen=" "
+    for port in "$@"; do
+      in_range "$port" "$PORT_MIN" "$PORT_MAX" ||
+        { echo "calque-netshape: port $port is outside $PORT_MIN-$PORT_MAX" >&2; exit 64; }
+      case $seen in *" $port "*) echo "calque-netshape: port $port is listed twice" >&2; exit 64 ;; esac
+      seen="$seen$port "
+    done
+    for range in first hifirst; do
+      [ "$PORT_MAX" -lt "$(sysctl -n "net.inet.ip.portrange.$range")" ] ||
+        { echo "calque-netshape: ports $PORT_MIN-$PORT_MAX overlap net.inet.ip.portrange.$range" >&2; exit 1; }
+    done
+
+    shape_down
+    delay=$((rtt / 2))
+    # About one bandwidth-delay product (Mbit/s x ms / 8 ~ KiB), so a bulk
+    # transfer cannot add more than about one RTT of queueing delay.
+    queue_kb=$((mbit * rtt / 8))
+    [ "$queue_kb" -ge 64 ] || queue_kb=64
+    [ "$queue_kb" -le 1024 ] || queue_kb=1024
+    dnctl -q pipe "$PIPE_TO_PORT" config bw "${mbit}Mbit/s" delay "$delay" queue "${queue_kb}Kbytes"
+    dnctl -q pipe "$PIPE_FROM_PORT" config bw "${mbit}Mbit/s" delay "$delay" queue "${queue_kb}Kbytes"
+
+    # A scrub rule names its port as the exclusive range port-1 >< port+1.
+    # xnu's pf_normalize_tcp hands pf_match_xport the rule's port operator
+    # where the protocol belongs (bsd/net/pf_norm.c:2629 and :2636 at
+    # xnu-12377.121.6), and pf_match_xport compares ports only for a
+    # port-carrying protocol number. `port N` is PF_OP_EQ, 2, read as IGMP:
+    # never compared, so its max-mss reaches every TCP connection on lo0.
+    # `><` is PF_OP_IRG, 1, read as ICMP: compared, and still compared if
+    # Apple fixes the call. Dummynet rules match through pf_match_port and
+    # keep `port N`.
+    rules=""
+    for port in "$@"; do
+      below=$((port - 1))
+      above=$((port + 1))
+      rules="${rules}scrub out on lo0 proto tcp from any to any port $below >< $above max-mss 1460
+scrub out on lo0 proto tcp from any port $below >< $above to any max-mss 1460
+"
+    done
+    for port in "$@"; do
+      rules="${rules}dummynet out quick on lo0 proto tcp from any to any port $port pipe $PIPE_TO_PORT
+dummynet out quick on lo0 proto tcp from any port $port to any pipe $PIPE_FROM_PORT
+"
+    done
+    if ! printf '%s' "$rules" | pfctl -q -a "$ANCHOR" -f -; then
+      shape_down
+      echo "calque-netshape: pf refused the rules; nothing is shaped" >&2
+      exit 1
+    fi
+    # The anchor only takes effect while the main ruleset evaluates
+    # com.apple/*; anything that reloads the main ruleset without those
+    # anchor points turns shaping off without an error.
+    if ! pfctl -s dummynet 2>/dev/null | grep -qF 'dummynet-anchor "com.apple/*"' ||
+      ! pfctl -s rules 2>/dev/null | grep -qF 'scrub-anchor "com.apple/*"'; then
+      shape_down
+      echo "calque-netshape: the main pf ruleset does not evaluate com.apple/*; nothing is shaped" >&2
+      exit 1
+    fi
+    # Read back the scrub rules the kernel holds: one written in any port form
+    # other than `><` would clamp every TCP connection on lo0 (see above).
+    scrub_shape=' on lo0 proto tcp from any (to any port [0123456789]+ >< [0123456789]+|port [0123456789]+ >< [0123456789]+ to any) max-mss 1460 '
+    scrub_rules=$(pfctl -a "$ANCHOR" -s rules 2>/dev/null | grep '^scrub' || true)
+    scrub_total=$(printf '%s\n' "$scrub_rules" | grep -c '^scrub' || true)
+    scrub_ranged=$(printf '%s\n' "$scrub_rules" | grep -Ec "^scrub out$scrub_shape" || true)
+    if [ "$scrub_total" -ne $((2 * $#)) ] || [ "$scrub_ranged" -ne "$scrub_total" ]; then
+      shape_down
+      echo "calque-netshape: pf holds a scrub rule that is not port-scoped; nothing is shaped" >&2
+      exit 1
+    fi
+
+    token=$(pfctl -E 2>&1 | sed -n 's/^Token : \([0-9][0-9]*\)$/\1/p')
+    case $token in
+      '' | *[!0123456789]*)
+        shape_down
+        echo "calque-netshape: pf gave no enable token; nothing is shaped" >&2
+        exit 1
+        ;;
+    esac
+    (set -C && printf '%s\n' "$token" >"$TOKEN_FILE")
+    echo "calque-netshape: ${mbit} Mbit/s, ${rtt} ms RTT, ${queue_kb} KiB queue on lo0 ports $*"
+    ;;
+  down)
+    [ $# -eq 0 ] || usage
+    shape_down
+    echo "calque-netshape: down"
+    ;;
+  status)
+    [ $# -eq 0 ] || usage
+    pfctl -a "$ANCHOR" -s rules 2>/dev/null || true
+    pfctl -a "$ANCHOR" -s dummynet 2>/dev/null || true
+    dnctl pipe show "$PIPE_TO_PORT" "$PIPE_FROM_PORT" 2>/dev/null || true
+    if [ -f "$TOKEN_FILE" ]; then echo "enable token: $(cat "$TOKEN_FILE")"; else echo "enable token: none"; fi
+    ;;
+  *)
+    usage
+    ;;
+esac

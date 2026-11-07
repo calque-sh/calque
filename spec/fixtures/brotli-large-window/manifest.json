@@ -1,0 +1,9 @@
+{
+  "decodedBytes": 16785408,
+  "decodedSha256": "d632742b105e65bb19605812188613968bc26fb2dfac7c58a780626c8898138e",
+  "encodedBytes": 4151,
+  "encodedSha256": "44039a1248a4adaa5ea0ce1aca574776f7f9b04a0138718e226ef2b6f89c43e2",
+  "encoder": "brotli crate 8.0.4",
+  "quality": 11,
+  "windowBits": 25
+}

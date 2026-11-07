@@ -1,0 +1,21 @@
+[package]
+name = "authz"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+canonical-log = { path = "../canonical-log" }
+hex = "0.4.3"
+sha2 = "0.10.9"
+source-control = { path = "../source-control" }
+# The partition router reads the leading part of a canonical primary key.
+sync-protocol = { path = "../sync-protocol" }
+sync-types = { path = "../sync-types" }
+thiserror = "1"
+
+[lints]
+workspace = true

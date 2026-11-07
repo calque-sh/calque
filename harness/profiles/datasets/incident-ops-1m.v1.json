@@ -1,0 +1,557 @@
+{
+  "documentKind": "dataset-profile",
+  "schemaVersion": "calque.benchmark-profile.v1",
+  "id": "dataset.incident-ops-1m.v1",
+  "description": "Deterministic multi-tenant incident-operations workspace with one million rows, realistic skew, text, JSON, relations, and hot recent updates.",
+  "seed": 20260809,
+  "totalRows": 1000000,
+  "artifactFormat": { "name": "calque-direct-columnar", "version": 3 },
+  "tables": [
+    {
+      "name": "events",
+      "rows": 800000,
+      "estimatedSourceBytesPerRow": 240,
+      "primaryKey": ["id"],
+      "columnTypes": [
+        {
+          "column": "id",
+          "postgresqlType": "bigint",
+          "nullable": false,
+          "artifactEncoding": { "kind": "int64" }
+        },
+        {
+          "column": "organization_id",
+          "postgresqlType": "uuid",
+          "nullable": false,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "project_id",
+          "postgresqlType": "uuid",
+          "nullable": false,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "issue_id",
+          "postgresqlType": "uuid",
+          "nullable": true,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "level",
+          "postgresqlType": "text",
+          "nullable": false,
+          "artifactEncoding": {
+            "kind": "dict",
+            "distinctValues": 5,
+            "minimumEntryBytes": 4,
+            "maximumEntryBytes": 7
+          }
+        },
+        {
+          "column": "message",
+          "postgresqlType": "text",
+          "nullable": false,
+          "artifactEncoding": {
+            "kind": "utf8",
+            "minimumValueBytes": 24,
+            "maximumValueBytes": 320
+          }
+        },
+        {
+          "column": "occurred_at",
+          "postgresqlType": "timestamptz",
+          "nullable": false,
+          "artifactEncoding": { "kind": "timestamp" }
+        },
+        {
+          "column": "payload",
+          "postgresqlType": "jsonb",
+          "nullable": false,
+          "artifactEncoding": {
+            "kind": "json",
+            "minimumValueBytes": 16,
+            "maximumValueBytes": 1024,
+            "measurement": "canonical compact JSON UTF-8"
+          }
+        }
+      ],
+      "cardinalities": [
+        { "column": "organization_id", "distinctValues": 100 },
+        { "column": "project_id", "distinctValues": 1000 },
+        { "column": "issue_id", "distinctValues": 85000 },
+        { "column": "level", "distinctValues": 5 }
+      ],
+      "distributions": [
+        {
+          "field": "organization_id",
+          "model": "zipf",
+          "parameters": [{ "name": "exponent", "value": 1.15 }]
+        },
+        {
+          "field": "level",
+          "model": "categorical",
+          "parameters": [
+            {
+              "name": "labels",
+              "value": ["debug", "info", "warning", "error", "fatal"]
+            },
+            { "name": "weights", "value": [0.05, 0.35, 0.25, 0.3, 0.05] }
+          ]
+        },
+        {
+          "field": "message",
+          "model": "bounded-text",
+          "parameters": [
+            { "name": "minimumBytes", "value": 24 },
+            { "name": "maximumBytes", "value": 320 },
+            { "name": "dictionaryEntries", "value": 50000 }
+          ]
+        },
+        {
+          "field": "payload",
+          "model": "json-payload",
+          "parameters": [
+            { "name": "minimumBytes", "value": 16 },
+            { "name": "maximumBytes", "value": 1024 },
+            { "name": "shapeCount", "value": 24 }
+          ]
+        },
+        {
+          "field": "occurred_at",
+          "model": "temporal-clustered",
+          "parameters": [
+            { "name": "historyDays", "value": 90 },
+            { "name": "lastSevenDaysFraction", "value": 0.55 }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "issues",
+      "rows": 100000,
+      "estimatedSourceBytesPerRow": 280,
+      "primaryKey": ["id"],
+      "columnTypes": [
+        {
+          "column": "id",
+          "postgresqlType": "uuid",
+          "nullable": false,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "organization_id",
+          "postgresqlType": "uuid",
+          "nullable": false,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "project_id",
+          "postgresqlType": "uuid",
+          "nullable": false,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "assignee_id",
+          "postgresqlType": "uuid",
+          "nullable": true,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "status",
+          "postgresqlType": "text",
+          "nullable": false,
+          "artifactEncoding": {
+            "kind": "dict",
+            "distinctValues": 5,
+            "minimumEntryBytes": 7,
+            "maximumEntryBytes": 13
+          }
+        },
+        {
+          "column": "priority",
+          "postgresqlType": "integer",
+          "nullable": false,
+          "artifactEncoding": { "kind": "int64" }
+        },
+        {
+          "column": "title",
+          "postgresqlType": "text",
+          "nullable": false,
+          "artifactEncoding": {
+            "kind": "utf8",
+            "minimumValueBytes": 24,
+            "maximumValueBytes": 256
+          }
+        },
+        {
+          "column": "event_count",
+          "postgresqlType": "integer",
+          "nullable": false,
+          "artifactEncoding": { "kind": "int64" }
+        },
+        {
+          "column": "updated_at",
+          "postgresqlType": "timestamptz",
+          "nullable": false,
+          "artifactEncoding": { "kind": "timestamp" }
+        }
+      ],
+      "cardinalities": [
+        { "column": "organization_id", "distinctValues": 100 },
+        { "column": "project_id", "distinctValues": 1000 },
+        { "column": "assignee_id", "distinctValues": 6500 },
+        { "column": "status", "distinctValues": 5 }
+      ],
+      "distributions": [
+        {
+          "field": "status",
+          "model": "categorical",
+          "parameters": [
+            {
+              "name": "labels",
+              "value": [
+                "unresolved",
+                "investigating",
+                "resolved",
+                "ignored",
+                "archived"
+              ]
+            },
+            { "name": "weights", "value": [0.18, 0.07, 0.5, 0.1, 0.15] }
+          ]
+        },
+        {
+          "field": "event_count",
+          "model": "lognormal",
+          "parameters": [
+            { "name": "median", "value": 5 },
+            { "name": "p99", "value": 2000 }
+          ]
+        },
+        {
+          "field": "title",
+          "model": "bounded-text",
+          "parameters": [
+            { "name": "minimumBytes", "value": 24 },
+            { "name": "maximumBytes", "value": 256 },
+            { "name": "dictionaryEntries", "value": 25000 }
+          ]
+        },
+        {
+          "field": "assignee_id",
+          "model": "nullable",
+          "parameters": [{ "name": "nullFraction", "value": 0.3 }]
+        },
+        {
+          "field": "updated_at",
+          "model": "temporal-clustered",
+          "parameters": [
+            { "name": "historyDays", "value": 365 },
+            { "name": "lastSevenDaysFraction", "value": 0.4 }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "comments",
+      "rows": 60000,
+      "estimatedSourceBytesPerRow": 360,
+      "primaryKey": ["id"],
+      "columnTypes": [
+        {
+          "column": "id",
+          "postgresqlType": "uuid",
+          "nullable": false,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "issue_id",
+          "postgresqlType": "uuid",
+          "nullable": false,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "author_id",
+          "postgresqlType": "uuid",
+          "nullable": false,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "body",
+          "postgresqlType": "text",
+          "nullable": false,
+          "artifactEncoding": {
+            "kind": "utf8",
+            "minimumValueBytes": 4,
+            "maximumValueBytes": 2048
+          }
+        },
+        {
+          "column": "created_at",
+          "postgresqlType": "timestamptz",
+          "nullable": false,
+          "artifactEncoding": { "kind": "timestamp" }
+        }
+      ],
+      "cardinalities": [
+        { "column": "issue_id", "distinctValues": 30000 },
+        { "column": "author_id", "distinctValues": 6000 }
+      ],
+      "distributions": [
+        {
+          "field": "issue_id",
+          "model": "zipf",
+          "parameters": [{ "name": "exponent", "value": 1.1 }]
+        },
+        {
+          "field": "body",
+          "model": "bounded-text",
+          "parameters": [
+            { "name": "minimumBytes", "value": 4 },
+            { "name": "maximumBytes", "value": 2048 },
+            { "name": "medianBytes", "value": 180 },
+            { "name": "dictionaryEntries", "value": 30000 }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "issue_tags",
+      "rows": 20000,
+      "estimatedSourceBytesPerRow": 40,
+      "primaryKey": ["issue_id", "tag"],
+      "columnTypes": [
+        {
+          "column": "issue_id",
+          "postgresqlType": "uuid",
+          "nullable": false,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "tag",
+          "postgresqlType": "text",
+          "nullable": false,
+          "artifactEncoding": {
+            "kind": "dict",
+            "distinctValues": 200,
+            "minimumEntryBytes": 1,
+            "maximumEntryBytes": 64
+          }
+        }
+      ],
+      "cardinalities": [
+        { "column": "issue_id", "distinctValues": 12000 },
+        { "column": "tag", "distinctValues": 200 }
+      ],
+      "distributions": [
+        {
+          "field": "tag",
+          "model": "zipf",
+          "parameters": [{ "name": "exponent", "value": 1.2 }]
+        }
+      ]
+    },
+    {
+      "name": "users",
+      "rows": 8000,
+      "estimatedSourceBytesPerRow": 160,
+      "primaryKey": ["id"],
+      "columnTypes": [
+        {
+          "column": "id",
+          "postgresqlType": "uuid",
+          "nullable": false,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "display_name",
+          "postgresqlType": "text",
+          "nullable": false,
+          "artifactEncoding": {
+            "kind": "utf8",
+            "minimumValueBytes": 1,
+            "maximumValueBytes": 128
+          }
+        },
+        {
+          "column": "email",
+          "postgresqlType": "text",
+          "nullable": false,
+          "artifactEncoding": {
+            "kind": "utf8",
+            "minimumValueBytes": 6,
+            "maximumValueBytes": 254
+          }
+        },
+        {
+          "column": "active",
+          "postgresqlType": "boolean",
+          "nullable": false,
+          "artifactEncoding": { "kind": "bool" }
+        }
+      ],
+      "cardinalities": [
+        { "column": "id", "distinctValues": 8000 },
+        { "column": "active", "distinctValues": 2 }
+      ],
+      "distributions": [
+        {
+          "field": "active",
+          "model": "categorical",
+          "parameters": [
+            { "name": "labels", "value": [true, false] },
+            { "name": "weights", "value": [0.94, 0.06] }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "projects",
+      "rows": 1000,
+      "estimatedSourceBytesPerRow": 180,
+      "primaryKey": ["id"],
+      "columnTypes": [
+        {
+          "column": "id",
+          "postgresqlType": "uuid",
+          "nullable": false,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "organization_id",
+          "postgresqlType": "uuid",
+          "nullable": false,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "slug",
+          "postgresqlType": "text",
+          "nullable": false,
+          "artifactEncoding": {
+            "kind": "utf8",
+            "minimumValueBytes": 1,
+            "maximumValueBytes": 63
+          }
+        },
+        {
+          "column": "name",
+          "postgresqlType": "text",
+          "nullable": false,
+          "artifactEncoding": {
+            "kind": "utf8",
+            "minimumValueBytes": 1,
+            "maximumValueBytes": 128
+          }
+        }
+      ],
+      "cardinalities": [
+        { "column": "id", "distinctValues": 1000 },
+        { "column": "organization_id", "distinctValues": 100 }
+      ],
+      "distributions": [
+        {
+          "field": "organization_id",
+          "model": "zipf",
+          "parameters": [{ "name": "exponent", "value": 1.15 }]
+        }
+      ]
+    },
+    {
+      "name": "memberships",
+      "rows": 11000,
+      "estimatedSourceBytesPerRow": 72,
+      "primaryKey": ["organization_id", "user_id"],
+      "columnTypes": [
+        {
+          "column": "organization_id",
+          "postgresqlType": "uuid",
+          "nullable": false,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "user_id",
+          "postgresqlType": "uuid",
+          "nullable": false,
+          "artifactEncoding": { "kind": "uuid" }
+        },
+        {
+          "column": "role",
+          "postgresqlType": "text",
+          "nullable": false,
+          "artifactEncoding": {
+            "kind": "dict",
+            "distinctValues": 4,
+            "minimumEntryBytes": 5,
+            "maximumEntryBytes": 6
+          }
+        }
+      ],
+      "cardinalities": [
+        { "column": "organization_id", "distinctValues": 100 },
+        { "column": "user_id", "distinctValues": 8000 },
+        { "column": "role", "distinctValues": 4 }
+      ],
+      "distributions": [
+        {
+          "field": "role",
+          "model": "categorical",
+          "parameters": [
+            {
+              "name": "labels",
+              "value": ["viewer", "member", "admin", "owner"]
+            },
+            { "name": "weights", "value": [0.25, 0.62, 0.11, 0.02] }
+          ]
+        }
+      ]
+    }
+  ],
+  "relationships": [
+    { "from": "events.project_id", "to": "projects.id", "kind": "many-to-one" },
+    { "from": "events.issue_id", "to": "issues.id", "kind": "many-to-one" },
+    { "from": "issues.project_id", "to": "projects.id", "kind": "many-to-one" },
+    { "from": "issues.assignee_id", "to": "users.id", "kind": "many-to-one" },
+    { "from": "comments.issue_id", "to": "issues.id", "kind": "many-to-one" },
+    { "from": "comments.author_id", "to": "users.id", "kind": "many-to-one" },
+    {
+      "from": "issue_tags.issue_id",
+      "to": "issues.id",
+      "kind": "many-to-many-projection"
+    },
+    {
+      "from": "memberships.user_id",
+      "to": "users.id",
+      "kind": "many-to-many-projection"
+    }
+  ],
+  "globalDistributions": [
+    {
+      "field": "tenant_size",
+      "model": "zipf",
+      "parameters": [
+        { "name": "exponent", "value": 1.15 },
+        { "name": "largestTenantRowFraction", "value": 0.12 }
+      ]
+    },
+    {
+      "field": "cross_table_time",
+      "model": "correlated",
+      "parameters": [
+        { "name": "correlation", "value": "events-comments-issue-updates" }
+      ]
+    }
+  ],
+  "updateLocality": {
+    "hotRowFraction": 0.05,
+    "hotRowTrafficFraction": 0.8,
+    "recentWindowHours": 24,
+    "recentWindowTrafficFraction": 0.7,
+    "sameTenantTransactionFraction": 0.98
+  },
+  "workloadMix": {
+    "insertFraction": 0.35,
+    "updateFraction": 0.6,
+    "deleteFraction": 0.05
+  }
+}

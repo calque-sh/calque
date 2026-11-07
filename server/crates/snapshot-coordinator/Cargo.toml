@@ -1,0 +1,31 @@
+[package]
+name = "snapshot-coordinator"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+canonical-log = { path = "../canonical-log" }
+pg_walstream = { version = "0.8.0", default-features = false, features = ["std", "libpq"] }
+pgoutput-decoder = { path = "../pgoutput-decoder" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+source-control = { path = "../source-control" }
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio-postgres = { version = "0.7.18", features = ["with-uuid-1"] }
+sync-types = { path = "../sync-types" }
+uuid = { version = "1.18.1", features = ["v4"] }
+
+[dev-dependencies]
+canonical-log = { path = "../canonical-log", features = ["test-support"] }
+futures-util = "0.3"
+postgres = "0.19.14"
+tempfile = "3"
+tokio-util = "0.7"
+
+[lints]
+workspace = true

@@ -1,0 +1,56 @@
+{
+  "application": { "id": "incident-ops", "version": "1.0.0" },
+  "protocol": {
+    "manifest": 1,
+    "artifact": 1,
+    "changeStream": 1,
+    "mutation": 1
+  },
+  "sources": [
+    {
+      "id": "primary",
+      "connectionEnv": "INCIDENT_DATABASE_URL",
+      "publication": "calque_incident",
+      "slot": "calque_incident_slot"
+    }
+  ],
+  "scopes": [
+    {
+      "id": "organization",
+      "source": "primary",
+      "kind": "source-wide",
+      "dataVersion": 1
+    }
+  ],
+  "collections": [
+    {
+      "id": "issues",
+      "source": "primary",
+      "kind": "table",
+      "relation": { "schema": "public", "table": "issues" },
+      "columns": [
+        { "name": "id", "postgresType": "uuid", "nullable": false },
+        {
+          "name": "organization_id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        { "name": "title", "postgresType": "text", "nullable": false },
+        { "name": "status", "postgresType": "text", "nullable": false }
+      ],
+      "primaryKey": ["id"],
+      "scope": "organization",
+      "adapter": "direct-columnar",
+      "encoding": "calque-columnar"
+    }
+  ],
+  "commands": [
+    {
+      "id": "edit-issue",
+      "kind": "crud",
+      "collection": "issues",
+      "operations": ["update", "delete"],
+      "writableColumns": ["status", "title"]
+    }
+  ]
+}

@@ -1,0 +1,410 @@
+{
+  "schemaVersion": "calque.pg-inspection.v1",
+  "serverMajor": 18,
+  "source": "local",
+  "publication": "calque_incidents",
+  "schemaFingerprint": "sha256:bb442ceda069e383e040551682d7dd1d5c67b41e10020ae2647831418b4d54ef",
+  "relations": [
+    {
+      "schema": "incidents",
+      "table": "comments",
+      "replicaIdentity": "default",
+      "columns": [
+        {
+          "name": "id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "issue_id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "author_id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "body",
+          "typeSchema": "pg_catalog",
+          "typeName": "text",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "created_at",
+          "typeSchema": "pg_catalog",
+          "typeName": "timestamptz",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "bench_index",
+          "typeSchema": "pg_catalog",
+          "typeName": "int8",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "is_sentinel",
+          "typeSchema": "pg_catalog",
+          "typeName": "bool",
+          "nullable": false,
+          "generated": false
+        }
+      ]
+    },
+    {
+      "schema": "incidents",
+      "table": "events",
+      "replicaIdentity": "default",
+      "columns": [
+        {
+          "name": "id",
+          "typeSchema": "pg_catalog",
+          "typeName": "int8",
+          "nullable": false,
+          "generated": false,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "organization_id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "project_id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "issue_id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": true,
+          "generated": false
+        },
+        {
+          "name": "level",
+          "typeSchema": "pg_catalog",
+          "typeName": "text",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "message",
+          "typeSchema": "pg_catalog",
+          "typeName": "text",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "occurred_at",
+          "typeSchema": "pg_catalog",
+          "typeName": "timestamptz",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "payload",
+          "typeSchema": "pg_catalog",
+          "typeName": "jsonb",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "bench_index",
+          "typeSchema": "pg_catalog",
+          "typeName": "int8",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "is_sentinel",
+          "typeSchema": "pg_catalog",
+          "typeName": "bool",
+          "nullable": false,
+          "generated": false
+        }
+      ]
+    },
+    {
+      "schema": "incidents",
+      "table": "issue_tags",
+      "replicaIdentity": "default",
+      "columns": [
+        {
+          "name": "issue_id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "tag",
+          "typeSchema": "pg_catalog",
+          "typeName": "text",
+          "nullable": false,
+          "generated": false,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "bench_index",
+          "typeSchema": "pg_catalog",
+          "typeName": "int8",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "is_sentinel",
+          "typeSchema": "pg_catalog",
+          "typeName": "bool",
+          "nullable": false,
+          "generated": false
+        }
+      ]
+    },
+    {
+      "schema": "incidents",
+      "table": "issues",
+      "replicaIdentity": "default",
+      "columns": [
+        {
+          "name": "id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "organization_id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "project_id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "assignee_id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": true,
+          "generated": false
+        },
+        {
+          "name": "status",
+          "typeSchema": "pg_catalog",
+          "typeName": "text",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "priority",
+          "typeSchema": "pg_catalog",
+          "typeName": "int4",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "title",
+          "typeSchema": "pg_catalog",
+          "typeName": "text",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "event_count",
+          "typeSchema": "pg_catalog",
+          "typeName": "int4",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "updated_at",
+          "typeSchema": "pg_catalog",
+          "typeName": "timestamptz",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "bench_index",
+          "typeSchema": "pg_catalog",
+          "typeName": "int8",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "is_sentinel",
+          "typeSchema": "pg_catalog",
+          "typeName": "bool",
+          "nullable": false,
+          "generated": false
+        }
+      ]
+    },
+    {
+      "schema": "incidents",
+      "table": "memberships",
+      "replicaIdentity": "default",
+      "columns": [
+        {
+          "name": "organization_id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "user_id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "role",
+          "typeSchema": "pg_catalog",
+          "typeName": "text",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "bench_index",
+          "typeSchema": "pg_catalog",
+          "typeName": "int8",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "is_sentinel",
+          "typeSchema": "pg_catalog",
+          "typeName": "bool",
+          "nullable": false,
+          "generated": false
+        }
+      ]
+    },
+    {
+      "schema": "incidents",
+      "table": "projects",
+      "replicaIdentity": "default",
+      "columns": [
+        {
+          "name": "id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "organization_id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "slug",
+          "typeSchema": "pg_catalog",
+          "typeName": "text",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "name",
+          "typeSchema": "pg_catalog",
+          "typeName": "text",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "bench_index",
+          "typeSchema": "pg_catalog",
+          "typeName": "int8",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "is_sentinel",
+          "typeSchema": "pg_catalog",
+          "typeName": "bool",
+          "nullable": false,
+          "generated": false
+        }
+      ]
+    },
+    {
+      "schema": "incidents",
+      "table": "users",
+      "replicaIdentity": "default",
+      "columns": [
+        {
+          "name": "id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "display_name",
+          "typeSchema": "pg_catalog",
+          "typeName": "text",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "email",
+          "typeSchema": "pg_catalog",
+          "typeName": "text",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "active",
+          "typeSchema": "pg_catalog",
+          "typeName": "bool",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "bench_index",
+          "typeSchema": "pg_catalog",
+          "typeName": "int8",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "is_sentinel",
+          "typeSchema": "pg_catalog",
+          "typeName": "bool",
+          "nullable": false,
+          "generated": false
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "calque.pg-inspection.v1",
+  "serverMajor": 18,
+  "source": "primary",
+  "publication": "calque_incident",
+  "schemaFingerprint": "sha256:7cc6bd29a06f54fa38ed821e88483b8d0101073ecc3274219a93f8bcb844eefd",
+  "relations": [
+    {
+      "schema": "public",
+      "table": "issues",
+      "replicaIdentity": "default",
+      "columns": [
+        {
+          "name": "id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "organization_id",
+          "typeSchema": "pg_catalog",
+          "typeName": "uuid",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "status",
+          "typeSchema": "pg_catalog",
+          "typeName": "text",
+          "nullable": false,
+          "generated": false
+        },
+        {
+          "name": "title",
+          "typeSchema": "pg_catalog",
+          "typeName": "text",
+          "nullable": false,
+          "generated": false
+        }
+      ]
+    }
+  ]
+}

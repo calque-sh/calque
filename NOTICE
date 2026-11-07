@@ -1,0 +1,15 @@
+Calque
+Copyright 2026 Yahya Jirari
+
+Calque is licensed under the Apache License 2.0 (LICENSE).
+
+vendor/pg-walstream is a vendored copy of pg-walstream, copyright its authors,
+licensed under the BSD 3-Clause License (vendor/pg-walstream/LICENSE).
+
+vendor/tokio-postgres is a vendored copy of tokio-postgres, copyright its
+authors, licensed under the MIT License (vendor/tokio-postgres/LICENSE-MIT) or
+the Apache License 2.0 (vendor/tokio-postgres/LICENSE-APACHE).
+
+client/packages/worker/wasm/brotli-decoder.wasm is built from the decoder of
+Brotli 1.2.0, copyright the Brotli Authors, licensed under the MIT License
+(client/packages/worker/wasm/BROTLI-LICENSE).

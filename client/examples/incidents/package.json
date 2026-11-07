@@ -1,0 +1,52 @@
+{
+  "name": "@calque/incidents",
+  "version": "0.1.0",
+  "description": "Example incident-operations application built on @calque/client and @calque/react.",
+  "license": "Apache-2.0",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/calque-sh/calque",
+    "directory": "client/examples/incidents"
+  },
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "build:harness": "vite build --mode harness",
+    "dev": "vite",
+    "format": "prettier --write .",
+    "lint": "eslint . --max-warnings 0 && prettier --check .",
+    "preview": "vite preview",
+    "generate:bindings:check": "calque-bindings --out src/calque.generated.ts --check",
+    "test": "vitest run",
+    "typecheck": "../../../node_modules/.bin/tsc --noEmit"
+  },
+  "dependencies": {
+    "@calque/client": "workspace:*",
+    "@calque/react": "workspace:*",
+    "@glideapps/glide-data-grid": "6.0.3",
+    "lodash": "4.17.23",
+    "marked": "4.3.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "react-responsive-carousel": "3.2.23"
+  },
+  "devDependencies": {
+    "@calque/config": "workspace:*",
+    "@eslint/js": "^9.31.0",
+    "@types/node": "^24.0.0",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.1.1",
+    "eslint": "^9.31.0",
+    "jiti": "^2.7.0",
+    "prettier": "^3.6.0",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.38.0",
+    "vite": "8.1.4",
+    "vitest": "4.1.10"
+  }
+}

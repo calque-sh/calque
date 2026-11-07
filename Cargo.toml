@@ -1,0 +1,81 @@
+[workspace]
+members = [
+  "server/apps/calque",
+  "server/crates/artifact-contract",
+  "server/crates/artifact-catalog",
+  "server/crates/authz",
+  "server/crates/background-thread",
+  "server/crates/blob-store",
+  "server/crates/bootstrap-api",
+  "server/crates/bootstrap-http",
+  "server/crates/canonical-log",
+  "server/crates/change-api",
+  "server/crates/dataset-grant",
+  "server/crates/dataset-grant-issuer",
+  "server/crates/http-headers",
+  "server/crates/change-http",
+  "server/crates/calque-engine",
+  "server/crates/cdc-ingest",
+  "server/crates/direct-columnar",
+  "server/crates/mutation-api",
+  "server/crates/mutation-crud",
+  "server/crates/mutation-http",
+  "server/crates/pgoutput-decoder",
+  "server/crates/postgres-connect",
+  "server/crates/snapshot-builder",
+  "server/crates/snapshot-coordinator",
+  "server/crates/snapshot-pipeline",
+  "server/crates/sync-protocol",
+  "server/crates/sync-types",
+  "server/crates/source-control",
+  "server/crates/source-runtime",
+]
+resolver = "2"
+exclude = ["vendor/pg-walstream", "vendor/tokio-postgres"]
+
+[patch.crates-io]
+pg_walstream = { path = "vendor/pg-walstream" }
+tokio-postgres = { path = "vendor/tokio-postgres" }
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+repository = "https://github.com/calque-sh/calque"
+rust-version = "1.97"
+
+[workspace.dependencies]
+# One exact version. The packer chooses its columns with this
+# crate's quality-9 encoder, whose cost model is floating point, so another
+# version can pack one artifact into another body. A bump regenerates
+# spec/fixtures/packed-artifact, spec/fixtures/brotli-large-window and
+# spec/fixtures/packed-brotli-large-window.
+brotli = "=8.0.4"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# Dev and test builds keep only the line tables a backtrace needs, and no
+# incremental cache, which keeps a fresh checkout's build small and fast.
+# CARGO_INCREMENTAL=1 turns the cache back on.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.dev.package."*"]
+debug = false
+
+# The dependencies that hash and compress build optimized in dev and test
+# builds; everything else stays at opt-level 0. Otherwise a test that pushes
+# megabytes through SHA-256, brotli or zstd runs them at debug speed.
+[profile.dev.package.sha2]
+opt-level = 2
+
+[profile.dev.package.brotli]
+opt-level = 2
+
+[profile.dev.package.brotli-decompressor]
+opt-level = 2
+
+[profile.dev.package.zstd-sys]
+opt-level = 2

@@ -1,0 +1,200 @@
+name: Publish
+
+# Publishes the @calque packages to npm and the `calque` container image to
+# GitHub's registry, by hand, from main. npm trusts this file through trusted
+# publishing: the job's OIDC identity proves the run is this workflow in the
+# npm environment, so no npm token is stored, and npm attaches provenance to
+# each version. The image jobs sign in to ghcr.io with the run's GITHUB_TOKEN.
+# Unticked, the run builds, checks and dry-runs every package, builds the
+# image for both platforms, and uploads nothing.
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Upload to npm and push the image to ghcr.io
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to npm
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      # No dependency cache: a release builds from a fresh install. The npm
+      # that ships with .nvmrc's Node (11.19) signs in through OIDC, which
+      # needs 11.5.1 or later.
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Publish
+        env:
+          UPLOAD: ${{ inputs.publish }}
+        run: |
+          if [ "$UPLOAD" = true ]; then
+            pnpm publish:packages --publish
+          else
+            pnpm publish:packages
+          fi
+
+  # One native build per platform: the Rust build of the release binary takes
+  # far too long under emulation. A platform's image is pushed by digest, and
+  # `image-manifest` joins the digests under the release tags.
+  image:
+    name: Build image (${{ matrix.platform }})
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/calque-sh/calque
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The tag is the version the npm packages carry, and the binary inside
+      # reports its own Cargo version, so the two have to agree.
+      - name: Read the release version
+        id: version
+        run: |
+          version=$(jq -r .version client/packages/client/package.json)
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' server/apps/calque/Cargo.toml | head -n 1)
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::@calque/client carries no release version: $version"
+            exit 1
+          fi
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::npm packages are at $version, the calque binary at $cargo_version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        if: inputs.publish
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # BuildKit attaches a provenance attestation and an SBOM to the image.
+      # The source label links the package to this repository, so it takes the
+      # repository's visibility and permissions.
+      - name: Build
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ inputs.publish }}
+
+      - name: Export the digest
+        if: inputs.publish
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload the digest
+        if: inputs.publish
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digests-${{ matrix.runner }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Tags the platform images once npm has the packages: the image is published
+  # alongside them, never ahead of them.
+  image-manifest:
+    name: Tag image
+    if: github.ref == 'refs/heads/main' && inputs.publish
+    needs: [publish, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/calque-sh/calque
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag the image
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          version=$(jq -r .version "$GITHUB_WORKSPACE/client/packages/client/package.json")
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            --tag "$IMAGE:$version" \
+            --tag "$IMAGE:latest" \
+            $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:$version"
+          docker run --rm "$IMAGE:$version" --version

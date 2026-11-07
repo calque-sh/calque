@@ -1,0 +1,108 @@
+{
+  "protocolVersion": 1,
+  "artifactId": "artifact_01JZCOLUMNAR",
+  "createdAt": "2026-07-12T12:00:00Z",
+  "decoded": {
+    "objectId": "sha256:4c10a234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+    "sha256": "4c10a234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+    "bytes": 24746441,
+    "mediaType": "application/vnd.calque.direct-columnar.v4",
+    "format": "directColumnar",
+    "schemaHash": "sha256:578eee00171f1dbe61e18e10be0acafe8335b630f77639cc0916a5b678e36737",
+    "collectionSetHash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "formatVersion": 4,
+    "identity": {
+      "manifestVersion": "manifest_01JZCOLUMNAR",
+      "authorizationScopeVersion": "authorization-generation-9"
+    },
+    "schema": {
+      "format": "calque-direct-columnar",
+      "version": 4,
+      "tables": [
+        {
+          "name": "tasks",
+          "primaryKey": ["id"],
+          "columns": [
+            { "name": "id", "type": "int64", "nullable": false },
+            { "name": "title", "type": "utf8", "nullable": true },
+            { "name": "status", "type": "dict", "nullable": false },
+            { "name": "updated_at", "type": "timestamp", "nullable": false }
+          ]
+        }
+      ]
+    },
+    "chunks": {
+      "bytes": 4194304,
+      "sha256": [
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+      ]
+    }
+  },
+  "pit": {
+    "sourceEpoch": "source_42/epoch_7",
+    "snapshotCursor": "cursor-v1:source_42/epoch_7/9182721",
+    "copyConsistentLsn": "3A2/4B000000",
+    "cutMessageLsn": "3A2/57A91B20",
+    "cutMarkerId": "snapshot_build_01JZPITEXAMPLE"
+  },
+  "compatibility": {
+    "publicationGeneration": 4,
+    "schemaGeneration": 18,
+    "authorizationGeneration": 9,
+    "authorizationPolicyHash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "authorizationScopeHash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "tableSetHash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "shardProfileHash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "indexProfileHash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    "typeCodecGeneration": 3,
+    "collationGeneration": 1
+  },
+  "tables": [
+    {
+      "tableId": "table/tasks",
+      "sourceSchema": "public",
+      "sourceTable": "tasks",
+      "localSchema": "main",
+      "localTable": "tasks",
+      "schemaHash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "columnProfileHash": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+      "rowCount": 1827304,
+      "primaryKeyCodec": "pk-v1/protobuf",
+      "columns": [
+        { "columnId": 1, "name": "id" },
+        { "columnId": 2, "name": "title" },
+        { "columnId": 3, "name": "status" },
+        { "columnId": 4, "name": "updated_at" }
+      ]
+    }
+  ],
+  "representations": [
+    {
+      "representationId": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "objectId": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "encoding": "zstd",
+      "encodedSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "encodedBytes": 6729101,
+      "zstd": {
+        "level": 3,
+        "windowLog": 23
+      }
+    },
+    {
+      "representationId": "sha256:4c10a234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+      "objectId": "sha256:4c10a234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+      "encoding": "identity",
+      "encodedSha256": "4c10a234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+      "encodedBytes": 24746441
+    }
+  ],
+  "memory": {
+    "estimatedPeakBytes": 67108864,
+    "recommendedGrowthReserveBytes": 16777216
+  }
+}

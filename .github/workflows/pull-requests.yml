@@ -1,0 +1,32 @@
+name: Pull requests
+
+# Calque takes issues, not pull requests (CONTRIBUTING.md). This closes a pull
+# request from anyone without write access. `pull_request_target` runs this
+# file as it is on main, with a token that can comment; it never checks out
+# or runs the pull request's code.
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    if: >-
+      !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+      github.event.pull_request.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Close with a pointer to issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: >-
+          gh pr close "$NUMBER" --repo "$REPOSITORY" --comment
+          "Thank you for this. Calque does not take pull requests yet, so
+          this one is closed without review. Please open an issue that
+          describes the problem or the change instead: CONTRIBUTING.md says
+          what helps."

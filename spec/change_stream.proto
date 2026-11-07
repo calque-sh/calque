@@ -1,0 +1,303 @@
+syntax = "proto3";
+
+package sync.change.v1;
+
+// Protocol v1. Existing package, field numbers, wire types, oneof membership,
+// enum values, and meanings change only by a recorded design decision, as the
+// frame envelope did in the pre-alpha. Removed fields and enum values reserve both
+// name and number. Additions are legal only when absence preserves v1
+// semantics. Unknown additive fields are ignored; unknown enums, required
+// oneof alternatives, and protocol versions fail closed.
+// Frames use an unsigned four-byte big-endian length prefix and a 4 MiB default
+// payload limit. Receivers enforce all narrower semantic limits before use.
+
+message Cursor {
+  // Opaque server-issued cursor bytes. Clients compare only for equality and
+  // pass them back to the server. Parsed debug fields must not be trusted.
+  bytes token = 1;
+}
+
+message SourceGeneration {
+  string source_epoch = 1;
+  uint64 publication_generation = 2;
+  uint64 schema_generation = 3;
+  uint64 authorization_generation = 4;
+  bytes authorization_scope_hash = 5; // 32-byte SHA-256
+}
+
+message TableSubscription {
+  string table_id = 1;
+  // Snapshot cursor of this staging shard. Operations at or before this cursor
+  // are skipped only for this shard during bootstrap.
+  optional Cursor shard_snapshot_cursor = 2;
+}
+
+message ChangeRequest {
+  uint32 protocol_version = 1; // must be 1
+  Cursor from_cursor_exclusive = 2;
+  optional Cursor through_cursor_inclusive = 3; // fixed activation fence
+  repeated TableSubscription tables = 4;
+  bytes authorization_scope_token = 5;
+  uint64 max_batch_bytes = 6;
+  uint32 max_transactions = 7;
+  uint32 long_poll_timeout_ms = 8;
+  string client_instance_id = 9;
+  bool accept_transaction_fragmentation = 10;
+  string plan_id = 11;
+  string device_id = 12;
+  repeated string pending_mutation_ids = 13;
+  // Explicit negotiation for the `RevocationBarrier` body. A sender may put a
+  // `revocation_barrier` frame on this stream only when the client set this,
+  // because a reader that does not know that body fails closed on it. A client
+  // that does not set it is still fenced: the server refuses to serve past the
+  // barrier's position and answers with the coarse expired authorization
+  // instead, so absence loses the ordered signal, never the revocation.
+  bool accept_revocation_barrier = 14;
+  // Asks for one open response instead of one batch. Legal only with a
+  // non-zero `long_poll_timeout_ms`, which is then how long the response
+  // stays open. Its body is a sequence of batches, each a complete frame
+  // sequence as a one-batch response carries, each starting where the
+  // previous one ended; the server authorizes each as it would a request of
+  // its own. A live request's stream writes a batch as the canonical head
+  // moves. A fenced request's writes its batches back to back and ends after
+  // the one that reaches `through_cursor_inclusive`. The body ends after a
+  // complete batch. Absence keeps v1's meaning, and a server that ignores the
+  // field answers with one batch, which a streaming reader reads as a stream
+  // that ended.
+  bool stream = 15;
+}
+
+message ChangeStreamFrame {
+  uint32 protocol_version = 1;
+  // A frame carries nothing of the response it travels in, so one encoding of
+  // a transaction is sent to every client of its scope. `BatchStart.stream_id`
+  // and `BatchEnd`'s frame count and frame digest bind a batch's frames to it.
+  reserved 2, 3;
+  reserved "stream_id", "frame_sequence";
+
+  oneof body {
+    BatchStart batch_start = 10;
+    TransactionFragment transaction_fragment = 11;
+    BatchEnd batch_end = 12;
+    Heartbeat heartbeat = 13;
+    StreamError error = 14;
+    // Negotiated: sent only to a request that set
+    // `ChangeRequest.accept_revocation_barrier`.
+    RevocationBarrier revocation_barrier = 15;
+  }
+
+  // Preimage:
+  // "calque.change.body-sha256.v2\\0" || selected body field tag
+  // (u8: 10..15) || body length (u32 BE) || deterministic protobuf
+  // serialization of known body fields only.
+  // The tag byte is the selected body's protobuf field number, so an added
+  // body alternative extends the legal tag set without changing the formula.
+  bytes body_sha256 = 20;
+}
+
+message BatchStart {
+  SourceGeneration generation = 1;
+  Cursor from_cursor_exclusive = 2;
+  optional Cursor requested_fence = 3;
+  repeated string table_ids = 4;
+  uint64 server_time_unix_micros = 5;
+  string plan_id = 6;
+  // Server-authoritative starts bound to the authenticated bootstrap plan.
+  repeated TableSubscription table_starts = 7;
+  // Identifies this batch. Every batch carries a new one.
+  bytes stream_id = 8;
+}
+
+message TransactionFragment {
+  bytes transaction_id = 1;
+  Cursor transaction_cursor = 2;
+  uint32 fragment_index = 3;
+  bool first_fragment = 4;
+  bool final_fragment = 5;
+
+  // PostgreSQL provenance is diagnostic; transaction_cursor is authoritative.
+  uint64 postgres_xid = 6;
+  string begin_lsn = 7;
+  string commit_lsn = 8;
+  uint64 commit_time_unix_micros = 9;
+
+  repeated Operation operations = 10;
+  // Acknowledgements depend on the client, so they travel in its `BatchEnd`.
+  reserved 11;
+  reserved "mutation_ids";
+}
+
+message BatchEnd {
+  // Trustworthy contiguous range covered by this batch, including ranges with
+  // no relevant operations. Must equal the client's next expected cursor.
+  Cursor through_cursor_inclusive = 1;
+  bool reached_requested_fence = 2;
+  bool currently_up_to_date = 3;
+  uint64 relevant_transaction_count = 4;
+  uint64 relevant_operation_count = 5;
+  uint64 server_time_unix_micros = 6;
+  // The request's pending mutation ids that a transaction this batch covers
+  // committed, each once, whether or not that transaction left an operation
+  // this client is sent.
+  repeated string acknowledged_mutation_ids = 7;
+  // How many frames precede this one in the batch, `BatchStart` included.
+  uint64 frame_count = 8;
+  // SHA-256 over "calque.change.batch-frames-sha256.v1\\0" followed by the
+  // `body_sha256` of each of those frames, in order.
+  bytes frames_sha256 = 9;
+}
+
+message Heartbeat {
+  Cursor durable_head = 1;
+  uint64 server_time_unix_micros = 2;
+}
+
+// An ordered, authenticated authorization-revocation barrier.
+//
+// The barrier occupies a position in the stream rather than describing one:
+// every operation a receiver has accepted before this frame is before the
+// barrier, and a v1 sender must place it as the last body before `BatchEnd`,
+// whose `through_cursor_inclusive` must equal `barrier_cursor`. A receiver
+// that sees any other body after a barrier in the same batch must refuse the
+// whole batch, so "before" and "after" are total and no receiver has to
+// reconcile two orders.
+//
+// It is authenticated by the authorization authority that mints dataset
+// grants, not by the change server that carries it, so a change server that
+// does not hold that signing key cannot forge one and a replayed frame cannot
+// move one. `signature` is Ed25519 over REVOCATION_BARRIER_SIGNING_DOMAIN
+// followed by the frozen length-prefixed preimage of every other field; the
+// frame's own `body_sha256` covers the signature in turn.
+message RevocationBarrier {
+  // The canonical position the barrier takes effect at: the durable
+  // authorization-generation fence, in the same opaque cursor space as every
+  // other cursor in this stream.
+  Cursor barrier_cursor = 1;
+  // The authorization generation this barrier retires. A receiver must refuse
+  // a barrier that does not retire the generation it is currently running, so
+  // a replayed barrier is inert.
+  uint64 revoked_authorization_generation = 2;
+  // The generation that replaces it. Must be strictly greater than
+  // `revoked_authorization_generation`.
+  uint64 effective_authorization_generation = 3;
+  // 32-byte SHA-256 authorization scope hash being retired. Must equal the
+  // scope hash the receiver's stream is bound to.
+  bytes revoked_authorization_scope_hash = 4;
+  // A barrier states something true of every plan of its generation and
+  // scope, so it names no plan.
+  reserved 5;
+  reserved "plan_id";
+  // Issuer-unique identity of this barrier, for logs and replay diagnosis.
+  string barrier_id = 6;
+  uint64 issued_at_unix_micros = 7;
+  // Identifier of the Ed25519 key the authorization authority signed with.
+  string signing_key_id = 8;
+  // 64-byte Ed25519 signature over the v2 barrier preimage.
+  bytes signature = 9;
+}
+
+enum StreamErrorCode {
+  STREAM_ERROR_CODE_UNSPECIFIED = 0;
+  CURSOR_EPOCH_MISMATCH = 1;
+  CURSOR_BEFORE_RETENTION = 2;
+  SCHEMA_GENERATION_MISMATCH = 3;
+  AUTHORIZATION_CHANGED = 4;
+  TABLE_SET_INVALID = 5;
+  PROTOCOL_VERSION_UNSUPPORTED = 6;
+  RATE_LIMITED = 7;
+  INTERNAL_RETRYABLE = 8;
+  REQUEST_INVALID = 9;
+  // A row moved between the partitions of a partitioned scope. The plan's
+  // state cannot take the move as a patch, so the client takes a fresh base.
+  PARTITION_MOVED = 10;
+}
+
+message StreamError {
+  StreamErrorCode code = 1;
+  string message = 2;
+  bool resnapshot_required = 3;
+  optional Cursor minimum_retained_cursor = 4;
+  optional Cursor durable_head = 5;
+  uint64 retry_after_ms = 6;
+}
+
+enum OperationKind {
+  OPERATION_KIND_UNSPECIFIED = 0;
+  INSERT_FULL_ROW = 1;
+  UPDATE_PATCH = 2;
+  DELETE_BY_KEY = 3;
+  TRUNCATE_AUTHORIZED_TABLE = 4;
+}
+
+message Operation {
+  string table_id = 1;
+  OperationKind kind = 2;
+  // Canonical serialization of PrimaryKey. Receivers must reject non-canonical
+  // encodings, unsupported codec versions, nulls, duplicate column IDs, and a
+  // part order that differs from the table's schema-generation key order. For
+  // UPDATE_PATCH this identifies the row before the patch; a patch may contain
+  // new values for primary-key columns.
+  bytes primary_key = 3;
+
+  oneof payload {
+    FullRow insert = 10;
+    RowPatch update = 11;
+    Delete delete = 12;
+    Truncate truncate = 13;
+  }
+}
+
+message FullRow {
+  repeated ColumnValue columns = 1;
+}
+
+message RowPatch {
+  // Only changed columns are present. Omitted columns retain their prior value.
+  repeated ColumnValue changed_columns = 1;
+}
+
+message Delete {}
+
+message Truncate {
+  // Legal only when the operation clears the complete local authorized table.
+  // Otherwise the server must normalize to key deletes or force a resnapshot.
+  string reason = 1;
+}
+
+message ColumnValue {
+  uint32 column_id = 1;
+  CellValue value = 2;
+}
+
+// Frozen primary-key codec v1. Protobuf owns the binary grammar; the engine
+// additionally requires known-field decode/re-encode byte equality. Ordered
+// parts preserve composite-key ordinal independently of numeric column IDs.
+// V1 key parts permit only int64_value, text_value, blob_value, bool_value,
+// and uuid_16; ordinary row values retain every CellValue alternative below.
+message PrimaryKey {
+  uint32 codec_version = 1; // must be 1
+  repeated ColumnValue parts = 2;
+}
+
+enum NullValue {
+  NULL_VALUE = 0;
+}
+
+message CellValue {
+  oneof kind {
+    NullValue null_value = 1;
+    sint64 int64_value = 2;
+    uint64 uint64_value = 3;
+    double float64_value = 4;
+    string text_value = 5;
+    bytes blob_value = 6;
+    bool bool_value = 7;
+    string decimal_text = 8;
+    int64 timestamp_unix_micros = 9;
+    bytes uuid_16 = 10;
+    string json_text = 11;
+    string date_iso8601 = 12;
+    string time_iso8601 = 13;
+    string interval_iso8601 = 14;
+  }
+}

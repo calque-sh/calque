@@ -1,0 +1,45 @@
+{
+  "name": "@calque/core",
+  "version": "0.1.0",
+  "description": "The direct-columnar artifact reader and local query engine behind @calque/client.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/calque-sh/calque",
+    "directory": "client/packages/core"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "format": "prettier --write .",
+    "lint": "eslint . --max-warnings 0 && prettier --check .",
+    "measure": "vitest run --config vitest.measure.config.ts",
+    "test": "vitest run",
+    "typecheck": "../../../node_modules/.bin/tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.31.0",
+    "@types/node": "^24.0.0",
+    "eslint": "^9.31.0",
+    "jiti": "^2.7.0",
+    "prettier": "^3.6.0",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.38.0",
+    "vitest": "^4.1.0"
+  }
+}

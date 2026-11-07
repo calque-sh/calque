@@ -1,0 +1,48 @@
+{
+  "name": "@calque/config",
+  "version": "0.1.0",
+  "description": "calque-bindings: renders a Calque configuration into typed @calque/client bindings.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/calque-sh/calque",
+    "directory": "client/packages/config"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "type": "module",
+  "bin": {
+    "calque-bindings": "./bin/calque-bindings.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "bin",
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "format": "prettier --write .",
+    "lint": "eslint . --max-warnings 0 && prettier --check .",
+    "test": "vitest run",
+    "typecheck": "../../../node_modules/.bin/tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.31.0",
+    "@types/node": "^24.0.0",
+    "eslint": "^9.31.0",
+    "jiti": "^2.7.0",
+    "prettier": "^3.6.0",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.38.0",
+    "vitest": "^4.1.0"
+  }
+}

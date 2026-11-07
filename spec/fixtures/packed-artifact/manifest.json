@@ -1,0 +1,80 @@
+{
+  "sizeTestEncoder": "brotli crate 8.0.4",
+  "cases": [
+    {
+      "name": "emit-fixture",
+      "body": "stored",
+      "artifactBytes": 2672,
+      "artifactSha256": "de04ded2d480791d57d16c3322fecf3aeefc109bd118da78645c574a2455eb5c",
+      "packedBytes": 2672,
+      "packedSha256": "de04ded2d480791d57d16c3322fecf3aeefc109bd118da78645c574a2455eb5c",
+      "hoistedParts": 0,
+      "transforms": {
+        "fk": 0,
+        "int": 0,
+        "sep": 0
+      },
+      "escapes": 0
+    },
+    {
+      "name": "emit-key-fixture",
+      "body": "packed",
+      "artifactBytes": 157164,
+      "artifactSha256": "a9a6d1559635b9061c2f130926a79338e006dabcc47d5665e2d8f3c2ca228d0f",
+      "packedBytes": 155480,
+      "packedSha256": "f40a15b5efebee4cd6ba6abec3dcbb3541a22c09787fc1aa6de85e3e51dd8155",
+      "hoistedParts": 0,
+      "transforms": {
+        "fk": 0,
+        "int": 0,
+        "sep": 2
+      },
+      "escapes": 0
+    },
+    {
+      "name": "every-kind",
+      "body": "packed",
+      "artifactBytes": 72714,
+      "artifactSha256": "61cca5e2940d13d63c71c4cc29a25f83501e5f55549e5cdb69febb29683e594a",
+      "packedBytes": 66865,
+      "packedSha256": "7eb604c8bf82b982b203a009222473c8f4bb0e5a39aeb1f41ebde5dea167dd74",
+      "hoistedParts": 2,
+      "transforms": {
+        "fk": 4,
+        "int": 9,
+        "sep": 8
+      },
+      "escapes": 1
+    },
+    {
+      "name": "tables-smallest-first",
+      "body": "packed",
+      "artifactBytes": 72671,
+      "artifactSha256": "8fba3eefc3aa95a6123e329295db1950a708dada0fbc32efaffbf12eb3d27f81",
+      "packedBytes": 66785,
+      "packedSha256": "6a632fb9be56e581fb6f08a9037a60827a5c0cd6f9fe402e2ae846f47542c79e",
+      "hoistedParts": 1,
+      "transforms": {
+        "fk": 4,
+        "int": 9,
+        "sep": 8
+      },
+      "escapes": 1
+    },
+    {
+      "name": "stored",
+      "body": "stored",
+      "artifactBytes": 965,
+      "artifactSha256": "198d1b397bdf772bf4b97d3b5d5c7c5e7f0de2575f084cb036674f0bc3e39b0f",
+      "packedBytes": 965,
+      "packedSha256": "198d1b397bdf772bf4b97d3b5d5c7c5e7f0de2575f084cb036674f0bc3e39b0f",
+      "hoistedParts": 0,
+      "transforms": {
+        "fk": 0,
+        "int": 0,
+        "sep": 0
+      },
+      "escapes": 0
+    }
+  ]
+}

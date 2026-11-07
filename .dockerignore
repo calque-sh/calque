@@ -1,0 +1,19 @@
+# An allowlist: the build context is the repository root, where the README's
+# self-host walk leaves the grant signing key `grant-key.pk8` and a live
+# grant. Everything is excluded, then only what the Dockerfile copies is let
+# back in, so a file written to the root never reaches the daemon.
+# `pnpm quickstart:e2e` checks that against the walk's own files.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!LICENSE
+!NOTICE
+!vendor
+!spec
+!server
+
+# Build output and host clutter under the directories let back in.
+**/target
+**/node_modules
+**/.DS_Store

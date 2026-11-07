@@ -1,0 +1,17 @@
+{
+  "description": "The covering window of a decoded length: the smallest power of two that is at least the length, from 2^10 to 2^30.",
+  "rows": [
+    { "decodedBytes": 1, "windowBits": 10 },
+    { "decodedBytes": 1024, "windowBits": 10 },
+    { "decodedBytes": 1025, "windowBits": 11 },
+    { "decodedBytes": 16777215, "windowBits": 24 },
+    { "decodedBytes": 16777216, "windowBits": 24 },
+    { "decodedBytes": 16777217, "windowBits": 25 },
+    { "decodedBytes": 31066017, "windowBits": 25 },
+    { "decodedBytes": 33554432, "windowBits": 25 },
+    { "decodedBytes": 33554433, "windowBits": 26 },
+    { "decodedBytes": 536870912, "windowBits": 29 },
+    { "decodedBytes": 536870913, "windowBits": 30 },
+    { "decodedBytes": 1073741824, "windowBits": 30 }
+  ]
+}

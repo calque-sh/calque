@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": []
+  },
+  "include": [
+    "registered.consumer.tsx",
+    "../../../client/tests/typed-consumer/calque.generated.ts"
+  ]
+}

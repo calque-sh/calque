@@ -1,0 +1,25 @@
+[package]
+name = "postgres-connect"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+percent-encoding = "2.3.2"
+postgres = "0.19.14"
+rustls = { version = "0.23.42", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+thiserror = "1"
+tokio-postgres = "0.7.18"
+tokio-postgres-rustls = { version = "0.14.0", default-features = false }
+tracing = "0.1.44"
+
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+tempfile = "3"
+tokio = { version = "1.52.0", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

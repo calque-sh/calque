@@ -1,0 +1,24 @@
+[package]
+name = "direct-columnar"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bigdecimal = "0.4"
+# The packer's size test: an int or sep stream against its parts at quality 9.
+brotli = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+hex = "0.4.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 0.11 for its hardware SHA-256, as in blob-store.
+sha2 = { version = "0.11.0", default-features = false }
+tempfile = "3"
+thiserror = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,186 @@
+{
+  "version": 1,
+  "wire": {
+    "artifact": "dataset grant v1 signed payloads and tokens",
+    "framing": "base64url(payload).base64url(ed25519-signature), unpadded",
+    "signing_domain": "calque.dataset-grant.v1\\0",
+    "producers": [
+      "rust",
+      "node"
+    ],
+    "note": "The tokens are exact: Ed25519 is deterministic, so test-only-grant-key.pk8 signs each payload to one token, and both producers must write it. The payloads under invalid/ are signed by the test, so every negative vector is validly signed and its refusal is a claim-check result; refusal names the GrantError variant the verifier returns for it."
+  },
+  "fixtures": [
+    {
+      "file": "read-only.payload.json",
+      "bytes": 267,
+      "sha256": "5c76d16cae4f36d132d6a7e1add00d52158346760665bc33d241cfb31b46e398",
+      "coverage": [
+        "v1 claims with no commands field",
+        "the payload every pre-capability issuer produced",
+        "verifies to a principal that authorizes no command"
+      ]
+    },
+    {
+      "file": "command-capability.payload.json",
+      "bytes": 395,
+      "sha256": "0309176ab77bd959d6add4aed8947a40bcb306fe81ba3542050a202b45cad990",
+      "coverage": [
+        "one collection with one operation and one with all three",
+        "the exact bytes dataset-grant-issuer serializes",
+        "per-collection and per-operation capability, both"
+      ]
+    },
+    {
+      "file": "attribute-types.payload.json",
+      "bytes": 667,
+      "sha256": "572cfc79732be176834e1b0619fabcfbdfd5e9542aa25e2a82b7d93cd99ba060",
+      "coverage": [
+        "every attribute type, with int2, int4 and int8 each at one of its bounds",
+        "an int8 beyond 2^53, exact only because it travels as a string",
+        "attribute names in UTF-8 byte order, which differs from an object key order and from UTF-16 order",
+        "hex digits in either case, written as given",
+        "a subject that needs JSON escapes and non-ASCII UTF-8",
+        "two collections, operations in the order given rather than sorted",
+        "a validity window of exactly MAX_GRANT_LIFETIME_SECONDS"
+      ]
+    },
+    {
+      "file": "test-only-grant-key.pk8",
+      "bytes": 83,
+      "sha256": "486b0a41b3e7059d6b4aefa78cfb21a8f2662b6258bdd53227468295d892705f",
+      "test_only": true,
+      "key_id": "grant-vectors-key",
+      "source": "RFC 8032 section 7.1, TEST 1",
+      "coverage": [
+        "TEST ONLY: the Ed25519 key of RFC 8032 section 7.1, TEST 1, public by construction; no deployment may trust it",
+        "in the PKCS#8 v2 layout calque-dev-grant writes to grant-key.pk8: the RFC's secret key as the seed, its public key as the [1] public key"
+      ]
+    },
+    {
+      "file": "test-only-grant-key.public.raw",
+      "bytes": 32,
+      "sha256": "21fe31dfa154a261626bf854046fd2271b7bed4b6abe45aa58877ef47f9721b9",
+      "test_only": true,
+      "coverage": [
+        "the raw 32-byte Ed25519 public key of test-only-grant-key.pk8, RFC 8032 section 7.1, TEST 1"
+      ]
+    },
+    {
+      "file": "test-only-verification-key.json",
+      "bytes": 87,
+      "sha256": "7a55e6155e751ab14de0b25a342b1b83a2ffc1d1e624dbe3e6c61ef9318801d1",
+      "test_only": true,
+      "coverage": [
+        "the --grant-verification-key-env value for test-only-grant-key.pk8 under keyId grant-vectors-key",
+        "what GrantIssuer::verification_key_environment returns for this key, byte for byte; calque-dev-grant prints the same object as verificationKeyEnvironment"
+      ]
+    },
+    {
+      "file": "read-only.token",
+      "bytes": 443,
+      "sha256": "f8b4f811ba282336055c5aeda9f078ed143fc7bd83669a4b479b6c8e6746a722",
+      "signs": "read-only.payload.json",
+      "key": "test-only-grant-key.pk8",
+      "coverage": [
+        "the exact token for read-only.payload.json",
+        "verifies at generation 9, one second after issue"
+      ]
+    },
+    {
+      "file": "command-capability.token",
+      "bytes": 614,
+      "sha256": "154c1dde5ca85d721f2992ef17dc03cef5f9a8071ade4a8d19d23690fd4eec43",
+      "signs": "command-capability.payload.json",
+      "key": "test-only-grant-key.pk8",
+      "coverage": [
+        "the exact token for command-capability.payload.json",
+        "verifies at generation 9, one second after issue"
+      ]
+    },
+    {
+      "file": "attribute-types.token",
+      "bytes": 977,
+      "sha256": "6b201d2c76aaeba4da34f73f58bab7c3aad7fcd14dd1e8be0a352c6006507cec",
+      "signs": "attribute-types.payload.json",
+      "key": "test-only-grant-key.pk8",
+      "coverage": [
+        "the exact token for attribute-types.payload.json",
+        "verifies at generation 9, one second after issue"
+      ]
+    },
+    {
+      "file": "invalid/truncated.payload.json",
+      "bytes": 163,
+      "sha256": "e2fad41781e6fef6040064608ed260587047c999f13d6352cbbd37c877c1ef9c",
+      "refusal": "MalformedPayload",
+      "coverage": [
+        "a payload cut mid-document"
+      ]
+    },
+    {
+      "file": "invalid/oversized.payload.json",
+      "bytes": 4519,
+      "sha256": "d3221201fc296beab0cbc6621a4f0de14103c54551dd996689a45e1f032797c3",
+      "refusal": "TokenTooLarge",
+      "coverage": [
+        "a payload past MAX_PAYLOAD_BYTES, refused before it is parsed"
+      ]
+    },
+    {
+      "file": "invalid/capability-empty-operations.payload.json",
+      "bytes": 319,
+      "sha256": "b6899a5e79b2d1e6a1b4c3a3d6cd51cbcee96813089cd0f28dccde00f202d340",
+      "refusal": "MalformedCommandCapability",
+      "coverage": [
+        "an empty operation set is refused, never read as every operation"
+      ]
+    },
+    {
+      "file": "invalid/capability-unknown-operation.payload.json",
+      "bytes": 329,
+      "sha256": "e95e40bf6f763feda3bfc5a80c62f3a5c2e7cd2867aead9020cb2e091a8b71cd",
+      "refusal": "MalformedPayload",
+      "coverage": [
+        "the operation vocabulary is closed"
+      ]
+    },
+    {
+      "file": "invalid/capability-unknown-field.payload.json",
+      "bytes": 345,
+      "sha256": "8da87f5fca964bdf501177bd14a4333fdac8cf792d7b4280ea5b880debb20427",
+      "refusal": "MalformedPayload",
+      "coverage": [
+        "deny_unknown_fields inside one capability entry"
+      ]
+    },
+    {
+      "file": "invalid/capability-duplicate-collection.payload.json",
+      "bytes": 374,
+      "sha256": "b8ac60f9ecff681232f313ce6e156acfa221993bf68c7c4a775b461457256f9e",
+      "refusal": "DuplicateCommandCapability",
+      "coverage": [
+        "a repeated collection is refused rather than last-wins"
+      ]
+    },
+    {
+      "file": "invalid/cross-generation.payload.json",
+      "bytes": 328,
+      "sha256": "07886d99df22cf5f1dffdcaf1da4faddeba1a030e703f7e3b9d74c4f6f791eb1",
+      "refusal": "AuthorizationGenerationMismatch",
+      "coverage": [
+        "the authorization-generation fence: a capability minted against a superseded generation"
+      ]
+    },
+    {
+      "file": "invalid/duplicate-attribute.payload.json",
+      "bytes": 329,
+      "sha256": "f0944951e05f68be1030d443050052dc3ecba16f55deaec06a5a5672b96ffa6c",
+      "refusal": "DuplicateAttribute",
+      "coverage": [
+        "an attribute name repeated with a different value is refused, never resolved to the last one",
+        "accepted, last value winning, by every v1 verifier before the refusal existed"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+# Layered over docker-compose.yml by `pnpm demo` when it runs `calque` from
+# its container image: `docker compose -f docker-compose.yml -f
+# docker-compose.demo-image.yml`. The `calque` container joins the PostgreSQL
+# container's network namespace, so it reaches the source at 127.0.0.1, and
+# this publishes its port from there, on the host's loopback address only.
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${CALQUE_LOCAL_PORT:?set by pnpm demo}:${CALQUE_LOCAL_PORT}"

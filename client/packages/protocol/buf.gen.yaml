@@ -1,0 +1,9 @@
+version: v2
+inputs:
+  - directory: ../../../spec
+plugins:
+  - local: protoc-gen-es
+    out: src/gen
+    opt:
+      - target=ts
+      - import_extension=js

@@ -1,0 +1,38 @@
+[package]
+name = "bootstrap-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+artifact-catalog = { path = "../artifact-catalog" }
+artifact-contract = { path = "../artifact-contract" }
+authz = { path = "../authz" }
+async-trait = "0.1.89"
+base64 = "0.22.1"
+blob-store = { path = "../blob-store" }
+canonical-log = { path = "../canonical-log" }
+hmac = "0.12.1"
+jsonschema = { version = "0.47.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+snapshot-builder = { path = "../snapshot-builder" }
+source-control = { path = "../source-control" }
+sync-types = { path = "../sync-types" }
+thiserror = "1"
+time = { version = "0.3.53", features = ["formatting"] }
+tokio = { version = "1.52.0", features = ["time"] }
+url = "2.5.8"
+uuid = { version = "1.23.0", features = ["v4"] }
+
+[dev-dependencies]
+canonical-log = { path = "../canonical-log", features = ["test-support"] }
+tempfile = "3"
+tokio = { version = "1.52.0", features = ["io-util", "macros", "rt"] }
+
+[lints]
+workspace = true

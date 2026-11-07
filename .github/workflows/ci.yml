@@ -1,0 +1,422 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # By hand, for running the live suites against a branch: every job runs on
+  # dispatch, the same as on a push to main, including the live-postgres job
+  # that pull requests do not run.
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch/PR so redundant work doesn't queue up.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Default to read-only; no job here needs to write to the repo or packages.
+permissions:
+  contents: read
+
+jobs:
+  # `pnpm verify` itself, not a hand-kept copy of its steps: the jobs this
+  # replaced ran formatting, clippy, the builds, typecheck and tests, and had
+  # drifted from the local gate by everything else it runs (the harness
+  # typecheck and tests, lint, protocol compatibility, the generated-binding
+  # and public-API checks, the consumer bundle). scripts/verify-workspace.ts
+  # is the one list; this job installs what it needs and runs it.
+  verify:
+    name: pnpm verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The whole workspace's debug build, both Playwright browsers and the
+      # cargo cache's own save do not fit in the root filesystem ubuntu-latest
+      # leaves free. The runner image's .NET, Android, GHC and CodeQL trees are
+      # tens of GB that nothing here uses.
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # libpq-dev is load-bearing, not optional: the vendored pg_walstream fork
+      # (vendor/pg-walstream) links pq-sys for its "libpq" feature, which
+      # server/crates/source-runtime, snapshot-coordinator, and pgoutput-decoder all
+      # depend on. protoc is NOT needed here -- sync-protocol/build.rs vendors it via
+      # protoc-bin-vendored. OpenSSL is NOT needed either -- TLS is rustls. See
+      # Dockerfile for the same reasoning applied to the runtime image.
+      - name: Install libpq
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libpq-dev
+
+      # No toolchain-install action here on purpose: ubuntu-latest ships rustup
+      # preinstalled, and rustup auto-installs the exact channel and components
+      # (clippy, rustfmt) pinned in rust-toolchain.toml the first time cargo/rustup
+      # runs in a directory below it. That keeps the Rust version single-sourced from
+      # that file instead of duplicated into this workflow.
+      - name: Install pinned toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # No explicit version input: pnpm/action-setup reads and honours the
+      # "packageManager" field in package.json. v6.1.0 is the first release
+      # that installs pnpm 12.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      # Single-sourced from .nvmrc, which pins one exact version the way
+      # rust-toolchain.toml pins 1.97.0 rather than a range. package.json's
+      # engines "^22.20.0 || >=24.5.0" is the supported range (the client
+      # browser fixture calls zlib.zstdCompressSync, absent before 22.15, and
+      # the harness tests run the grant issuer example's .mts files, which Node
+      # runs without a flag only from 22.18 and whose PKCS#8 v2 key only the
+      # OpenSSL 3.5 bundled from 22.20 and 24.5 reads; Node 23 and 24.0 to 24.4
+      # bundle OpenSSL 3.0); .nvmrc is the pin.
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # @calque/worker, @calque/client, and @calque/react all run part or all
+      # of their vitest suite in browser mode (chromium; @calque/client also needs
+      # firefox for its unsupported-browser project), so the Playwright browsers must
+      # be present before any test step runs.
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps chromium firefox
+
+      # @calque/core's artifact test shells out to `cargo run -p
+      # direct-columnar --example emit_fixture` to compare against the exact
+      # bytes the Rust encoder emits. The gate's clippy pass compiles no
+      # binaries, so building the example here keeps the compile out of the
+      # test's own time budget, and surfaces a Rust build failure as a build
+      # failure rather than as a test timeout.
+      - name: Pre-build the direct-columnar fixture example
+        run: cargo build -p direct-columnar --example emit_fixture
+
+      - name: pnpm verify
+        run: pnpm verify
+
+  # The browser and client end-to-end runs against a real PostgreSQL 18 in
+  # Docker: `calque dev`'s commit-to-paint timing in Chromium, its mutations
+  # from a Node client, and `calque serve`'s writes and revocation in
+  # Chromium. Each script starts and removes its own database: the latency run
+  # through docker-compose.yml on 55432, the mutation run under its own
+  # compose project on 55453, and the serve runs in one `postgres:18`
+  # container on 55491. Their timings on a shared runner are directional; the
+  # job is here for the pass or fail.
+  browser-e2e:
+    name: Browser end-to-end (calque dev and calque serve)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Same reasoning as the verify job: its disk step's comment says why.
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # Same reasoning as the verify job: the vendored pg_walstream links pq-sys.
+      - name: Install libpq
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libpq-dev
+
+      - name: Install pinned toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The pages and the Node client import the built packages.
+      - name: Build all packages
+        run: pnpm -r build
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      # Outside every script's readiness timeout, into the checkout's own
+      # `target`, which is where every script here builds and what the cache
+      # keeps.
+      - name: Build calque and calque-dev-grant
+        run: cargo build -p calque -p dataset-grant-issuer
+
+      - name: calque dev commit-to-paint latency
+        run: pnpm demo:e2e:latency
+
+      - name: calque dev mutations
+        run: pnpm demo:e2e:mutation
+
+      - name: calque serve writes and revocation
+        run: pnpm serve:e2e
+
+  # docker-compose.selfhost.yml end to end: PostgreSQL 18, MinIO, `calque
+  # serve` built from the Dockerfile, and Caddy terminating TLS in front of
+  # it, driven from Chromium over HTTPS. On Linux the harness puts Caddy's
+  # local root into an NSS database only its Chromium reads, which needs
+  # NSS's `certutil`. The image build is a release build of the workspace
+  # inside Docker, with no cache between runs. The README's self-host walk
+  # then runs from its own text against the same composition file and ends
+  # on the quickstart page.
+  selfhost-e2e:
+    name: Self-hosted composition behind Caddy
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The README walk adds a host debug build of `calque` to the images
+      # this job already holds. The browser-e2e job, which builds `calque` on
+      # the host too, frees the same trees; this job has not been measured
+      # without it.
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # The selfhost harness mints its grants with `cargo run -p
+      # dataset-grant-issuer` on the host, and that crate links no libpq. The
+      # README walk also runs `calque inspect` and `calque init` on the host,
+      # and `calque` links libpq through the vendored pg_walstream fork.
+      - name: Install certutil and libpq
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libnss3-tools libpq-dev
+
+      - name: Install pinned toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build all packages
+        run: pnpm -r build
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: pnpm selfhost:e2e
+        run: pnpm selfhost:e2e
+
+      - name: pnpm quickstart:e2e
+        run: pnpm quickstart:e2e
+
+  # The `#[ignore]`d tests `cargo test --workspace` never runs, blob-store's
+  # two aside, need a live PostgreSQL 18 with logical decoding, except
+  # snapshot_recovery_child_exits_without_cleanup, a re-exec fixture that
+  # rides along under the same filter. scripts/live-postgres-suite.sh is the
+  # setup the README documents, so CI and a local run cannot drift apart, and it
+  # refuses to report a pass unless every test `--ignored --list` names ran.
+  # The count is not maintained by hand: the script derives it per run, and
+  # this comment is only orientation.
+  #
+  # Not a pull-request check yet. The suite's wall-clock is bounded by lease
+  # TTLs, barrier timeouts and process kills rather than by CPU, but one test
+  # gives a cleanup retry a 40 ms budget (snapshot-pipeline live_publication
+  # supervisor_hung_provider_delete_retries_after_cleanup_lease_expiry) that a
+  # loaded machine has exceeded.
+  #
+  # Every live_publication fixture that hands the supervisor a file-backed
+  # canonical log multiplies that provider's 300 ms retention deadline by
+  # CALQUE_TEST_TIME_SCALE (default 1; the test file documents it), set on the
+  # run step below: on a hosted runner, a manifest write on a disk shared with
+  # the postgres:18 service exceeded the unscaled deadline. A bare
+  # FileCanonicalLog does not implement the trait the barrier mirror needs, so
+  # a fixture that mirrors into an unscaled log does not compile. The job stays
+  # off pull requests until dispatch runs have shown the margin holds; no test
+  # is loosened to get there, and no product constant moved.
+  live-postgres:
+    name: Live PostgreSQL suite
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          # A service container has no `command:` override, so the server
+          # settings go through initdb: PostgreSQL 16+ `initdb -c` writes them
+          # into postgresql.conf. Verified against postgres:18 -- SHOW reports
+          # logical/20/20/400 -- and `bootstrap` below re-checks all four before
+          # creating anything, so a regression here fails at setup with the
+          # setting named rather than as a slot error deep in a test.
+          POSTGRES_INITDB_ARGS: -c wal_level=logical -c max_replication_slots=20 -c max_wal_senders=20 -c max_connections=400
+        ports:
+          - 55444:5432
+        # Over TCP: the image's temporary initdb server answers on the socket
+        # only, and this must not report it (see the script's bootstrap).
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Same reasoning as the verify job: its disk step's comment says why.
+      # Here the workspace's debug test build left MinIO too little disk to
+      # store the recovery test's first object (`XMinioStorageFull`).
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # Same reasoning as the verify job: the vendored pg_walstream links pq-sys.
+      - name: Install libpq
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libpq-dev
+
+      - name: Install pinned toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Enrollment refuses a superuser with SUPERUSER_NOT_LEAST_PRIVILEGE,
+      # so the image's bootstrap role cannot run the suite. The script creates
+      # the NOSUPERUSER REPLICATION CREATEDB CREATEROLE role and its database
+      # through the container's own psql, then asserts pg_roles agrees.
+      - name: Bootstrap the least-privilege replication role
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: scripts/live-postgres-suite.sh bootstrap "$POSTGRES_CONTAINER"
+
+      # Exports the seven connection variables, runs
+      # `cargo test --workspace --exclude blob-store --no-fail-fast -- --ignored`,
+      # and fails if fewer distinct tests passed than `--ignored --list` names.
+      # blob-store's two ignored tests want S3, not PostgreSQL; the job below
+      # runs them. The one test outside blob-store that wants S3 as well is
+      # skipped here by its exact name and runs in the last step, because the
+      # variables it reads cannot be set for this step: `calque serve` refuses
+      # to start with any `CALQUE_S3_*` set and `CALQUE_OBJECT_STORE` unset
+      # (server/apps/calque/src/serve.rs, `selected_object_store_kind`), and
+      # the `serve_*_live` tests start it with this step's environment.
+      - name: Run the ignored live-PostgreSQL suite
+        env:
+          # 10x: the file provider's 300 ms retention deadline becomes 3 s, the
+          # deadline production already grants the Postgres-fenced provider,
+          # inside the lease guard's ttl/3 bound for the fixture's 30 s TTL.
+          # A hosted runner exceeds 300 ms by an unknown margin, so the factor
+          # follows what production tolerates rather than a guess at the
+          # runner's fsync latency.
+          # The provider's 50 ms barrier-read deadline is not scaled: the
+          # barrier wait bounds each read to 250 ms and rejects a larger
+          # declared deadline outright (the test file records the failed try).
+          CALQUE_TEST_TIME_SCALE: "10"
+        run: >-
+          scripts/live-postgres-suite.sh run 55444 --exact
+          --skip recovery::tests::a_filesystem_unit_restores_into_a_provider_store_and_serves_from_it
+
+      # The same digest-pinned MinIO the blob-store job runs against, from its
+      # compose file, with run-scoped credentials and one bucket. The test
+      # does not create the bucket; a deployment's operator does, and so does
+      # this step, with the `mc` the image carries. Without a bucket the test
+      # finds no store and fails, as it is written to.
+      - name: Start MinIO for the S3 recovery test
+        if: ${{ !cancelled() }}
+        run: |
+          df -h /
+          user="rm$(openssl rand -hex 12)"
+          password="$(openssl rand -hex 32)"
+          echo "::add-mask::$user"
+          echo "::add-mask::$password"
+          export CALQUE_MINIO_ROOT_USER="$user"
+          export CALQUE_MINIO_ROOT_PASSWORD="$password"
+          export CALQUE_MINIO_VOLUME=calque-live-postgres-minio
+          {
+            echo "CALQUE_MINIO_ROOT_USER=$user"
+            echo "CALQUE_MINIO_ROOT_PASSWORD=$password"
+          } >>"$GITHUB_ENV"
+          minio="docker compose --project-name calque-live-postgres-minio --file server/crates/blob-store/tests/s3-emulator/compose.yaml"
+          $minio up --detach --wait
+          $minio exec -T -e "MC_HOST_live=http://$user:$password@127.0.0.1:9000" s3 \
+            mc mb live/calque-live-recovery
+
+      # Only here are the four variables set, and only this test runs, so the
+      # completeness check expects exactly one pass.
+      - name: Run the S3 recovery test against MinIO
+        if: ${{ !cancelled() }}
+        env:
+          CALQUE_TEST_TIME_SCALE: "10"
+          CALQUE_S3_ENDPOINT: http://127.0.0.1:29000
+          CALQUE_S3_BUCKET: calque-live-recovery
+        run: >-
+          CALQUE_S3_ACCESS_KEY="$CALQUE_MINIO_ROOT_USER"
+          CALQUE_S3_SECRET_KEY="$CALQUE_MINIO_ROOT_PASSWORD"
+          scripts/live-postgres-suite.sh run 55444 --exact
+          recovery::tests::a_filesystem_unit_restores_into_a_provider_store_and_serves_from_it
+
+  # blob-store's two `#[ignore]`d S3 conformance tests, against a digest-pinned
+  # MinIO started by docker compose with run-scoped credentials, through the
+  # same `pnpm verify:s3:minio` a contributor runs. It also runs blob-store's
+  # unit tests and artifact-catalog's 100-schedule provider-fault matrix, and
+  # writes the run's evidence directory under target/s3-conformance/. The
+  # script needs no installed packages, so the job sets up pnpm and Node but
+  # runs no `pnpm install`.
+  blob-store-minio:
+    name: blob-store S3 conformance (MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # run.sh hashes the source tree with `rg --files` before and after the
+      # run to prove nothing changed underneath the evidence. No libpq here:
+      # neither blob-store nor artifact-catalog links pq-sys.
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ripgrep
+
+      - name: Install pinned toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Run the S3 adapter conformance against MinIO
+        run: pnpm verify:s3:minio

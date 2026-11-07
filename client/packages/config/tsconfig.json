@@ -1,0 +1,30 @@
+// `noEmit`: this config only typechecks. Without it, `tsc -p tsconfig.json`
+// writes JavaScript beside every source file without a warning, and that
+// output shadows configs, doubles test runs and breaks lint
+// (scripts/verify-no-emitted-javascript.ts refuses it).
+// `paths` resolves `typescript` to this package's TypeScript 5. Without it,
+// the typescript-eslint declarations `eslint.config.ts` pulls in resolve the
+// workspace root's TypeScript 7, which exports none of the API they import,
+// and the typecheck fails. `paths` resolves relative to this file, so it
+// needs no `baseUrl`, which TypeScript 7 removed.
+{
+  "compilerOptions": {
+    "noEmit": true,
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ESNext"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "useUnknownInCatchVariables": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": false,
+    "types": ["vitest/globals", "node"],
+    "paths": {
+      "typescript": ["./node_modules/typescript/lib/typescript.d.ts"]
+    }
+  },
+  "include": ["src", "eslint.config.ts"]
+}

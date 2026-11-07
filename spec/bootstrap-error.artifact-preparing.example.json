@@ -1,0 +1,5 @@
+{
+  "code": "ARTIFACT_PREPARING",
+  "message": "this authorization generation's artifact is still being published",
+  "resnapshotRequired": false
+}

@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package sync.mutation.v1;
+
+// Frozen protocol v1 under the compatibility policy in change_stream.proto.
+// Mutations are registered commands, not arbitrary remote SQL. HTTP
+// acknowledgement is not canonical confirmation; the mutation remains pending
+// until its ID appears in the canonical change stream.
+
+message Cursor {
+  bytes token = 1;
+}
+
+message MutationBatchRequest {
+  uint32 protocol_version = 1; // must be 1
+  string client_instance_id = 2;
+  string device_id = 3;
+  bytes authorization_scope_token = 4;
+  repeated MutationEnvelope mutations = 5;
+}
+
+message MutationEnvelope {
+  string mutation_id = 1; // globally unique, client generated
+  string command_name = 2;
+  uint32 command_version = 3;
+  bytes canonical_input = 4;
+  Cursor base_cursor = 5;
+  uint64 created_at_unix_micros = 6;
+  repeated ExpectedVersion expected_versions = 7;
+  MutationFootprint declared_footprint = 8;
+}
+
+message ExpectedVersion {
+  string table_id = 1;
+  bytes primary_key = 2;
+  bytes expected_version = 3;
+}
+
+message MutationFootprint {
+  repeated AffectedRow rows = 1;
+  repeated string table_ids = 2;
+}
+
+message AffectedRow {
+  string table_id = 1;
+  bytes primary_key = 2;
+}
+
+message MutationBatchResponse {
+  uint32 protocol_version = 1;
+  repeated MutationOutcome outcomes = 2;
+  uint64 server_time_unix_micros = 3;
+}
+
+enum MutationOutcomeCode {
+  MUTATION_OUTCOME_CODE_UNSPECIFIED = 0;
+  ACCEPTED_AWAITING_CANONICAL_ECHO = 1;
+  ALREADY_ACCEPTED_AWAITING_CANONICAL_ECHO = 2;
+  ALREADY_CANONICAL = 3;
+  REJECTED_VALIDATION = 4;
+  REJECTED_AUTHORIZATION = 5;
+  CONFLICT = 6;
+  COMMAND_VERSION_UNSUPPORTED = 7;
+  RETRYABLE_FAILURE = 8;
+}
+
+message MutationOutcome {
+  string mutation_id = 1;
+  MutationOutcomeCode code = 2;
+  string message = 3;
+  // Exactly 16 UUID bytes for accepted outcomes; empty for all rejections.
+  bytes server_transaction_id = 4;
+  // Required only for ALREADY_CANONICAL.
+  optional Cursor observed_canonical_cursor = 5;
+  optional Conflict conflict = 6;
+  uint64 retry_after_ms = 7;
+}
+
+message Conflict {
+  string kind = 1;
+  repeated CanonicalRow rows = 2;
+  bytes application_payload = 3;
+}
+
+message CanonicalRow {
+  string table_id = 1;
+  bytes primary_key = 2;
+  bytes encoded_full_row = 3;
+  bytes version = 4;
+}
+
+// Binary payload emitted transactionally through pg_logical_emit_message()
+// under a reserved prefix such as "sync.mutation.v1".
+message MutationLogicalMarker {
+  uint32 protocol_version = 1;
+  repeated string mutation_ids = 2;
+  // Exactly the 16 UUID bytes stored in the durable mutation receipt.
+  bytes server_transaction_id = 3;
+}

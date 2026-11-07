@@ -1,0 +1,12 @@
+{
+  "artifact": "packed-artifact/every-kind/artifact.bin",
+  "bodyBytes": 66865,
+  "bodyVersion": 1,
+  "decodedBytes": 72714,
+  "decodedSha256": "61cca5e2940d13d63c71c4cc29a25f83501e5f55549e5cdb69febb29683e594a",
+  "encodedBytes": 17764,
+  "encodedSha256": "0a23fd8ad47239a74838c18317f6922277c1bca543b7a7c3c6b8df8059d1f840",
+  "encoder": "brotli crate 8.0.4",
+  "quality": 11,
+  "windowBits": 17
+}

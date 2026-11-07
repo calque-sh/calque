@@ -1,0 +1,31 @@
+[package]
+name = "cdc-ingest"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bigdecimal = "0.4.10"
+canonical-log = { path = "../canonical-log" }
+chrono = { version = "0.4.42", default-features = false, features = ["std"] }
+hex = "0.4.3"
+pgoutput-decoder = { path = "../pgoutput-decoder" }
+prost = "0.14.3"
+postgres-types = "0.2.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+source-control = { path = "../source-control" }
+sync-protocol = { path = "../sync-protocol" }
+sync-types = { path = "../sync-types" }
+thiserror = "1.0.69"
+uuid = "1.23.0"
+
+[dev-dependencies]
+canonical-log = { path = "../canonical-log", features = ["test-support"] }
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

@@ -1,0 +1,671 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:calque:artifact-manifest:v1",
+  "title": "Immutable snapshot artifact manifest",
+  "description": "Draft v1. Immutable metadata for one decoded artifact and its encoded transport representations. The decoded object names its format. Dynamic signed URLs and activation fences do not belong here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocolVersion",
+    "artifactId",
+    "createdAt",
+    "decoded",
+    "pit",
+    "compatibility",
+    "tables",
+    "representations",
+    "memory"
+  ],
+  "properties": {
+    "protocolVersion": {
+      "const": 1
+    },
+    "artifactId": {
+      "$ref": "#/$defs/id"
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "decoded": {
+      "type": "object",
+      "description": "The decoded artifact object: a CALQART1-framed image at format version 4; `schemaHash` and `collectionSetHash` bind the manifest to the artifact identity written into the encoded header, `identity` carries the two header strings those hashes do not pin, and `schema` the physical schema the decoder re-hashes to `schemaHash`. A bootstrap plan copies all of them verbatim. Each variable-width column's offsets are written as value lengths, which the decoder turns back into offsets after every digest matches.",
+      "unevaluatedProperties": false,
+      "required": [
+        "objectId",
+        "sha256",
+        "bytes",
+        "mediaType",
+        "format",
+        "schemaHash",
+        "collectionSetHash",
+        "formatVersion",
+        "identity",
+        "schema",
+        "chunks"
+      ],
+      "properties": {
+        "objectId": {
+          "$ref": "#/$defs/id"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "bytes": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "format": {
+          "const": "directColumnar"
+        },
+        "mediaType": {
+          "const": "application/vnd.calque.direct-columnar.v4"
+        },
+        "schemaHash": {
+          "$ref": "#/$defs/hashId"
+        },
+        "collectionSetHash": {
+          "$ref": "#/$defs/hashId"
+        },
+        "formatVersion": {
+          "const": 4
+        },
+        "identity": {
+          "$ref": "#/$defs/directColumnarIdentity"
+        },
+        "schema": {
+          "$ref": "#/$defs/directColumnarSchema"
+        },
+        "chunks": {
+          "$ref": "#/$defs/artifactChunks"
+        }
+      }
+    },
+    "pit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceEpoch",
+        "snapshotCursor",
+        "copyConsistentLsn",
+        "cutMessageLsn",
+        "cutMarkerId"
+      ],
+      "properties": {
+        "sourceEpoch": {
+          "$ref": "#/$defs/id"
+        },
+        "snapshotCursor": {
+          "$ref": "#/$defs/cursor"
+        },
+        "copyConsistentLsn": {
+          "$ref": "#/$defs/pgLsn"
+        },
+        "cutMessageLsn": {
+          "$ref": "#/$defs/pgLsn"
+        },
+        "cutMarkerId": {
+          "$ref": "#/$defs/id"
+        }
+      }
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "publicationGeneration",
+        "schemaGeneration",
+        "authorizationGeneration",
+        "authorizationPolicyHash",
+        "authorizationScopeHash",
+        "tableSetHash",
+        "shardProfileHash",
+        "indexProfileHash",
+        "typeCodecGeneration",
+        "collationGeneration"
+      ],
+      "properties": {
+        "publicationGeneration": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "schemaGeneration": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "authorizationGeneration": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "authorizationPolicyHash": {
+          "$ref": "#/$defs/hashId"
+        },
+        "authorizationScopeHash": {
+          "$ref": "#/$defs/hashId"
+        },
+        "tableSetHash": {
+          "$ref": "#/$defs/hashId"
+        },
+        "shardProfileHash": {
+          "$ref": "#/$defs/hashId"
+        },
+        "indexProfileHash": {
+          "$ref": "#/$defs/hashId"
+        },
+        "typeCodecGeneration": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "collationGeneration": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      }
+    },
+    "tables": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/table"
+      }
+    },
+    "representations": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/representation"
+      },
+      "allOf": [
+        {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "encoding": {
+                "const": "zstd"
+              }
+            },
+            "required": [
+              "encoding"
+            ]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "encoding": {
+                "const": "identity"
+              }
+            },
+            "required": [
+              "encoding"
+            ]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "encoding": {
+                "enum": [
+                  "brotli-large-window",
+                  "packed-brotli-large-window"
+                ]
+              }
+            },
+            "required": [
+              "encoding"
+            ]
+          },
+          "minContains": 0,
+          "maxContains": 1
+        }
+      ]
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "estimatedPeakBytes",
+        "recommendedGrowthReserveBytes"
+      ],
+      "properties": {
+        "estimatedPeakBytes": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "recommendedGrowthReserveBytes": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "keyId",
+        "signatureBase64"
+      ],
+      "properties": {
+        "algorithm": {
+          "const": "Ed25519"
+        },
+        "keyId": {
+          "$ref": "#/$defs/id"
+        },
+        "signatureBase64": {
+          "type": "string",
+          "minLength": 40
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*$"
+    },
+    "hashId": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "cursor": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "pgLsn": {
+      "type": "string",
+      "pattern": "^[0-9A-F]+/[0-9A-F]+$"
+    },
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tableId",
+        "sourceSchema",
+        "sourceTable",
+        "localSchema",
+        "localTable",
+        "schemaHash",
+        "columnProfileHash",
+        "rowCount",
+        "primaryKeyCodec",
+        "columns"
+      ],
+      "properties": {
+        "tableId": {
+          "$ref": "#/$defs/id"
+        },
+        "sourceSchema": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sourceTable": {
+          "type": "string",
+          "minLength": 1
+        },
+        "localSchema": {
+          "type": "string",
+          "minLength": 1
+        },
+        "localTable": {
+          "type": "string",
+          "minLength": 1
+        },
+        "schemaHash": {
+          "$ref": "#/$defs/hashId"
+        },
+        "columnProfileHash": {
+          "$ref": "#/$defs/hashId"
+        },
+        "rowCount": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "primaryKeyCodec": {
+          "type": "string",
+          "minLength": 1
+        },
+        "columns": {
+          "type": "array",
+          "description": "The change stream's column ids for this table, in the image's column order.",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/column"
+          }
+        }
+      }
+    },
+    "representation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "representationId",
+        "objectId",
+        "encoding",
+        "encodedSha256",
+        "encodedBytes"
+      ],
+      "properties": {
+        "representationId": {
+          "$ref": "#/$defs/hashId"
+        },
+        "objectId": {
+          "$ref": "#/$defs/id"
+        },
+        "encoding": {
+          "description": "`brotli-large-window` is the decoded artifact as one brotli stream with the large-window extension. `packed-brotli-large-window` is the artifact's packed body as one such stream: the client decodes the stream and restores the artifact's bytes from the body. Both are sent without a Content-Encoding, and a manifest holds at most one of them.",
+          "enum": [
+            "zstd",
+            "identity",
+            "brotli-large-window",
+            "packed-brotli-large-window"
+          ]
+        },
+        "encodedSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "encodedBytes": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "zstd": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "level",
+            "windowLog"
+          ],
+          "properties": {
+            "level": {
+              "type": "integer",
+              "minimum": -5,
+              "maximum": 22
+            },
+            "windowLog": {
+              "type": "integer",
+              "minimum": 10,
+              "maximum": 23
+            }
+          }
+        },
+        "brotli": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "quality",
+            "windowBits"
+          ],
+          "properties": {
+            "quality": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 11
+            },
+            "windowBits": {
+              "type": "integer",
+              "minimum": 10,
+              "maximum": 30
+            }
+          }
+        },
+        "packed": {
+          "type": "object",
+          "description": "The packed body the stream decodes to: its format version and its length, which the stream's window covers and which is less than the decoded artifact's.",
+          "additionalProperties": false,
+          "required": [
+            "version",
+            "bodyBytes"
+          ],
+          "properties": {
+            "version": {
+              "const": 1
+            },
+            "bodyBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "encoding": {
+                "const": "zstd"
+              }
+            },
+            "required": [
+              "encoding"
+            ]
+          },
+          "then": {
+            "required": [
+              "zstd"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "zstd"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "encoding": {
+                "enum": [
+                  "brotli-large-window",
+                  "packed-brotli-large-window"
+                ]
+              }
+            },
+            "required": [
+              "encoding"
+            ]
+          },
+          "then": {
+            "required": [
+              "brotli"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "brotli"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "encoding": {
+                "const": "packed-brotli-large-window"
+              }
+            },
+            "required": [
+              "encoding"
+            ]
+          },
+          "then": {
+            "required": [
+              "packed"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "packed"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "artifactChunks": {
+      "type": "object",
+      "description": "The SHA-256 of each consecutive `bytes` bytes of the decoded artifact, in order, the last covering what is left: `sha256` has exactly ceil(decoded length / bytes) entries. A bootstrap plan copies it verbatim, and the client verifies each chunk as it arrives, before it reads any byte of the artifact. The decoded `sha256` stays the artifact's content address.",
+      "additionalProperties": false,
+      "required": [
+        "bytes",
+        "sha256"
+      ],
+      "properties": {
+        "bytes": {
+          "const": 4194304
+        },
+        "sha256": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/hashId"
+          }
+        }
+      }
+    },
+    "directColumnarIdentity": {
+      "type": "object",
+      "description": "The header identity fields the plan's hashes do not repeat. The client binds them against the encoded header at open, so they must be the strings the encoder wrote.",
+      "additionalProperties": false,
+      "required": [
+        "manifestVersion",
+        "authorizationScopeVersion"
+      ],
+      "properties": {
+        "manifestVersion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "authorizationScopeVersion": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "directColumnarSchema": {
+      "type": "object",
+      "description": "The physical schema of the image, verbatim from the encoder: `schemaHash` is the SHA-256 of its canonical JSON in this key order (`format`, `version`, `tables[name, primaryKey, columns[name, type, nullable]]`), and the decoder recomputes it before it reads a byte of payload. Its table names are exactly the manifest's `tables[].localTable`s.",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "version",
+        "tables"
+      ],
+      "properties": {
+        "format": {
+          "const": "calque-direct-columnar"
+        },
+        "version": {
+          "const": 4
+        },
+        "tables": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/directColumnarTableSchema"
+          }
+        }
+      }
+    },
+    "directColumnarTableSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "primaryKey",
+        "columns"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "primaryKey": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "type",
+              "nullable"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "type": {
+                "enum": [
+                  "int64",
+                  "uint64",
+                  "f64",
+                  "timestamp",
+                  "bool",
+                  "utf8",
+                  "bytes",
+                  "uuid",
+                  "json",
+                  "decimal",
+                  "date",
+                  "time",
+                  "interval",
+                  "dict"
+                ]
+              },
+              "nullable": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
+    "column": {
+      "type": "object",
+      "description": "One wire column: the canonical change stream's column id and the source column it carries.",
+      "additionalProperties": false,
+      "required": [
+        "columnId",
+        "name"
+      ],
+      "properties": {
+        "columnId": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

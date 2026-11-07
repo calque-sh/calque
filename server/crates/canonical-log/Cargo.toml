@@ -1,0 +1,37 @@
+[package]
+name = "canonical-log"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# The filesystem canonical log, for tests that need a log without PostgreSQL.
+test-support = []
+
+[dependencies]
+hex = "0.4"
+postgres = "0.19.14"
+postgres-connect = { path = "../postgres-connect" }
+# A stored entry is a protobuf message whose operations are sync-protocol's
+# change-stream messages.
+prost = "0.14.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 0.11 hashes with the ARMv8 SHA-256 instructions, detected at run time. Every
+# log read hashes each record it returns, once for each browser it is read for.
+sha2 = { version = "0.11.0", default-features = false }
+sync-protocol = { path = "../sync-protocol" }
+sync-types = { path = "../sync-types" }
+thiserror = "1"
+
+[dev-dependencies]
+# calque's binary builds serde_json with `arbitrary_precision`, which
+# cdc-ingest asks for, so the tests decode entries with it as calque does.
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+tempfile = "3"
+
+[lints]
+workspace = true

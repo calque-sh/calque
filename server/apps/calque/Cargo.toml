@@ -1,0 +1,81 @@
+[package]
+name = "calque"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+artifact-catalog = { path = "../../crates/artifact-catalog" }
+authz = { path = "../../crates/authz" }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.22.1"
+blob-store = { path = "../../crates/blob-store" }
+calque-engine = { path = "../../crates/calque-engine" }
+clap = { version = "4.6.2", features = ["derive"] }
+dataset-grant = { path = "../../crates/dataset-grant" }
+# `init` and the mutation registry read one CRUD admission rule from here, so a
+# manifest declares exactly the operations and writable columns the registry
+# admits.
+mutation-crud = { path = "../../crates/mutation-crud" }
+# Raises the open-file limit at startup: every open change stream and request
+# in flight holds a socket. It reads macOS's per-process cap, which
+# `setrlimit` refuses to exceed.
+rlimit = "0.11.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Quotes the state directory in the `calque destroy` lines refusals print,
+# only where a shell would split or expand it. 2.0.1 is the version `cc`
+# already locks.
+shlex = "2.0.1"
+source-control = { path = "../../crates/source-control" }
+sync-types = { path = "../../crates/sync-types" }
+thiserror = "1"
+# `io-util` is the startup object-store probe reading its own object back.
+tokio = { version = "1.52.0", features = ["io-util", "net", "rt-multi-thread", "signal", "time"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+# `dev` logs each startup phase's wall time under `calque::preparation`.
+tracing = "0.1.44"
+# bootstrap-http, change-http and mutation-api emit spans and events on every
+# request; without a subscriber they are discarded and the process logs nothing.
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+uuid = { version = "1.23.0", features = ["v4"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The object-store probe's fault doubles implement `blob_store::BlobStore`,
+# which is an `#[async_trait]` trait.
+async-trait = "0.1.89"
+# The remedy tests build the refusal of a canonical log an earlier release
+# wrote, which reaches this crate only inside `calque_engine`'s errors.
+canonical-log = { path = "../../crates/canonical-log" }
+# The live suite mints real grants. A dev edge only: no server target links the
+# issuer.
+dataset-grant-issuer = { path = "../../crates/dataset-grant-issuer" }
+hex = "0.4.3"
+# The live suite drives its PostgreSQL source directly. The binary itself has
+# no PostgreSQL client: every connection it opens goes through
+# `calque_engine`, which takes only a guarded `DatabaseUrl`.
+postgres = "0.19.14"
+# The command manifest test registers the crud commands through the registry
+# `mutation-http` executes against.
+mutation-api = { path = "../../crates/mutation-api" }
+# The live suite decodes the change endpoint's protobuf frames rather than
+# trusting a header about them.
+prost = "0.14.4"
+# The TLS suite signs a stand-in remote PostgreSQL's certificate and
+# terminates TLS in front of the suite's PostgreSQL.
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+rustls = { version = "0.23.42", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"] }
+sync-protocol = { path = "../../crates/sync-protocol", features = ["test-support"] }
+# The tenant suite ages a stopped server's tenant directory, the way time
+# would. The engine already links this version.
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+tempfile = "3.27.0"
+# `#[tokio::test]` for the async object-store probe tests.
+tokio = { version = "1.52.0", features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,153 @@
+[package]
+name = "pg_walstream"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+documentation = "https://docs.rs/pg_walstream"
+readme = "README.md"
+description = "PostgreSQL logical replication protocol library - parse and handle PostgreSQL WAL streaming messages"
+keywords = ["postgresql", "replication", "wal", "logical-decoding", "streaming"]
+categories = ["database", "parsing", "network-programming", "no-std"]
+
+[workspace]
+members = ["macros"]
+exclude = ["examples", "fuzz", "load-tests"]
+
+[workspace.package]
+version = "0.8.0"
+edition = "2021"
+authors = ["danielshih <dog830228@gmail.com>"]
+license = "BSD-3-Clause"
+repository = "https://github.com/isdaniel/pg-walstream"
+homepage = "https://github.com/isdaniel/pg-walstream"
+rust-version = "1.87"
+
+[workspace.dependencies]
+pg-walstream-macros = { path = "macros", version = "=0.8.0" }
+
+[dependencies]
+tokio = { version = "1.52.3", features = ["io-util", "net", "time", "macros", "rt", "rt-multi-thread"], optional = true }
+tokio-util = { version = "0.7.18", optional = true }
+serde = { version = "1.0.228", default-features = false, features = ["derive", "rc", "alloc"] }
+chrono = { version = "0.4.45", default-features = false, features = ["serde", "alloc"] }
+bytes = { version = "1.12.1", default-features = false, features = ["serde"] }
+tracing = { version = "0.1.44", default-features = false }
+futures-core = { version = "0.3.32", default-features = false }
+memchr = { version = "2.8.3", default-features = false }
+smallvec = { version = "1.15.2", features = ["serde"] }
+pg-walstream-macros = { workspace = true, optional = true }
+
+# libpq backend (opt-in) — pq-sys: raw FFI to the system libpq via pkg-config, with pre-generated bindings (no libclang/bindgen at build time).
+pq-sys = { version = "0.7.5", optional = true }
+
+# rustls-tls
+tokio-rustls = { version = "0.26.4", optional = true }
+rustls = { version = "0.23.41", default-features = false, features = ["std", "tls12"], optional = true }
+webpki-roots = { version = "1.0.8", optional = true }
+postgres-protocol = { version = "0.6.12", optional = true }
+aws-lc-rs = { version = "1.17.1", optional = true }
+socket2 = { version = "0.6.4", features = ["all"], optional = true }
+
+[features]
+default = ["std", "rustls-tls"]
+derive = ["dep:pg-walstream-macros"]
+
+# Standard library support, on by default. Disable with `--no-default-features` for a no_std + alloc parser-only build (targets wasm and embedded).
+std = [
+    "serde/std",
+    "chrono/std",
+    "chrono/clock",
+    "bytes/std",
+    "tracing/std",
+    "futures-core/std",
+    "memchr/std",
+]
+
+libpq = ["dep:pq-sys", "dep:socket2", "dep:tokio", "dep:tokio-util", "std"]
+
+# Pure-Rust native backend: uses rustls with aws-lc-rs forhardware-accelerated TLS crypto (AES-NI, AVX2, SHA-NI), requires cmake + C compiler at build time.
+rustls-tls = [
+    "dep:tokio",
+    "tokio/sync",
+    "dep:tokio-util",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:webpki-roots",
+    "dep:postgres-protocol",
+    "dep:aws-lc-rs",
+    "dep:socket2",
+    "rustls/aws_lc_rs",
+    "std",
+]
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["full"] }
+criterion = { package = "codspeed-criterion-compat", version = "5.0.1", features = ["html_reports"] }
+futures = "0.3.32"
+serde_bytes = "0.11.19"
+proptest = "1.11"
+serde_json = "1.0.150"
+
+[[test]]
+name = "snapshot_export"
+path = "integration-tests/snapshot_export.rs"
+
+[[test]]
+name = "rate_limited_streaming"
+path = "integration-tests/rate_limited_streaming.rs"
+
+[[test]]
+name = "safe_transaction_consumer"
+path = "integration-tests/safe_transaction_consumer.rs"
+
+[[test]]
+name = "complex_types"
+path = "integration-tests/complex_types.rs"
+
+[[test]]
+name = "typed_deserialization"
+path = "integration-tests/typed_deserialization.rs"
+
+[[test]]
+name = "ssl_connections"
+path = "integration-tests/ssl_connections.rs"
+
+[[test]]
+name = "pgoutput_fidelity"
+path = "integration-tests/pgoutput_fidelity.rs"
+
+[[test]]
+name = "streaming_decode"
+path = "integration-tests/streaming_decode.rs"
+
+[[test]]
+name = "pg_result_get_bytes"
+path = "integration-tests/pg_result_get_bytes.rs"
+
+[[test]]
+name = "binary_columns"
+path = "integration-tests/binary_columns.rs"
+
+[[test]]
+name = "ergonomics"
+path = "integration-tests/ergonomics.rs"
+
+[[test]]
+name = "bounded_replay"
+path = "integration-tests/bounded_replay.rs"
+
+[[test]]
+name = "raw_xlogdata"
+path = "integration-tests/raw_xlogdata.rs"
+
+[[bench]]
+name = "wal_pipeline"
+harness = false
+
+[[bench]]
+name = "deserialize"
+harness = false

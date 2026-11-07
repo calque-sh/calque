@@ -1,0 +1,12 @@
+// The Vite plugin runs in Node, so it builds in a program with Node's types.
+// That program also emits the two starter modules the plugin imports;
+// `pnpm build` runs it first, so dist keeps tsconfig.build.json's output of
+// them.
+{
+  "extends": "./tsconfig.build.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": ["src/vite.ts"],
+  "exclude": []
+}

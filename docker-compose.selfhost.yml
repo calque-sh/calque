@@ -1,0 +1,290 @@
+# The self-hosted Calque deployment: PostgreSQL 18, an S3-compatible object
+# store, `calque serve`, and Caddy terminating TLS in front of it.
+#
+# This is a second compose file, not a change to `docker-compose.yml`, because
+# the two answer different questions and share nothing but the PostgreSQL
+# image tag. `docker-compose.yml` is one development PostgreSQL on loopback
+# with a committed password, for `pnpm demo`, and runs no server. Adding one
+# would put a committed secret on the deployment path and would move every
+# `pnpm demo` flow onto a server it does not want.
+#
+# Nothing in this file is a secret. Every credential is interpolated from the
+# environment and refuses to default, so `docker compose up` without them
+# stops with the variable's own message rather than starting on a guessable
+# password. Connection strings reach the server through named environment
+# variables and never through argv, so they are absent from `ps` and from
+# shell history.
+#
+# They are NOT absent from `docker inspect`: the values below reach the
+# container as its environment, and `docker inspect` prints a container's
+# environment verbatim, as does `/proc/<pid>/environ`. Anyone who can talk to
+# the Docker socket can read these. Argv is the exposure the environment
+# closes, and it is the only one -- keep the credentials run-scoped and treat
+# the host as trusted.
+#
+# What this composition does NOT provide is in docs/design/operations.md
+# ("What the self-hosted composition does not do"). It is one process per service on
+# one host: no failover, no horizontal scaling, no rolling upgrade and no
+# connection draining. TLS ends at the `caddy` service: the hops behind it, to
+# `calque serve` and from it to the object store, are plaintext on the
+# composition's bridge network.
+#
+# The bring-up is two steps -- the manifest has to exist before the server
+# starts -- and every variable this file reads has a row in the table in
+# docs/design/operations.md ("The self-hosted deployment"). Follow that.
+# `pnpm selfhost:e2e` is the same sequence run unattended against run-scoped
+# credentials, from a clean state to `down -v`, if you would rather read code:
+# scripts/selfhost-compose-e2e.ts.
+
+name: ${CALQUE_SELFHOST_PROJECT:-calque-selfhost}
+
+services:
+  # PostgreSQL 18 with logical decoding, reached by the server over the Unix
+  # socket on the `postgres-socket` volume below. The two services are
+  # otherwise independent: each publishes its own port, and either can be
+  # recreated without taking the other's network with it.
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${CALQUE_SELFHOST_POSTGRES_SUPERUSER:-calque_admin}
+      POSTGRES_PASSWORD: ${CALQUE_SELFHOST_POSTGRES_SUPERUSER_PASSWORD:?a run-scoped PostgreSQL superuser password is required}
+      POSTGRES_DB: ${CALQUE_SELFHOST_DATABASE:-calque}
+      # initdb writes its Unix-socket and loopback pg_hba rules as
+      # scram-sha-256 instead of its default, trust. The image appends its own
+      # scram-sha-256 rule after them and pg_hba is first-match-wins, so with
+      # trust rules a socket or loopback client would never be asked for a
+      # password. docker/selfhost-postgres-init/10-calque-no-trust-rules.sh
+      # fails the first start if a trust rule is left. The image's entrypoint
+      # exports PGPASSWORD to its init scripts for this case, so they still
+      # connect.
+      POSTGRES_INITDB_ARGS: "--auth=scram-sha-256"
+      # Read by docker/selfhost-postgres-init to create the least-privilege
+      # role the server connects as. Enrollment refuses a superuser with
+      # SUPERUSER_NOT_LEAST_PRIVILEGE, so the bootstrap role above can never be
+      # the one `calque serve` uses.
+      CALQUE_SELFHOST_DB_ROLE: ${CALQUE_SELFHOST_DB_ROLE:-calque_sync}
+      CALQUE_SELFHOST_DB_PASSWORD: ${CALQUE_SELFHOST_DB_PASSWORD:?a run-scoped password for the Calque database role is required}
+    volumes:
+      - ./docker/selfhost-postgres-init:/docker-entrypoint-initdb.d:ro
+      # PostgreSQL 18's image wants the mount one level above the data
+      # directory: it refuses to start on a volume at
+      # `/var/lib/postgresql/data`, because `pg_upgrade --link` cannot cross a
+      # mount-point boundary. Mounting `/var/lib/postgresql` puts the cluster
+      # in a major-versioned subdirectory inside the volume instead.
+      - postgres-data:/var/lib/postgresql
+      # The cluster's Unix socket directory, shared with the `calque` service.
+      # The image creates it mode 3777 owned by `postgres`, so the volume
+      # inherits that and the server container connects as its own user. This
+      # is the whole of the server's path to the database: no address, no
+      # name, no interface.
+      - postgres-socket:/var/run/postgresql
+    ports:
+      # The database, for the operator: enrolment inspection, seeding, backup.
+      - "127.0.0.1:${CALQUE_SELFHOST_POSTGRES_PORT:-55452}:5432"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "timezone=UTC"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -h 127.0.0.1",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # The S3-compatible object store the published artifacts live in. Its data
+  # is a named volume, so artifact bytes outlive every container in this file:
+  # that is the whole reason the deployment does not use the filesystem store.
+  #
+  # MinIO, pinned by digest to `pgsty/minio` RELEASE.2026-08-04T00-00-00Z, a
+  # community build of MinIO's AGPL source for linux/amd64 and linux/arm64.
+  # MinIO no longer publishes community images: `minio/minio` is gone from
+  # Docker Hub, and `quay.io/minio/minio` answers `unauthorized` for the
+  # digest this file used to pin. The image carries `mc` and `curl`, so
+  # `objectstore-init` and the health check use it too. `pnpm verify:s3:minio`
+  # runs the adapter's conformance against the same digest.
+  objectstore:
+    image: pgsty/minio@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+    command: ["server", "/data", "--address", ":9000"]
+    environment:
+      MINIO_ROOT_USER: ${CALQUE_S3_ACCESS_KEY:?a run-scoped object-store access key is required}
+      MINIO_ROOT_PASSWORD: ${CALQUE_S3_SECRET_KEY:?a run-scoped object-store secret key is required}
+    volumes:
+      - objectstore-data:/data
+    ports:
+      # For the operator and for the blob-store conformance run, which points
+      # at this same store. Loopback only.
+      - "127.0.0.1:${CALQUE_SELFHOST_S3_PORT:-59001}:9000"
+    healthcheck:
+      test:
+        ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/ready"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # Creates the bucket and exits. `calque serve` never creates one: provisioning
+  # storage is an operator action, and a server that can create its own bucket
+  # is a server that answers a typo by silently starting somewhere empty.
+  objectstore-init:
+    # The same image as `objectstore`: it carries `mc`.
+    image: pgsty/minio@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+    depends_on:
+      objectstore:
+        condition: service_healthy
+    environment:
+      MC_HOST_selfhost: http://${CALQUE_S3_ACCESS_KEY:?}:${CALQUE_S3_SECRET_KEY:?}@objectstore:9000
+      CALQUE_S3_BUCKET: ${CALQUE_S3_BUCKET:-calque-artifacts}
+    entrypoint: ["/bin/sh", "-c"]
+    # `MC_HOST_selfhost` is how `mc` takes an alias without writing credentials
+    # to a config file, and `--ignore-existing` makes a re-run idempotent.
+    command:
+      - 'mc mb --ignore-existing "selfhost/$${CALQUE_S3_BUCKET}"'
+    restart: "no"
+
+  calque:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${CALQUE_SELFHOST_IMAGE:-calque:selfhost}
+    # The server reaches PostgreSQL over the Unix socket on the shared
+    # `postgres-socket` volume. `DatabaseUrl::parse` accepts a host name such
+    # as `postgres` only over TLS that verifies its certificate, and this
+    # PostgreSQL has none; a socket needs no certificate and puts nothing on a
+    # network. It also leaves the two services independent: this one publishes
+    # its own port, and recreating `postgres` does not take this container's
+    # network with it. `docs/design/operations.md` records the rule.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      objectstore-init:
+        condition: service_completed_successfully
+    ports:
+      # The server's own plaintext listener, on loopback, for the operator's
+      # probes. Browsers use the `caddy` service. A browser sent here is
+      # refused with 421: it sends `Host: <name>:8787`, and the server answers
+      # only the bare public host Caddy forwards, so a probe has to name it
+      # (`curl -H "Host: localhost" ...`).
+      - "127.0.0.1:${CALQUE_SELFHOST_HTTP_PORT:-8787}:8787"
+      # The metrics listener, the only one that serves `/metrics`, on
+      # loopback for the operator's scraper. Caddy forwards to 8787, which
+      # has no `/metrics` route, so the TLS edge serves no scrape.
+      - "127.0.0.1:${CALQUE_SELFHOST_METRICS_PORT:-8788}:8788"
+    volumes:
+      - ${CALQUE_SELFHOST_CONFIG:?the path to a calque.config.json is required}:/etc/calque/calque.config.json:ro
+      - calque-state:/var/lib/calque
+      # Recovery units. `backup --output /recovery/<unit>` writes here and
+      # `restore --backup` reads here, from a one-off `docker compose run` of
+      # this service. A volume of its own, so losing `calque-state` does not
+      # take the units with it; and a volume rather than a host directory,
+      # because a bind mount keeps the host directory's owner, which on Linux
+      # is not the image's user, and `backup` fails on its first write. A unit
+      # moves between this volume and the host as a tar stream:
+      # docs/design/operations.md ("Backup and restore against the
+      # composition").
+      - calque-recovery:/recovery
+      # Read-only: connecting to a socket needs no write access to the
+      # directory that holds it, so the server cannot create anything beside
+      # PostgreSQL's own socket.
+      - postgres-socket:/var/run/postgresql:ro
+    environment:
+      # The manifest's `sources[].connectionEnv` names this variable. The
+      # socket form takes its credentials as `user`/`password` query parameters
+      # because a URL with an empty authority cannot carry userinfo; they are
+      # interpolated into a URL query, so the role's password has to be
+      # URL-safe (hexadecimal is the safe shape, as for the object-store keys).
+      CALQUE_DATABASE_URL: postgresql:///${CALQUE_SELFHOST_DATABASE:-calque}?host=%2Fvar%2Frun%2Fpostgresql&user=${CALQUE_SELFHOST_DB_ROLE:-calque_sync}&password=${CALQUE_SELFHOST_DB_PASSWORD:?}
+      CALQUE_GRANT_VERIFICATION_KEY: ${CALQUE_SELFHOST_GRANT_VERIFICATION_KEY:?the JSON verification-key object for this deployment's dataset grants is required}
+      CALQUE_OBJECT_STORE: s3
+      CALQUE_S3_BUCKET: ${CALQUE_S3_BUCKET:-calque-artifacts}
+      CALQUE_S3_PREFIX: ${CALQUE_S3_PREFIX:-calque}
+      CALQUE_S3_REGION: ${CALQUE_S3_REGION:-us-east-1}
+      CALQUE_S3_ENDPOINT: http://${CALQUE_SELFHOST_S3_HOST:-objectstore}:9000
+      CALQUE_S3_ACCESS_KEY: ${CALQUE_S3_ACCESS_KEY:?}
+      CALQUE_S3_SECRET_KEY: ${CALQUE_S3_SECRET_KEY:?}
+      # A self-hosted store is reached by name or address, which is not a
+      # virtual-host bucket name.
+      CALQUE_S3_FORCE_PATH_STYLE: "1"
+    command:
+      - "serve"
+      - "--config"
+      - "/etc/calque/calque.config.json"
+      - "--state-dir"
+      - "/var/lib/calque/state"
+      - "--grant-audience"
+      - "${CALQUE_SELFHOST_GRANT_AUDIENCE:?the dataset-grant audience this deployment requires is required}"
+      - "--grant-verification-key-env"
+      - "CALQUE_GRANT_VERIFICATION_KEY"
+      - "--allow-origin"
+      - "${CALQUE_SELFHOST_ALLOWED_ORIGIN:-http://127.0.0.1:5173}"
+      - "--bind-address"
+      - "0.0.0.0"
+      - "--port"
+      - "8787"
+      # The exact `Host` this process answers: the public host with no port,
+      # which is what Caddy forwards (docker/selfhost-caddy/Caddyfile). The
+      # check stays one byte-equal comparison.
+      - "--expected-host"
+      - "${CALQUE_SELFHOST_PUBLIC_HOST:-localhost}"
+      # On every interface inside the container, which is where the published
+      # port arrives. The Host it answers is the published address, so a
+      # scraper on the host needs no Host override:
+      # `curl http://127.0.0.1:8788/metrics` with the default port.
+      - "--metrics-bind-address"
+      - "0.0.0.0:8788"
+      - "--metrics-expected-host"
+      - "127.0.0.1:${CALQUE_SELFHOST_METRICS_PORT:-8788}"
+      # What the browser addresses. Artifact and change URLs in every plan are
+      # built on it, so they name the HTTPS edge and never this listener.
+      - "--public-base-url"
+      - "https://${CALQUE_SELFHOST_PUBLIC_HOST:-localhost}:${CALQUE_SELFHOST_HTTPS_PORT:-8443}/"
+    # An orderly stop drains HTTP, ends the CDC loop, waits for PostgreSQL to
+    # let go of the slot and releases the source lease, which took 1-2 s in
+    # the self-host e2e with a page long-polling. Killed before that, the
+    # server leaves its lease held for up to one lease TTL (10 s), and the
+    # next start waits it out. The engine's default grace is not something to
+    # rely on: a container created without one got 1 s on the Docker Desktop
+    # host this composition was tested on.
+    stop_grace_period: 30s
+    restart: "no"
+
+  # The TLS edge: the only way a browser reaches `calque serve`. It depends on
+  # nothing, so recreating the server behind it leaves it up, answering 502
+  # until the server is back, and the certificate and local CA it keeps on
+  # `caddy-data` survive both.
+  #
+  # Caddy 2.11.4 (`caddy:2.11.4-alpine`), pinned by the digest of its
+  # multi-platform index.
+  caddy:
+    image: caddy@sha256:6aeddd44c3078b0f9a35206472a11420648a79c184603ef95957d0a20044cb2b
+    environment:
+      # The one name the edge serves and takes a certificate for. The default,
+      # `localhost`, gets one from Caddy's local CA; a public domain whose DNS
+      # points at this host gets one from a public ACME CA.
+      CALQUE_PUBLIC_HOST: ${CALQUE_SELFHOST_PUBLIC_HOST:-localhost}
+    ports:
+      # Loopback by default. A real host publishes 443 on every interface:
+      # CALQUE_SELFHOST_HTTPS_ADDRESS=0.0.0.0 CALQUE_SELFHOST_HTTPS_PORT=443.
+      - "${CALQUE_SELFHOST_HTTPS_ADDRESS:-127.0.0.1}:${CALQUE_SELFHOST_HTTPS_PORT:-8443}:443"
+    volumes:
+      - ./docker/selfhost-caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: "no"
+
+volumes:
+  postgres-data:
+  postgres-socket:
+  objectstore-data:
+  calque-state:
+  calque-recovery:
+  caddy-data:
+  caddy-config:

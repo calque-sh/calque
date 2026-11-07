@@ -1,0 +1,83 @@
+[package]
+name = "calque-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+dataset-grant = { path = "../dataset-grant" }
+direct-columnar = { path = "../direct-columnar" }
+artifact-catalog = { path = "../artifact-catalog" }
+artifact-contract = { path = "../artifact-contract" }
+async-trait = "0.1.89"
+authz = { path = "../authz" }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+# A re-cut's build and every re-encode run in the scheduler's background class.
+background-thread = { path = "../background-thread" }
+base64 = "0.22.1"
+blob-store = { path = "../blob-store" }
+bootstrap-api = { path = "../bootstrap-api" }
+bootstrap-http = { path = "../bootstrap-http" }
+canonical-log = { path = "../canonical-log" }
+# The CDC reconnect classifier matches the ingest errors source-runtime wraps.
+cdc-ingest = { path = "../cdc-ingest" }
+change-api = { path = "../change-api" }
+change-http = { path = "../change-http" }
+getrandom = "0.3.4"
+hex = "0.4.3"
+# Plan tokens and artifact capabilities are HMAC-SHA-256, as bootstrap-api's
+# resident-state proofs are.
+hmac = "0.12.1"
+http-body = "1.0.1"
+mutation-api = { path = "../mutation-api" }
+mutation-crud = { path = "../mutation-crud" }
+mutation-http = { path = "../mutation-http" }
+pgoutput-decoder = { path = "../pgoutput-decoder" }
+# The guard writes connection-string query values in the percent-encoding
+# libpq and tokio-postgres decode; form encoding turns a space into `+`.
+percent-encoding = "2.3.2"
+pin-project-lite = "0.2.16"
+postgres = "0.19.14"
+postgres-connect = { path = "../postgres-connect" }
+prometheus-client = "0.25.0"
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+snapshot-builder = { path = "../snapshot-builder" }
+snapshot-coordinator = { path = "../snapshot-coordinator" }
+snapshot-pipeline = { path = "../snapshot-pipeline" }
+source-control = { path = "../source-control" }
+source-runtime = { path = "../source-runtime" }
+subtle = "2.6.1"
+sync-protocol = { path = "../sync-protocol" }
+sync-types = { path = "../sync-types" }
+thiserror = "1"
+time = { version = "0.3.47", features = ["formatting", "parsing"] }
+tokio = { version = "1.52.0", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-postgres = "0.7.18"
+tokio-util = { version = "0.7.18", features = ["io", "rt"] }
+tracing = "0.1.44"
+url = "2.5.8"
+uuid = { version = "1.23.0", features = ["v4"] }
+
+[dev-dependencies]
+# The re-encode tests decode the brotli objects they publish, as a client
+# would.
+brotli = { workspace = true }
+canonical-log = { path = "../canonical-log", features = ["test-support"] }
+dataset-grant-issuer = { path = "../dataset-grant-issuer" }
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+snapshot-pipeline = { path = "../snapshot-pipeline", features = ["test-support"] }
+# The change tail's tests read the frames a build writes, as a client would.
+sync-protocol = { path = "../sync-protocol", features = ["test-support"] }
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }
+# The re-encode tests decode the objects they publish, as a client would.
+zstd = { version = "0.13.3", default-features = false }
+
+[lints]
+workspace = true

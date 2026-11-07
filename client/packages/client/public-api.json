@@ -1,0 +1,254 @@
+{
+  "packageSubpaths": [
+    ".",
+    "./generated",
+    "./internal",
+    "./bootstrap-start",
+    "./bootstrap-render",
+    "./vite"
+  ],
+  "reachableDeclarationGraphSha256": "3130b45e67008504c85d4ed3dde0f2ef8094f6e3bc135c3cabb929c75ba8a5a6",
+  "rootValues": [
+    "MutationSubmissionError",
+    "SyncError",
+    "and",
+    "createSyncClient",
+    "eq",
+    "gt",
+    "gte",
+    "isNotNull",
+    "isNull",
+    "lt",
+    "lte",
+    "neq",
+    "not",
+    "or"
+  ],
+  "rootTypes": [
+    "ClientSchema",
+    "CollectionFacade",
+    "CollectionFacades",
+    "CollectionShape",
+    "CollectionShapes",
+    "GrantVerificationKey",
+    "GroupedQueryBuilder",
+    "JoinSource",
+    "JoinedColumns",
+    "LiveQueryResource",
+    "LiveQuerySnapshot",
+    "MutationResult",
+    "MutationState",
+    "MutationStatus",
+    "ProjectedName",
+    "ProjectedRow",
+    "QueryBuilder",
+    "QueryJoinKind",
+    "QueryLiveOptions",
+    "QueryLiveWindowOptions",
+    "QueryNullPlacement",
+    "QueryOrderDirection",
+    "QueryPredicate",
+    "QueryRunOptions",
+    "QueryWindow",
+    "QueryWindowOptions",
+    "Register",
+    "RegisteredCollections",
+    "SyncAuth",
+    "SyncClient",
+    "SyncClientCollections",
+    "SyncClientOptions",
+    "SyncErrorCode",
+    "SyncErrorScope",
+    "SyncPublication",
+    "SyncRecovery",
+    "SyncStatus"
+  ],
+  "syncClientMembers": [
+    "close",
+    "db",
+    "mutationStatus",
+    "refresh",
+    "reset",
+    "retryMutation",
+    "status",
+    "subscribe",
+    "subscribeMutation",
+    "subscribeMutations",
+    "subscribePublications"
+  ],
+  "syncClientReadonlyDataMembers": ["db", "status"],
+  "syncClientReadonlyFunctionMembers": [
+    "close",
+    "mutationStatus",
+    "refresh",
+    "reset",
+    "retryMutation",
+    "subscribe",
+    "subscribeMutation",
+    "subscribeMutations",
+    "subscribePublications"
+  ],
+  "syncClientOptions": [
+    "auth",
+    "deviceId",
+    "endpoint",
+    "fetch",
+    "grantVerificationKey",
+    "memoryBudgetBytes",
+    "schema"
+  ],
+  "syncAuthMembers": ["bearerToken"],
+  "syncClientAuthReturnTypes": ["SyncAuth", "Promise<SyncAuth>"],
+  "syncStatusVariants": {
+    "closed": ["state"],
+    "error": ["error", "state"],
+    "initializing": ["state"],
+    "locked": ["error", "reason", "state"],
+    "preparing": ["state"],
+    "ready": ["state"]
+  },
+  "mutationResultVariants": {
+    "already_canonical": {
+      "members": ["message", "mutationId", "state"],
+      "optional": []
+    },
+    "awaiting_canonical_echo": {
+      "members": ["message", "mutationId", "state"],
+      "optional": []
+    },
+    "conflict": {
+      "members": ["conflict", "message", "mutationId", "state"],
+      "optional": []
+    },
+    "rejected": {
+      "members": ["message", "mutationId", "state"],
+      "optional": []
+    },
+    "retryable": {
+      "members": ["message", "mutationId", "retryAfterMs", "state"],
+      "optional": []
+    }
+  },
+  "mutationStatusVariants": {
+    "ambiguous": {
+      "members": ["collection", "error", "key", "mutationId", "state"],
+      "optional": []
+    },
+    "awaiting_canonical_echo": {
+      "members": ["collection", "key", "mutationId", "result", "state"],
+      "optional": [],
+      "resultStates": ["already_canonical", "awaiting_canonical_echo"]
+    },
+    "canonical": {
+      "members": ["collection", "key", "mutationId", "result", "state"],
+      "optional": [],
+      "resultStates": ["already_canonical", "awaiting_canonical_echo"]
+    },
+    "conflict": {
+      "members": ["collection", "key", "mutationId", "result", "state"],
+      "optional": [],
+      "resultStates": ["conflict"]
+    },
+    "rejected": {
+      "members": ["collection", "key", "mutationId", "result", "state"],
+      "optional": [],
+      "resultStates": ["rejected"]
+    },
+    "retryable": {
+      "members": ["collection", "key", "mutationId", "result", "state"],
+      "optional": [],
+      "resultStates": ["retryable"]
+    },
+    "submitting": {
+      "members": ["collection", "key", "mutationId", "state"],
+      "optional": []
+    }
+  },
+  "mutationSubmissionErrorMembers": ["code", "mutationId"],
+  "mutationSubmissionErrorCodes": [
+    "AUTH_FAILED",
+    "MUTATION_AMBIGUOUS",
+    "MUTATION_REJECTED"
+  ],
+  "mutationSubmissionErrorRuntimeOwnKeys": [
+    "code",
+    "mutationId",
+    "name",
+    "recovery",
+    "scope"
+  ],
+  "liveQueryResourceMembers": [
+    "getServerSnapshot",
+    "getSnapshot",
+    "promise",
+    "subscribe"
+  ],
+  "liveQueryResourceReadonlyDataMembers": ["promise"],
+  "liveQueryResourceReadonlyFunctionMembers": [
+    "getServerSnapshot",
+    "getSnapshot",
+    "subscribe"
+  ],
+  "syncPublicationMembers": [
+    "changedCollections",
+    "cursor",
+    "latestCommitTimeUnixMicros",
+    "transactionCount"
+  ],
+  "generatedValues": ["createGeneratedClientSchema"],
+  "generatedTypes": [],
+  "internalValues": [
+    "createGeneratedClientSchema",
+    "createInternalColumnarClient"
+  ],
+  "internalTypes": [
+    "GeneratedClientCollectionColumnDescriptor",
+    "GeneratedClientCollectionDescriptor",
+    "GeneratedClientCollectionWritesDescriptor",
+    "GeneratedClientColumnKind",
+    "GeneratedClientCrudOperation",
+    "GeneratedClientSchemaDescriptor",
+    "InternalSyncClientOptions"
+  ],
+  "bootstrapStartValues": [
+    "BOOTSTRAP_START_SCRIPT",
+    "BOOTSTRAP_START_SCRIPT_SHA256",
+    "renderedConnection",
+    "startBootstrap",
+    "startedAuth"
+  ],
+  "bootstrapStartTypes": [
+    "BootstrapRequest",
+    "BootstrapStart",
+    "RenderedConnection"
+  ],
+  "bootstrapStartDeclarationGraphSha256": "544284d642b1a9e5fcb298f48881ce71e55b19d9b35538695a150a2cd8f6445a",
+  "bootstrapRenderValues": ["renderBootstrap"],
+  "bootstrapRenderTypes": [
+    "BootstrapRequest",
+    "RenderBootstrapOptions",
+    "RenderedConnection"
+  ],
+  "bootstrapRenderDeclarationGraphSha256": "0f15784fe75b2bc4159a6f8654250a383cdd9368151aa834726e696daeea4fc2",
+  "vitePluginValues": ["calque"],
+  "vitePluginTypes": ["CalquePluginOptions"],
+  "vitePluginDeclarationGraphSha256": "9cdc3ad0a1cfd2de78fb74e66756bf47037ec6729cf33b7c3482333d0d9d0adc",
+  "reactRootValues": [
+    "SyncProvider",
+    "useLiveQuery",
+    "useLiveWindow",
+    "useMutationStatus",
+    "usePendingWrite",
+    "useSuspenseLiveQuery",
+    "useSyncClient",
+    "useSyncStatus"
+  ],
+  "reactRootTypes": [
+    "LiveQuerySource",
+    "LiveWindowSnapshot",
+    "LiveWindowSource",
+    "PendingWriteCollection",
+    "PendingWriteKey",
+    "SyncProviderProps"
+  ]
+}

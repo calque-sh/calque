@@ -1,0 +1,35 @@
+[package]
+name = "change-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+authz = { path = "../authz" }
+# A transaction's frames are encoded once per scope and written to every
+# response of that scope, so they are refcounted bytes rather than copies.
+bytes = "1"
+canonical-log = { path = "../canonical-log" }
+mutation-api = { path = "../mutation-api" }
+prost = "0.14.4"
+source-control = { path = "../source-control" }
+sync-protocol = { path = "../sync-protocol" }
+sync-types = { path = "../sync-types" }
+thiserror = "2.0.18"
+uuid = { version = "1.23.0", features = ["v4", "fast-rng"] }
+
+[dev-dependencies]
+canonical-log = { path = "../canonical-log", features = ["test-support"] }
+mutation-api = { path = "../mutation-api", features = ["test-support"] }
+postgres = "0.19.14"
+# Negative revocation-barrier vectors have to be validly signed to prove
+# anything about the binding checks, so the tests need a real Ed25519 signer.
+ring = "0.17.14"
+sync-protocol = { path = "../sync-protocol", features = ["test-support"] }
+tempfile = "3"
+
+[lints]
+workspace = true

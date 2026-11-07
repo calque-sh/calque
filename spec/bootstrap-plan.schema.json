@@ -1,0 +1,388 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:calque:bootstrap-plan:v1",
+  "title": "Authenticated bootstrap plan",
+  "description": "Draft v1. Dynamic plan selecting immutable artifacts, delivery URLs, a fixed activation fence, and the canonical catch-up stream.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocolVersion",
+    "planId",
+    "issuedAt",
+    "expiresAt",
+    "source",
+    "authorization",
+    "requiredTables",
+    "activationCursor",
+    "nextResidentStateProof",
+    "artifacts",
+    "changeStream",
+    "memory"
+  ],
+  "properties": {
+    "protocolVersion": { "const": 1 },
+    "planId": { "$ref": "#/$defs/id" },
+    "issuedAt": { "type": "string", "format": "date-time" },
+    "expiresAt": { "type": "string", "format": "date-time" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceEpoch",
+        "publicationGeneration",
+        "schemaGeneration",
+        "authorizationGeneration",
+        "authorizationPolicyHash"
+      ],
+      "properties": {
+        "sourceEpoch": { "$ref": "#/$defs/id" },
+        "publicationGeneration": { "$ref": "#/$defs/nonNegativeInteger" },
+        "schemaGeneration": { "$ref": "#/$defs/nonNegativeInteger" },
+        "authorizationGeneration": { "$ref": "#/$defs/nonNegativeInteger" },
+        "authorizationPolicyHash": { "$ref": "#/$defs/hashId" }
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policyHash", "scopeHash", "scopeToken"],
+      "properties": {
+        "policyHash": { "$ref": "#/$defs/hashId" },
+        "scopeHash": { "$ref": "#/$defs/hashId" },
+        "scopeToken": { "type": "string", "minLength": 1 }
+      }
+    },
+    "requiredTables": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/id" },
+      "uniqueItems": true
+    },
+    "residentTables": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": { "$ref": "#/$defs/id" },
+      "uniqueItems": true,
+      "default": []
+    },
+    "residentCursor": { "$ref": "#/$defs/cursor" },
+    "activationCursor": { "$ref": "#/$defs/cursor" },
+    "nextResidentStateProof": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1048576
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifactInstall" }
+    },
+    "changeStream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "endpoint",
+        "wireProtocol",
+        "fromCursorExclusive",
+        "throughCursorInclusive",
+        "longPollTimeoutMs",
+        "maxBatchBytes"
+      ],
+      "properties": {
+        "endpoint": { "type": "string", "format": "uri" },
+        "wireProtocol": { "const": "sync.change.v1" },
+        "fromCursorExclusive": { "$ref": "#/$defs/cursor" },
+        "throughCursorInclusive": { "$ref": "#/$defs/cursor" },
+        "longPollTimeoutMs": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 120000
+        },
+        "maxBatchBytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 16777216
+        }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimumSafeBudgetBytes",
+        "stagingOverlapBytes",
+        "queryResultReserveBytes",
+        "catchUpReserveBytes",
+        "clientHeapReserveBytes"
+      ],
+      "properties": {
+        "minimumSafeBudgetBytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "stagingOverlapBytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "queryResultReserveBytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "catchUpReserveBytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "clientHeapReserveBytes": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "replan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "endpoint",
+        "allowedAfterNetworkMiss",
+        "allowedAfterAllocationFailure"
+      ],
+      "properties": {
+        "endpoint": { "type": "string", "format": "uri" },
+        "allowedAfterNetworkMiss": { "type": "boolean" },
+        "allowedAfterAllocationFailure": { "type": "boolean" }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*$"
+    },
+    "hashId": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "cursor": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "positiveInteger": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "artifactInstall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifactId",
+        "manifestId",
+        "attachAs",
+        "snapshotCursor",
+        "tables",
+        "decodedSha256",
+        "decodedBytes",
+        "bufferCapacityBytes",
+        "runtime",
+        "selectedRepresentation",
+        "installOrder"
+      ],
+      "properties": {
+        "artifactId": { "$ref": "#/$defs/id" },
+        "manifestId": { "$ref": "#/$defs/id" },
+        "attachAs": {
+          "type": "string",
+          "pattern": "^stage_[0-9]{4}$"
+        },
+        "snapshotCursor": { "$ref": "#/$defs/cursor" },
+        "tables": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/id" },
+          "uniqueItems": true
+        },
+        "decodedSha256": { "$ref": "#/$defs/sha256" },
+        "decodedBytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "bufferCapacityBytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "runtime": { "$ref": "#/$defs/artifactRuntime" },
+        "installOrder": { "type": "integer", "minimum": 0 },
+        "selectedRepresentation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "representationId",
+            "encoding",
+            "encodedBytes",
+            "downloadUrl"
+          ],
+          "properties": {
+            "representationId": { "$ref": "#/$defs/hashId" },
+            "encoding": {
+              "enum": ["zstd", "identity", "brotli-large-window", "packed-brotli-large-window"]
+            },
+            "encodedBytes": { "$ref": "#/$defs/nonNegativeInteger" },
+            "downloadUrl": { "type": "string", "format": "uri" },
+            "expiresAt": { "type": "string", "format": "date-time" }
+          }
+        }
+      }
+    },
+    "artifactRuntime": {
+      "type": "object",
+      "description": "Install-time facts for one artifact, a CALQART1-framed image at format version 4; the format fields mirror the immutable manifest's `decoded`. `schemaHash` and `collectionSetHash` repeat the identity written into the encoded header, so the client binds the bytes it downloaded to the plan that selected them. `identity` carries the two header strings those hashes do not pin, and `schema` the physical schema the decoder re-hashes to `schemaHash`; a client that opens the artifact requires both, and a server that binds one for such a client emits them. `spec/bootstrap-plan.direct-columnar.example.json` is the checked-in vector.",
+      "unevaluatedProperties": false,
+      "required": [
+        "tableSetHash",
+        "shardProfileHash",
+        "indexProfileHash",
+        "tables",
+        "format",
+        "schemaHash",
+        "collectionSetHash",
+        "formatVersion",
+        "chunks"
+      ],
+      "properties": {
+        "tableSetHash": { "$ref": "#/$defs/hashId" },
+        "shardProfileHash": { "$ref": "#/$defs/hashId" },
+        "indexProfileHash": { "$ref": "#/$defs/hashId" },
+        "tables": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/artifactRuntimeTable" }
+        },
+        "format": { "const": "directColumnar" },
+        "schemaHash": { "$ref": "#/$defs/hashId" },
+        "collectionSetHash": { "$ref": "#/$defs/hashId" },
+        "formatVersion": { "const": 4 },
+        "identity": { "$ref": "#/$defs/directColumnarIdentity" },
+        "schema": { "$ref": "#/$defs/directColumnarSchema" },
+        "chunks": { "$ref": "#/$defs/artifactChunks" }
+      }
+    },
+    "artifactChunks": {
+      "type": "object",
+      "description": "The SHA-256 of each consecutive `bytes` bytes of the decoded artifact, in order, the last covering what is left: `sha256` has exactly ceil(decodedBytes / bytes) entries, a count the client checks because a schema cannot. The size is fixed so that no plan can ask for a digest of every few bytes. The worker verifies each chunk as it arrives, reads no byte of a chunk before it has matched, and releases nothing of the artifact until every chunk has; the whole-artifact SHA-256 stays its content address.",
+      "additionalProperties": false,
+      "required": ["bytes", "sha256"],
+      "properties": {
+        "bytes": { "const": 4194304 },
+        "sha256": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/hashId" }
+        }
+      }
+    },
+    "directColumnarIdentity": {
+      "type": "object",
+      "description": "The header identity fields the plan's hashes do not repeat. The client binds them against the encoded header at open, so they must be the strings the encoder wrote.",
+      "additionalProperties": false,
+      "required": ["manifestVersion", "authorizationScopeVersion"],
+      "properties": {
+        "manifestVersion": { "type": "string", "minLength": 1 },
+        "authorizationScopeVersion": { "type": "string", "minLength": 1 }
+      }
+    },
+    "directColumnarSchema": {
+      "type": "object",
+      "description": "The physical schema of the image, verbatim from the encoder: `schemaHash` is the SHA-256 of its canonical JSON in this key order (`format`, `version`, `tables[name, primaryKey, columns[name, type, nullable]]`), and the decoder recomputes it before it reads a byte of payload.",
+      "additionalProperties": false,
+      "required": ["format", "version", "tables"],
+      "properties": {
+        "format": { "const": "calque-direct-columnar" },
+        "version": { "const": 4 },
+        "tables": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/directColumnarTableSchema" }
+        }
+      }
+    },
+    "directColumnarTableSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "primaryKey", "columns"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "primaryKey": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "type", "nullable"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "type": {
+                "enum": [
+                  "int64",
+                  "uint64",
+                  "f64",
+                  "timestamp",
+                  "bool",
+                  "utf8",
+                  "bytes",
+                  "uuid",
+                  "json",
+                  "decimal",
+                  "date",
+                  "time",
+                  "interval",
+                  "dict"
+                ]
+              },
+              "nullable": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    "artifactRuntimeColumn": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["columnId", "name"],
+      "properties": {
+        "columnId": { "$ref": "#/$defs/positiveInteger" },
+        "name": { "type": "string", "minLength": 1 }
+      }
+    },
+    "artifactRuntimeTable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tableId",
+        "sourceSchema",
+        "sourceTable",
+        "localTable",
+        "schemaHash",
+        "columnProfileHash",
+        "rowCount",
+        "primaryKeyCodec"
+      ],
+      "properties": {
+        "tableId": { "$ref": "#/$defs/id" },
+        "sourceSchema": { "type": "string", "minLength": 1 },
+        "sourceTable": { "type": "string", "minLength": 1 },
+        "localTable": { "type": "string", "minLength": 1 },
+        "schemaHash": { "$ref": "#/$defs/hashId" },
+        "columnProfileHash": { "$ref": "#/$defs/hashId" },
+        "rowCount": { "$ref": "#/$defs/nonNegativeInteger" },
+        "primaryKeyCodec": { "type": "string", "minLength": 1 },
+        "columns": {
+          "type": "array",
+          "description": "The change stream's column ids for this table, in the image's column order. The client compiles its change contract from them.",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/artifactRuntimeColumn" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,33 @@
+[package]
+name = "dataset-grant"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+authz = { path = "../authz" }
+base64 = "0.22"
+hex = "0.4.3"
+# Ed25519 verification, already built into the workspace through rustls. A
+# shared HMAC secret would let Calque mint grants too; only the application
+# backend may.
+ring = "0.17.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# A dev-only cycle: negative vectors must be validly signed to prove anything,
+# so the tests need the real issuer.
+dataset-grant-issuer = { path = "../dataset-grant-issuer" }
+# The payload vectors are pinned by digest, so a wire-format change cannot be
+# silent.
+sha2 = "0.10.9"
+source-control = { path = "../source-control" }
+sync-types = { path = "../sync-types" }

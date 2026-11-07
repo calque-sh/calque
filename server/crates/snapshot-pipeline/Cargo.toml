@@ -1,0 +1,68 @@
+[package]
+name = "snapshot-pipeline"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# Barrier reads from the filesystem canonical log, for tests.
+test-support = ["canonical-log/test-support"]
+
+[dependencies]
+artifact-catalog = { path = "../artifact-catalog" }
+artifact-contract = { path = "../artifact-contract" }
+# A lowered thread's encodes start their verifiers and digesters lowered too.
+background-thread = { path = "../background-thread" }
+blob-store = { path = "../blob-store" }
+# Encodes and verifies the brotli-large-window representation. Chosen over a
+# binding to brotli 1.2.0's C encoder: it is safe Rust under the workspace's
+# `unsafe_code = "forbid"`, needs no C build step, and its large-window
+# streams decode with the client's pinned decoder module.
+brotli = { workspace = true }
+canonical-log = { path = "../canonical-log" }
+# Packs a published artifact in front of its brotli encode and unpacks it
+# again in that encode's verifier.
+direct-columnar = { path = "../direct-columnar" }
+# `try_join_all` runs a publication's representation uploads at once, so
+# their flushes overlap; snapshot-builder and snapshot-coordinator already
+# depend on it.
+futures-util = "0.3"
+hex = "0.4.3"
+pgoutput-decoder = { path = "../pgoutput-decoder" }
+postgres = "0.19.14"
+postgres-connect = { path = "../postgres-connect" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 0.11 for its hardware SHA-256.
+sha2 = { version = "0.11.0", default-features = false }
+snapshot-builder = { path = "../snapshot-builder" }
+snapshot-coordinator = { path = "../snapshot-coordinator" }
+source-control = { path = "../source-control" }
+sync-types = { path = "../sync-types" }
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1.52.0", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+tokio-postgres = "0.7.18"
+# Each preparation phase logs its wall time at info under
+# `calque::preparation`.
+tracing = "0.1.44"
+# `zstdmt` builds libzstd with its worker threads, which encode the zstd
+# representation (`ZSTD_WORKERS` in representations.rs).
+zstd = { version = "0.13.3", default-features = false, features = ["zstdmt"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+authz = { path = "../authz" }
+canonical-log = { path = "../canonical-log", features = ["test-support"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+snapshot-pipeline = { path = ".", features = ["test-support"] }
+tokio = { version = "1.52.0", features = ["test-util"] }
+uuid = { version = "1.23.0", features = ["v4"] }
+zstd = { version = "0.13.3", default-features = false, features = ["zdict_builder"] }
+
+[lints]
+workspace = true

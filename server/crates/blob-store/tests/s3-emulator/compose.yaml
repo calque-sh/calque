@@ -1,0 +1,28 @@
+# MinIO, pinned by digest to `pgsty/minio` RELEASE.2026-08-04T00-00-00Z (an
+# OCI index with linux/amd64 and linux/arm64): MinIO publishes no community
+# images, and `pgsty/minio` builds the same server from MinIO's AGPL source.
+# The S3 adapter's conformance run (`pnpm verify:s3:minio`) admits it as the
+# test provider.
+services:
+  s3:
+    image: pgsty/minio@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${CALQUE_MINIO_ROOT_USER:?run-scoped MinIO user is required}
+      MINIO_ROOT_PASSWORD: ${CALQUE_MINIO_ROOT_PASSWORD:?run-scoped MinIO password is required}
+    # Below the ephemeral ranges of Linux (32768-60999) and macOS
+    # (49152-65535). On a CI runner, 59000 was already in use when MinIO
+    # started after the live suite, and the S3 recovery test failed.
+    ports:
+      - "127.0.0.1:${CALQUE_MINIO_PORT:-29000}:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/ready"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - minio-data:/data
+
+volumes:
+  minio-data:
+    name: ${CALQUE_MINIO_VOLUME:?run-scoped MinIO volume is required}

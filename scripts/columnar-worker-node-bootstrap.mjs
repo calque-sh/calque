@@ -1,0 +1,39 @@
+// Runs one packaged direct-columnar worker entry on a Node worker thread: the
+// engine worker (`columnar-worker-entry.js`) or a hasher worker
+// (`columnar-hasher-entry.js`), named by `workerData.entry`.
+//
+// An entry reads `globalThis.postMessage` and assigns `globalThis.onmessage`,
+// DOM worker globals Node lacks, so this module supplies them over
+// `parentPort` and then imports the entry by absolute path, so its
+// `@calque/core` imports resolve from the worker package.
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { parentPort, workerData } from "node:worker_threads";
+
+if (!parentPort) throw new Error("this module only runs on a worker thread");
+
+const ENTRIES = new Set([
+  "columnar-worker-entry.js",
+  "columnar-hasher-entry.js",
+]);
+const name = workerData?.entry;
+if (!ENTRIES.has(name))
+  throw new Error(`no packaged columnar worker entry is named ${String(name)}`);
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const entry = pathToFileURL(
+  join(root, "client/packages/worker/dist", name),
+).href;
+
+globalThis.postMessage = (message) => {
+  parentPort.postMessage(message);
+};
+
+await import(entry);
+
+if (typeof globalThis.onmessage !== "function")
+  throw new Error(`${name} installed no message handler`);
+
+parentPort.on("message", (data) => {
+  globalThis.onmessage({ data });
+});

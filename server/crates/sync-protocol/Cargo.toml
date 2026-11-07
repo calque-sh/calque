@@ -1,0 +1,37 @@
+[package]
+name = "sync-protocol"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+prost = "0.14.4"
+# Ed25519 verification of the ordered revocation barrier. The application
+# backend that mints a grant also retires it; a shared secret would let the
+# change server mint both.
+ring = "0.17.14"
+# 0.11 hashes with the ARMv8 SHA-256 instructions, detected at run time; 0.10
+# without `asm` hashes in software, and every change frame is hashed.
+sha2 = { version = "0.11.0", default-features = false }
+subtle = "2.6.1"
+thiserror = "1"
+
+[features]
+# Test oracles the `calque` binary never calls: the frame decoder, stream-order
+# validation and the validators for messages other than mutation requests.
+test-support = []
+
+[dev-dependencies]
+hex = "0.4.3"
+sync-protocol = { path = ".", features = ["test-support"] }
+
+[build-dependencies]
+prost-build = "0.14.4"
+protoc-bin-vendored = "3.2.0"
+
+[lints]
+workspace = true

@@ -1,0 +1,143 @@
+{
+  "protocolVersion": 1,
+  "planId": "plan_01JZCOLUMNAR",
+  "issuedAt": "2026-09-05T12:05:00Z",
+  "expiresAt": "2026-09-05T12:15:00Z",
+  "source": {
+    "sourceEpoch": "source_42/epoch_7",
+    "publicationGeneration": 4,
+    "schemaGeneration": 18,
+    "authorizationGeneration": 9,
+    "authorizationPolicyHash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "authorization": {
+    "policyHash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "scopeHash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "scopeToken": "opaque-short-lived-scope-token"
+  },
+  "requiredTables": ["table/tasks"],
+  "residentTables": [],
+  "activationCursor": "cursor-v1:source_42/epoch_7/9182990",
+  "nextResidentStateProof": "resident-state-proof-v1.example",
+  "artifacts": [
+    {
+      "artifactId": "artifact_01JZCOLUMNAR",
+      "manifestId": "manifest_01JZCOLUMNAR",
+      "attachAs": "stage_0000",
+      "snapshotCursor": "cursor-v1:source_42/epoch_7/9182721",
+      "tables": ["table/tasks"],
+      "decodedSha256": "4c10a234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+      "decodedBytes": 24746441,
+      "bufferCapacityBytes": 24746441,
+      "installOrder": 0,
+      "runtime": {
+        "tableSetHash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "shardProfileHash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "indexProfileHash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "format": "directColumnar",
+        "schemaHash": "sha256:578eee00171f1dbe61e18e10be0acafe8335b630f77639cc0916a5b678e36737",
+        "collectionSetHash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "formatVersion": 4,
+        "identity": {
+          "manifestVersion": "manifest_01JZCOLUMNAR",
+          "authorizationScopeVersion": "authorization-generation-9"
+        },
+        "schema": {
+          "format": "calque-direct-columnar",
+          "version": 4,
+          "tables": [
+            {
+              "name": "tasks",
+              "primaryKey": ["id"],
+              "columns": [
+                {
+                  "name": "id",
+                  "type": "int64",
+                  "nullable": false
+                },
+                {
+                  "name": "title",
+                  "type": "utf8",
+                  "nullable": true
+                },
+                {
+                  "name": "status",
+                  "type": "dict",
+                  "nullable": false
+                },
+                {
+                  "name": "updated_at",
+                  "type": "timestamp",
+                  "nullable": false
+                }
+              ]
+            }
+          ]
+        },
+        "chunks": {
+          "bytes": 4194304,
+          "sha256": [
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+          ]
+        },
+        "tables": [
+          {
+            "tableId": "table/tasks",
+            "sourceSchema": "public",
+            "sourceTable": "tasks",
+            "localTable": "tasks",
+            "schemaHash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+            "columnProfileHash": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+            "rowCount": 1827304,
+            "primaryKeyCodec": "pk-v1/protobuf",
+            "columns": [
+              {
+                "columnId": 1,
+                "name": "id"
+              },
+              {
+                "columnId": 2,
+                "name": "title"
+              },
+              {
+                "columnId": 3,
+                "name": "status"
+              },
+              {
+                "columnId": 4,
+                "name": "updated_at"
+              }
+            ]
+          }
+        ]
+      },
+      "selectedRepresentation": {
+        "representationId": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "encoding": "zstd",
+        "encodedBytes": 6729101,
+        "downloadUrl": "https://delivery.example.test/signed/columnar",
+        "expiresAt": "2026-09-05T12:15:00Z"
+      }
+    }
+  ],
+  "changeStream": {
+    "endpoint": "https://sync.example.test/v1/changes",
+    "wireProtocol": "sync.change.v1",
+    "fromCursorExclusive": "cursor-v1:source_42/epoch_7/9182721",
+    "throughCursorInclusive": "cursor-v1:source_42/epoch_7/9182990",
+    "longPollTimeoutMs": 30000,
+    "maxBatchBytes": 4194304
+  },
+  "memory": {
+    "minimumSafeBudgetBytes": 268435456,
+    "stagingOverlapBytes": 24746441,
+    "queryResultReserveBytes": 33554432,
+    "catchUpReserveBytes": 16777216,
+    "clientHeapReserveBytes": 67108864
+  }
+}

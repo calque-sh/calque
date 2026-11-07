@@ -1,0 +1,57 @@
+{
+  "name": "@calque/react",
+  "version": "0.1.0",
+  "description": "React provider and hooks for @calque/client.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/calque-sh/calque",
+    "directory": "client/packages/react"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "format": "prettier --write .",
+    "lint": "eslint . --max-warnings 0 && prettier --check .",
+    "test": "vitest run",
+    "typecheck": "../../../node_modules/.bin/tsc -p tsconfig.json --noEmit && ../../../node_modules/.bin/tsc -p tests/registered/tsconfig.json"
+  },
+  "dependencies": {
+    "@calque/client": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=19.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.31.0",
+    "@testing-library/react": "16.3.2",
+    "@types/node": "^24.0.0",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitest/browser-playwright": "^4.1.0",
+    "eslint": "^9.31.0",
+    "jiti": "^2.7.0",
+    "playwright": "^1.59.0",
+    "prettier": "^3.6.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.38.0",
+    "vitest": "^4.1.0"
+  }
+}

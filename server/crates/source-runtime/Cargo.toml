@@ -1,0 +1,31 @@
+[package]
+name = "source-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+authz = { path = "../authz" }
+canonical-log = { path = "../canonical-log" }
+cdc-ingest = { path = "../cdc-ingest" }
+hex = "0.4"
+mutation-api = { path = "../mutation-api" }
+pg_walstream = { version = "0.8.0", default-features = false, features = ["std", "libpq"] }
+pgoutput-decoder = { path = "../pgoutput-decoder" }
+postgres = "0.19.14"
+postgres-connect = { path = "../postgres-connect" }
+source-control = { path = "../source-control" }
+sync-types = { path = "../sync-types" }
+thiserror = "1"
+tokio = { version = "1.52.0", features = ["net", "rt", "time"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+prost = "0.14.4"
+sync-protocol = { path = "../sync-protocol" }
+
+[lints]
+workspace = true

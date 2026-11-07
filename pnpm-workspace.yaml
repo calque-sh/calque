@@ -1,0 +1,23 @@
+packages:
+  - "client/packages/*"
+  - "client/examples/*"
+
+# The workspace needs Node's built-in zstd (`zlib.zstdCompressSync`), added in
+# Node 22.15 and 23.8, to build artifact fixtures. Under an older runtime the
+# failure surfaces as a TypeError deep inside a vitest config with nothing
+# naming the cause, so refuse the install outright instead. The range in
+# package.json starts at 22.20 and 24.5, the first releases that both run the
+# grant issuer example's `.mts` files without a flag and bundle the OpenSSL
+# 3.5 that reads its key; Node 23 and 24.0 to 24.4 bundle OpenSSL 3.0.
+engineStrict: true
+
+peerDependencyRules:
+  allowedVersions:
+    "@glideapps/glide-data-grid>react": "19"
+    "@glideapps/glide-data-grid>react-dom": "19"
+
+allowBuilds:
+  # buf's bin script runs the binary from its platform optional dependency.
+  # The postinstall only checks that binary's version, or fetches it with npm
+  # when that dependency is missing.
+  "@bufbuild/buf": false

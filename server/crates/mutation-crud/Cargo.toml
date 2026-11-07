@@ -1,0 +1,22 @@
+[package]
+name = "mutation-crud"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+authz = { path = "../authz" }
+mutation-api = { path = "../mutation-api" }
+postgres = "0.19.14"
+prost = "0.14.4"
+source-control = { path = "../source-control" }
+sync-protocol = { path = "../sync-protocol" }
+sync-types = { path = "../sync-types" }
+thiserror = "2.0.18"
+time = { version = "0.3.47", features = ["formatting"] }
+
+[lints]
+workspace = true

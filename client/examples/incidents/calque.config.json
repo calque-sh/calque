@@ -1,0 +1,414 @@
+{
+  "application": {
+    "id": "incidents",
+    "version": "0.1.0"
+  },
+  "protocol": {
+    "manifest": 1,
+    "artifact": 1,
+    "changeStream": 1,
+    "mutation": 1
+  },
+  "sources": [
+    {
+      "id": "local",
+      "connectionEnv": "CALQUE_DATABASE_URL",
+      "publication": "calque_incidents",
+      "slot": "calque_incidents_slot"
+    }
+  ],
+  "scopes": [
+    {
+      "id": "all",
+      "source": "local",
+      "kind": "source-wide",
+      "dataVersion": 1
+    }
+  ],
+  "collections": [
+    {
+      "id": "comments",
+      "source": "local",
+      "kind": "table",
+      "relation": {
+        "schema": "incidents",
+        "table": "comments"
+      },
+      "columns": [
+        {
+          "name": "id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "issue_id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "author_id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "body",
+          "postgresType": "text",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "postgresType": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "bench_index",
+          "postgresType": "int8",
+          "nullable": false
+        },
+        {
+          "name": "is_sentinel",
+          "postgresType": "bool",
+          "nullable": false
+        }
+      ],
+      "primaryKey": ["id"],
+      "scope": "all",
+      "adapter": "direct-columnar",
+      "encoding": "calque-columnar"
+    },
+    {
+      "id": "events",
+      "source": "local",
+      "kind": "table",
+      "relation": {
+        "schema": "incidents",
+        "table": "events"
+      },
+      "columns": [
+        {
+          "name": "id",
+          "postgresType": "int8",
+          "nullable": false
+        },
+        {
+          "name": "organization_id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "project_id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "issue_id",
+          "postgresType": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "level",
+          "postgresType": "text",
+          "nullable": false
+        },
+        {
+          "name": "message",
+          "postgresType": "text",
+          "nullable": false
+        },
+        {
+          "name": "occurred_at",
+          "postgresType": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "payload",
+          "postgresType": "jsonb",
+          "nullable": false
+        },
+        {
+          "name": "bench_index",
+          "postgresType": "int8",
+          "nullable": false
+        },
+        {
+          "name": "is_sentinel",
+          "postgresType": "bool",
+          "nullable": false
+        }
+      ],
+      "primaryKey": ["id"],
+      "scope": "all",
+      "adapter": "direct-columnar",
+      "encoding": "calque-columnar"
+    },
+    {
+      "id": "issue_tags",
+      "source": "local",
+      "kind": "table",
+      "relation": {
+        "schema": "incidents",
+        "table": "issue_tags"
+      },
+      "columns": [
+        {
+          "name": "issue_id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "tag",
+          "postgresType": "text",
+          "nullable": false
+        },
+        {
+          "name": "bench_index",
+          "postgresType": "int8",
+          "nullable": false
+        },
+        {
+          "name": "is_sentinel",
+          "postgresType": "bool",
+          "nullable": false
+        }
+      ],
+      "primaryKey": ["issue_id", "tag"],
+      "scope": "all",
+      "adapter": "direct-columnar",
+      "encoding": "calque-columnar"
+    },
+    {
+      "id": "issues",
+      "source": "local",
+      "kind": "table",
+      "relation": {
+        "schema": "incidents",
+        "table": "issues"
+      },
+      "columns": [
+        {
+          "name": "id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "organization_id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "project_id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "assignee_id",
+          "postgresType": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "status",
+          "postgresType": "text",
+          "nullable": false
+        },
+        {
+          "name": "priority",
+          "postgresType": "int4",
+          "nullable": false
+        },
+        {
+          "name": "title",
+          "postgresType": "text",
+          "nullable": false
+        },
+        {
+          "name": "event_count",
+          "postgresType": "int4",
+          "nullable": false
+        },
+        {
+          "name": "updated_at",
+          "postgresType": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "bench_index",
+          "postgresType": "int8",
+          "nullable": false
+        },
+        {
+          "name": "is_sentinel",
+          "postgresType": "bool",
+          "nullable": false
+        }
+      ],
+      "primaryKey": ["id"],
+      "scope": "all",
+      "adapter": "direct-columnar",
+      "encoding": "calque-columnar"
+    },
+    {
+      "id": "memberships",
+      "source": "local",
+      "kind": "table",
+      "relation": {
+        "schema": "incidents",
+        "table": "memberships"
+      },
+      "columns": [
+        {
+          "name": "organization_id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "user_id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "role",
+          "postgresType": "text",
+          "nullable": false
+        },
+        {
+          "name": "bench_index",
+          "postgresType": "int8",
+          "nullable": false
+        },
+        {
+          "name": "is_sentinel",
+          "postgresType": "bool",
+          "nullable": false
+        }
+      ],
+      "primaryKey": ["organization_id", "user_id"],
+      "scope": "all",
+      "adapter": "direct-columnar",
+      "encoding": "calque-columnar"
+    },
+    {
+      "id": "projects",
+      "source": "local",
+      "kind": "table",
+      "relation": {
+        "schema": "incidents",
+        "table": "projects"
+      },
+      "columns": [
+        {
+          "name": "id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "organization_id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "slug",
+          "postgresType": "text",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "postgresType": "text",
+          "nullable": false
+        },
+        {
+          "name": "bench_index",
+          "postgresType": "int8",
+          "nullable": false
+        },
+        {
+          "name": "is_sentinel",
+          "postgresType": "bool",
+          "nullable": false
+        }
+      ],
+      "primaryKey": ["id"],
+      "scope": "all",
+      "adapter": "direct-columnar",
+      "encoding": "calque-columnar"
+    },
+    {
+      "id": "users",
+      "source": "local",
+      "kind": "table",
+      "relation": {
+        "schema": "incidents",
+        "table": "users"
+      },
+      "columns": [
+        {
+          "name": "id",
+          "postgresType": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "display_name",
+          "postgresType": "text",
+          "nullable": false
+        },
+        {
+          "name": "email",
+          "postgresType": "text",
+          "nullable": false
+        },
+        {
+          "name": "active",
+          "postgresType": "bool",
+          "nullable": false
+        },
+        {
+          "name": "bench_index",
+          "postgresType": "int8",
+          "nullable": false
+        },
+        {
+          "name": "is_sentinel",
+          "postgresType": "bool",
+          "nullable": false
+        }
+      ],
+      "primaryKey": ["id"],
+      "scope": "all",
+      "adapter": "direct-columnar",
+      "encoding": "calque-columnar"
+    }
+  ],
+  "commands": [
+    {
+      "id": "edit-comments",
+      "kind": "crud",
+      "collection": "comments",
+      "operations": ["insert", "update", "delete"],
+      "writableColumns": [
+        "issue_id",
+        "author_id",
+        "body",
+        "created_at",
+        "bench_index",
+        "is_sentinel"
+      ]
+    },
+    {
+      "id": "edit-issues",
+      "kind": "crud",
+      "collection": "issues",
+      "operations": ["insert", "update", "delete"],
+      "writableColumns": [
+        "organization_id",
+        "project_id",
+        "assignee_id",
+        "status",
+        "priority",
+        "title",
+        "event_count",
+        "updated_at",
+        "bench_index",
+        "is_sentinel"
+      ]
+    }
+  ]
+}

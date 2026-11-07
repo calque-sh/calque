@@ -1,0 +1,26 @@
+[package]
+name = "mutation-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+authz = { path = "../authz" }
+postgres = "0.19.14"
+prost = "0.14.4"
+sha2 = "0.10.9"
+source-control = { path = "../source-control" }
+subtle = "2.6.1"
+sync-protocol = { path = "../sync-protocol" }
+sync-types = { path = "../sync-types" }
+thiserror = "2.0.18"
+uuid = { version = "1.23.0", features = ["v4"] }
+
+[lints]
+workspace = true

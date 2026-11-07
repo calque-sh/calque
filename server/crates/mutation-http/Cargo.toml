@@ -1,0 +1,22 @@
+[package]
+name = "mutation-http"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+http-headers = { path = "../http-headers" }
+prost = "0.14.4"
+sync-protocol = { path = "../sync-protocol" }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt"] }
+tower = { version = "0.5.3", features = ["util"] }
+
+[lints]
+workspace = true

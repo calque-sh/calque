@@ -1,0 +1,100 @@
+{
+  "application": { "id": "serve-tenants", "version": "0.1.0" },
+  "protocol": {
+    "manifest": 1,
+    "artifact": 1,
+    "changeStream": 1,
+    "mutation": 1
+  },
+  "sources": [
+    {
+      "id": "serve-tenants",
+      "connectionEnv": "SERVE_TENANTS_DATABASE_URL",
+      "publication": "calque_serve_tenants",
+      "slot": "calque_serve_tenants_slot"
+    }
+  ],
+  "scopes": [
+    {
+      "id": "tenant",
+      "source": "serve-tenants",
+      "kind": "partitioned",
+      "attribute": "tenant_id",
+      "dataVersion": 1
+    }
+  ],
+  "collections": [
+    {
+      "id": "priorities",
+      "source": "serve-tenants",
+      "kind": "table",
+      "relation": { "schema": "public", "table": "priorities" },
+      "columns": [
+        { "name": "id", "postgresType": "int8", "nullable": false },
+        { "name": "label", "postgresType": "text", "nullable": false }
+      ],
+      "primaryKey": ["id"],
+      "scope": "tenant",
+      "shared": true,
+      "adapter": "direct-columnar",
+      "encoding": "calque-columnar"
+    },
+    {
+      "id": "projects",
+      "source": "serve-tenants",
+      "kind": "table",
+      "relation": { "schema": "public", "table": "projects" },
+      "columns": [
+        { "name": "tenant_id", "postgresType": "int8", "nullable": false },
+        { "name": "id", "postgresType": "int8", "nullable": false },
+        { "name": "name", "postgresType": "text", "nullable": false }
+      ],
+      "primaryKey": ["tenant_id", "id"],
+      "scope": "tenant",
+      "partitionColumn": "tenant_id",
+      "adapter": "direct-columnar",
+      "encoding": "calque-columnar"
+    },
+    {
+      "id": "tasks",
+      "source": "serve-tenants",
+      "kind": "table",
+      "relation": { "schema": "public", "table": "tasks" },
+      "columns": [
+        { "name": "tenant_id", "postgresType": "int8", "nullable": false },
+        { "name": "id", "postgresType": "int8", "nullable": false },
+        { "name": "project_id", "postgresType": "int8", "nullable": false },
+        { "name": "title", "postgresType": "text", "nullable": false },
+        { "name": "done", "postgresType": "bool", "nullable": false }
+      ],
+      "primaryKey": ["tenant_id", "id"],
+      "scope": "tenant",
+      "partitionColumn": "tenant_id",
+      "adapter": "direct-columnar",
+      "encoding": "calque-columnar"
+    }
+  ],
+  "commands": [
+    {
+      "id": "edit-priority",
+      "kind": "crud",
+      "collection": "priorities",
+      "operations": ["update"],
+      "writableColumns": ["label"]
+    },
+    {
+      "id": "edit-project",
+      "kind": "crud",
+      "collection": "projects",
+      "operations": ["update"],
+      "writableColumns": ["name"]
+    },
+    {
+      "id": "edit-task",
+      "kind": "crud",
+      "collection": "tasks",
+      "operations": ["insert", "update", "delete"],
+      "writableColumns": ["project_id", "title", "done"]
+    }
+  ]
+}

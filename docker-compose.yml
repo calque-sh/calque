@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: calque
+      POSTGRES_PASSWORD: calque
+      POSTGRES_DB: calque_dev
+    ports:
+      - "127.0.0.1:${CALQUE_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "timezone=UTC"
+    healthcheck:
+      # Over TCP, because the socket also answers from the entrypoint's
+      # temporary initdb server (scripts/live-postgres-suite.sh).
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U calque -d calque_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
