@@ -190,7 +190,8 @@ write by its mutation id.
 You need:
 
 - Docker, with Compose 2.17 or newer (`docker compose version`);
-- Node 22.20 or newer on the 22 line, or 24.5 or newer;
+- Node 26.12.1 or newer, 24.22.1 or newer on the 24 line, or 22.23.4 or newer
+  on the 22 line: the releases with Node's October 2026 security fixes;
 - pnpm 11 or newer, which switches to the version the root `package.json`
   pins (`npx get-pnpm` installs the latest; open a new terminal after it);
 - Google Chrome or another Chromium-based browser.

@@ -19,14 +19,15 @@ node client/examples/grant-issuer/mint-grant.mts --key-file grant-key.pk8 \
   --subject me --lifetime-seconds 900 --command tasks=update
 ```
 
-It needs Node 22.20 or newer on the 22 line, or 24.5 or newer. Node runs
-`.mts` files without a flag from 22.18 and 23.6, but the `grant-key.pk8`
-`calque-dev-grant` writes is a PKCS#8 v2 document, which carries the public key
-beside the private one, and only the OpenSSL 3.5 that Node bundles from 22.20
-and 24.5 reads it. OpenSSL 3.0 refuses it with `wrong tag`, and no Node 23
-release bundles 3.5. A backend behind a bundler, or on an older Node, copies
-both files in and strips the types there; on an older Node it also needs a
-PKCS#8 v1 key, which is the form `node:crypto` exports.
+Run it on Node 26.12.1 or newer, 24.22.1 or newer on the 24 line, or 22.23.4 or
+newer on the 22 line: the releases with Node's October 2026 security fixes.
+Node runs `.mts` files without a flag from 22.18 and 23.6, but the
+`grant-key.pk8` `calque-dev-grant` writes is a PKCS#8 v2 document, which
+carries the public key beside the private one, and only the OpenSSL 3.5 that
+Node bundles from 22.20 and 24.5 reads it. OpenSSL 3.0 refuses it with
+`wrong tag`, and no Node 23 release bundles 3.5. A backend behind a bundler, or
+on an older Node, copies both files in and strips the types there; on an older
+Node it also needs a PKCS#8 v1 key, which is the form `node:crypto` exports.
 
 ## Tenants
 

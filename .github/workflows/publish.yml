@@ -42,7 +42,7 @@ jobs:
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
 
       # No dependency cache: a release builds from a fresh install. The npm
-      # that ships with .nvmrc's Node (11.19) signs in through OIDC, which
+      # that ships with .nvmrc's Node (11.20) signs in through OIDC, which
       # needs 11.5.1 or later.
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

@@ -1,8 +1,9 @@
 # Developing Calque
 
-Node has to be 22.20 or newer on the 22 line, or 24.5 or newer: the workspace
-uses Node's built-in zstd, and its tests run the grant issuer example, which
-needs Node to strip `.mts` types and to bundle OpenSSL 3.5.
+Node has to be 26.12.1 or newer, 24.22.1 or newer on the 24 line, or 22.23.4 or
+newer on the 22 line: the releases with Node's October 2026 security fixes.
+The workspace uses Node's built-in zstd, and its tests run the grant issuer
+example, which needs Node to strip `.mts` types and to bundle OpenSSL 3.5.
 
 ## Building calque from source
 
