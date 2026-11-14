@@ -13,7 +13,12 @@
  * real wire, framed and sealed here.
  */
 import { create, toBinary } from "@bufbuild/protobuf";
-import type { DirectColumnarSchema, TrustedArtifact } from "@calque/core";
+import type {
+  ColumnarEnumLabels,
+  DirectColumnarSchema,
+  QueryPredicate,
+  TrustedArtifact,
+} from "@calque/core";
 import {
   BatchFramesDigest,
   change,
@@ -290,12 +295,14 @@ interface MountOptions {
   /** Whether the open carries a change contract, which makes the mount live. */
   readonly live?: boolean;
   readonly queryCapacityBytes?: number | undefined;
+  readonly enumLabels?: readonly ColumnarEnumLabels[];
 }
 
 async function openMount({
   cursor = "cursor-0",
   live = true,
   queryCapacityBytes,
+  enumLabels,
 }: MountOptions = {}) {
   const fixture = await commands.encodeColumnarFixture(cursor);
   const contract = contractFor(fixture.schema);
@@ -330,6 +337,7 @@ async function openMount({
       queryCapacityBytes,
       undefined,
       live ? contract : undefined,
+      enumLabels,
     );
     await hashers.send(0, bytesOf(fixture.bytes));
     receiving.end(1);
@@ -449,6 +457,82 @@ describe("dedicated direct-columnar worker", () => {
     expect(
       await client.rows("users", 0, fixture.users.length, [...USER_FIELDS]),
     ).toEqual(before);
+  });
+
+  it("orders an enum column by its declared labels, a value added since after every one", async () => {
+    // Declared out of text order, as PostgreSQL keeps an enum's.
+    const labels = ["User 3", "User 1", "User 0", "User 2"];
+    const { contract, client } = await openMount({
+      queryCapacityBytes: 64 << 20,
+      enumLabels: [{ collection: "users", column: "display_name", labels }],
+    });
+    // A label the server started without, as an enum value added since.
+    await client.applyChangeBatches([
+      await encodeBatch(contract, {
+        from: "cursor-0",
+        through: "cursor-1",
+        operations: [
+          { kind: "update", id: "user-2", changed: { display_name: "Added" } },
+        ],
+      }),
+    ]);
+    const names = async (
+      where: QueryPredicate | undefined,
+      direction: "asc" | "desc",
+    ) =>
+      (
+        await client.query({
+          version: 1,
+          from: { collection: "users", as: "u" },
+          ...(where === undefined ? {} : { where }),
+          select: [
+            {
+              kind: "field",
+              field: { source: "u", column: "display_name" },
+              as: "name",
+            },
+          ],
+          orderBy: [{ by: "name", direction }],
+        })
+      ).result.rows.map(([name]) => name);
+    const name = {
+      kind: "field",
+      field: { source: "u", column: "display_name" },
+    } as const;
+    const userZero = { kind: "literal", value: "User 0" } as const;
+    expect(await names(undefined, "asc")).toEqual([
+      "User 3",
+      "User 1",
+      "User 0",
+      "Added",
+    ]);
+    expect(await names(undefined, "desc")).toEqual([
+      "Added",
+      "User 0",
+      "User 1",
+      "User 3",
+    ]);
+    expect(
+      await names(
+        { kind: "compare", operator: "lt", left: name, right: userZero },
+        "asc",
+      ),
+    ).toEqual(["User 3", "User 1"]);
+    expect(
+      await names(
+        { kind: "compare", operator: "gt", left: name, right: userZero },
+        "asc",
+      ),
+    ).toEqual(["Added"]);
+    const extremes = await client.query({
+      version: 1,
+      from: { collection: "users", as: "u" },
+      select: [
+        { kind: "aggregate", operator: "min", field: name.field, as: "least" },
+        { kind: "aggregate", operator: "max", field: name.field, as: "most" },
+      ],
+    });
+    expect(extremes.result.rows).toEqual([["User 3", "Added"]]);
   });
 
   it("refuses to open an artifact that names no snapshot cursor", async () => {

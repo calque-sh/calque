@@ -10,14 +10,14 @@
 #   scripts/live-postgres-suite.sh bootstrap <container>
 #       Wait for the postgres:18 container to accept connections, verify
 #       wal_level/slots/senders/connections, and create the least-privilege
-#       role and database inside it (idempotent; safe to rerun).
+#       role and database inside it, with the functions
+#       scripts/live-postgres-suite.sql installs for what only a superuser may
+#       create (idempotent; safe to rerun).
 #
 #   scripts/live-postgres-suite.sh env <port>
-#       Print the eight `export` lines the suite reads (eval or source them):
+#       Print the seven `export` lines the suite reads (eval or source them):
 #       five names some test requires, plus DATABASE_URL and
-#       CALQUE_DATABASE_URL, alternates a test falls back from, plus
-#       CALQUE_SUPERUSER_DATABASE_URL, the image's superuser, for the one test
-#       that needs what only a superuser may create.
+#       CALQUE_DATABASE_URL, alternates a test falls back from.
 #       Under GitHub Actions the same names are appended to $GITHUB_ENV.
 #
 #   scripts/live-postgres-suite.sh run <port> [test-harness args...]
@@ -42,17 +42,16 @@
 # would hide an uncovered provider behind a green run.
 #
 # Tunables (all optional): CALQUE_LIVEPG_ROLE, CALQUE_LIVEPG_PASSWORD,
-# CALQUE_LIVEPG_DATABASE, CALQUE_LIVEPG_HOST, CALQUE_LIVEPG_SUPERUSER,
-# CALQUE_LIVEPG_SUPERUSER_PASSWORD (default `postgres`, the image's
-# POSTGRES_PASSWORD in CI and in docs/development.md).
+# CALQUE_LIVEPG_DATABASE, CALQUE_LIVEPG_HOST, CALQUE_LIVEPG_SUPERUSER.
 set -eu
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
 role=${CALQUE_LIVEPG_ROLE:-calque_test}
 password=${CALQUE_LIVEPG_PASSWORD:-calque_test}
 database=${CALQUE_LIVEPG_DATABASE:-calque_verify}
 host=${CALQUE_LIVEPG_HOST:-127.0.0.1}
 superuser=${CALQUE_LIVEPG_SUPERUSER:-postgres}
-superuser_password=${CALQUE_LIVEPG_SUPERUSER_PASSWORD:-postgres}
 
 # All of these want the same connection string, and no single one covers the
 # suite. Five are each required by some ignored test, which fails rather than
@@ -83,12 +82,6 @@ require_port() {
 
 database_url() {
   printf 'postgresql://%s:%s@%s:%s/%s' "$role" "$password" "$host" "$1" "$database"
-}
-
-# Only a superuser may create a `FOR TABLES IN SCHEMA` publication, and the
-# test that checks Calque follows one reads this name alone.
-superuser_url() {
-  printf 'postgresql://%s:%s@%s:%s/%s' "$superuser" "$superuser_password" "$host" "$1" "$database"
 }
 
 # psql inside the container, as the bootstrap superuser. Using the container's
@@ -199,6 +192,14 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_database WHERE datname = '$databas
 \\gexec
 SQL
   container_psql "$container" -d "$database" -c "GRANT ALL ON SCHEMA public TO \"$role\";"
+  container_psql "$container" -d "$database" -v role="$role" <"$script_dir/live-postgres-suite.sql"
+  # A source that subscribes to another database writes rows under a
+  # replication origin. Granted in template1, so every database a test creates
+  # lets the role write as a subscriber does.
+  container_psql "$container" -d template1 -c "GRANT EXECUTE ON FUNCTION
+    pg_catalog.pg_replication_origin_create(text), pg_catalog.pg_replication_origin_drop(text),
+    pg_catalog.pg_replication_origin_session_setup(text),
+    pg_catalog.pg_replication_origin_session_reset() TO \"$role\";"
 
   privileges=$(container_psql "$container" -c "SELECT rolsuper, rolreplication, rolcreatedb, rolcreaterole FROM pg_catalog.pg_roles WHERE rolname = '$role';")
   if [ "$privileges" != 'f|t|t|t' ]; then
@@ -218,17 +219,11 @@ print_env() {
       printf '%s=%s\n' "$name" "$url" >>"$GITHUB_ENV"
     fi
   done
-  printf "export CALQUE_SUPERUSER_DATABASE_URL='%s'\n" "$(superuser_url "$1")"
-  if [ -n "${GITHUB_ENV:-}" ]; then
-    printf 'CALQUE_SUPERUSER_DATABASE_URL=%s\n' "$(superuser_url "$1")" >>"$GITHUB_ENV"
-  fi
 }
 
 run() {
   require_port "${1:-}"
   url=$(database_url "$1")
-  CALQUE_SUPERUSER_DATABASE_URL=$(superuser_url "$1")
-  export CALQUE_SUPERUSER_DATABASE_URL
   shift
   for name in $env_names; do
     export "$name=$url"

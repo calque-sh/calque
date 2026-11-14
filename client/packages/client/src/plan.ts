@@ -105,6 +105,11 @@ export interface PlanArtifactColumnarRuntime {
 interface PlanArtifactColumn {
   readonly columnId: number;
   readonly name: string;
+  /**
+   * The labels of the enum the column carries, in PostgreSQL's declaration
+   * order; absent for any other column.
+   */
+  readonly enumLabels?: readonly string[];
 }
 
 export interface PlanArtifactTable {
@@ -472,6 +477,10 @@ function parseArtifactColumns(
 ): readonly PlanArtifactColumn[] {
   const columns = array(value, path).map((columnValue, index) => {
     const column = object(columnValue, `${path}[${index}]`);
+    const enumLabels =
+      column.enumLabels === undefined
+        ? undefined
+        : parseEnumLabels(column.enumLabels, `${path}[${index}].enumLabels`);
     return {
       columnId: integerRange(
         column.columnId,
@@ -480,6 +489,7 @@ function parseArtifactColumns(
         MAX_SAFE,
       ),
       name: string(column.name, `${path}[${index}].name`),
+      ...(enumLabels === undefined ? {} : { enumLabels }),
     };
   });
   if (columns.length === 0) fail(path, "must be non-empty");
@@ -488,6 +498,26 @@ function parseArtifactColumns(
   if (new Set(columns.map((column) => column.name)).size !== columns.length)
     fail(path, "contains duplicate column names");
   return columns;
+}
+
+/** The most labels a plan names for one enum, as the server serves at most. */
+const MAX_ENUM_LABELS = 4_096;
+/** PostgreSQL's 63-byte label bound, which no label exceeds in UTF-16 units either. */
+const MAX_ENUM_LABEL_UNITS = 63;
+
+function parseEnumLabels(value: unknown, path: string): readonly string[] {
+  const labels = array(value, path);
+  if (labels.length === 0 || labels.length > MAX_ENUM_LABELS)
+    fail(path, `must hold 1 to ${MAX_ENUM_LABELS} labels`);
+  for (const [index, label] of labels.entries())
+    if (typeof label !== "string" || label.length > MAX_ENUM_LABEL_UNITS)
+      fail(
+        `${path}[${index}]`,
+        `must be a text of at most ${MAX_ENUM_LABEL_UNITS} characters`,
+      );
+  if (new Set(labels).size !== labels.length)
+    fail(path, "contains duplicate labels");
+  return Object.freeze([...(labels as readonly string[])]);
 }
 
 function validateArtifactCoverage(

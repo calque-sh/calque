@@ -150,6 +150,32 @@ describe("verifyColumnarBootstrapPlan", () => {
     expect(() => verifyColumnarBootstrapPlan(schema, plan())).not.toThrow();
   });
 
+  it("binds each enum column's labels to the collection that reads it", () => {
+    expect(
+      bindColumnarPlan(descriptor.collections, parseBootstrapPlan(plan()))
+        .enumLabels,
+    ).toEqual([]);
+    const labelled = plan();
+    const table = (
+      firstRuntime(labelled).tables as Record<string, unknown>[]
+    )[0];
+    const level = (
+      table?.columns as Record<string, unknown>[] | undefined
+    )?.[1];
+    if (!level) throw new Error("fixture column missing");
+    level.enumLabels = ["debug", "info", "error"];
+    expect(
+      bindColumnarPlan(descriptor.collections, parseBootstrapPlan(labelled))
+        .enumLabels,
+    ).toEqual([
+      {
+        collection: "events",
+        column: "level",
+        labels: ["debug", "info", "error"],
+      },
+    ]);
+  });
+
   it("binds collections by relation and takes the wire table id from the plan", () => {
     const hashed = plan();
     const wire = "table:9f2c:g18";

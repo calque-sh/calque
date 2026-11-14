@@ -33,7 +33,7 @@ use snapshot_builder::{
     COLLATION_GENERATION_V1, NO_INDEX_PROFILE_HASH, PUBLICATION_GENERATION_V1,
     SOURCE_WIDE_SHARD_PROFILE_HASH, TYPE_CODEC_GENERATION_V1,
 };
-use source_control::ActivatedSource;
+use source_control::{ActivatedSource, EnumLabels, QualifiedTable};
 use sync_types::{ArtifactId, CursorPosition, ObjectId, OpaqueCursor, PlanId, TableId};
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -321,6 +321,10 @@ pub struct BootstrapRequest {
     /// before `through`, the plan activates where its catch-up starts, so the
     /// client has nothing to catch up.
     pub unchanged: Option<UnchangedScope>,
+    /// The declared order of each enum column's labels, which the plan names
+    /// beside the column so the client orders it as PostgreSQL does. Kept out
+    /// of the manifest, so an added label changes no artifact.
+    pub enum_labels: EnumLabels,
 }
 
 /// No operation the scope reads committed after `last_change`, up to and
@@ -457,7 +461,31 @@ pub struct PlanArtifactTable {
     /// The change stream's column ids for this table, copied from the
     /// manifest; the client compiles its change contract from them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub columns: Vec<ArtifactColumn>,
+    pub columns: Vec<PlanArtifactColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanArtifactColumn {
+    pub column_id: u32,
+    pub name: String,
+    /// The labels of the enum the column carries, in PostgreSQL's declaration
+    /// order; empty, and left out, for any other column.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enum_labels: Vec<String>,
+}
+
+impl PlanArtifactColumn {
+    fn of(column: &ArtifactColumn, table: &QualifiedTable, labels: &EnumLabels) -> Self {
+        Self {
+            column_id: column.column_id,
+            name: column.name.clone(),
+            enum_labels: labels
+                .column(table, &column.name)
+                .map(<[String]>::to_vec)
+                .unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -868,16 +896,32 @@ impl BootstrapPlanner {
                     tables: manifest
                         .tables
                         .iter()
-                        .map(|table| PlanArtifactTable {
-                            table_id: table.table_id.clone(),
-                            source_schema: table.source_schema.clone(),
-                            source_table: table.source_table.clone(),
-                            local_table: table.local_table.clone(),
-                            schema_hash: table.schema_hash.clone(),
-                            column_profile_hash: table.column_profile_hash.clone(),
-                            row_count: table.row_count,
-                            primary_key_codec: table.primary_key_codec.clone(),
-                            columns: table.columns.clone(),
+                        .map(|table| {
+                            let relation = QualifiedTable {
+                                schema: table.source_schema.clone(),
+                                table: table.source_table.clone(),
+                            };
+                            PlanArtifactTable {
+                                table_id: table.table_id.clone(),
+                                source_schema: table.source_schema.clone(),
+                                source_table: table.source_table.clone(),
+                                local_table: table.local_table.clone(),
+                                schema_hash: table.schema_hash.clone(),
+                                column_profile_hash: table.column_profile_hash.clone(),
+                                row_count: table.row_count,
+                                primary_key_codec: table.primary_key_codec.clone(),
+                                columns: table
+                                    .columns
+                                    .iter()
+                                    .map(|column| {
+                                        PlanArtifactColumn::of(
+                                            column,
+                                            &relation,
+                                            &request.enum_labels,
+                                        )
+                                    })
+                                    .collect(),
+                            }
                         })
                         .collect(),
                 },
@@ -2279,6 +2323,7 @@ mod tests {
             long_poll_timeout_ms: 30_000,
             max_change_batch_bytes: 4 * 1024 * 1024,
             unchanged: None,
+            enum_labels: EnumLabels::default(),
         }
     }
 
@@ -2563,6 +2608,66 @@ mod tests {
         let mut unknown = value;
         unknown["artifacts"][0]["runtime"]["pageSize"] = serde_json::json!(8192);
         assert!(!validator.is_valid(&unknown));
+    }
+
+    /// An enum column's labels reach the plan beside its wire id, in the
+    /// order the request holds them, through a plan the planner has already
+    /// schema-validated; a column of no enum names none. The artifact the
+    /// plan installs is the same one, so labels change no artifact identity.
+    #[tokio::test]
+    async fn a_plan_names_each_enum_columns_labels_in_declared_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let (source, table, scope) = activated_source_with_scope();
+        let mut log = canonical_log(&directory.path().join("log"), &source);
+        let artifact_cursor = source.cursor_codec().encode(&CursorPosition {
+            source_epoch: source.source_epoch().clone(),
+            sequence: 0,
+        });
+        let artifact_bytes = b"verified artifact image";
+        let manifest = manifest_for_scope(&source, &table, artifact_cursor, artifact_bytes, &scope);
+        let mut catalog =
+            SqliteArtifactCatalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let store = LocalFilesystemBlobStore::open(directory.path().join("objects"), 1024).unwrap();
+        publish(&mut catalog, &store, &manifest, artifact_bytes).await;
+        let declared = ["low", "urgent", "medium", "", "high"].map(str::to_owned);
+        let mut labelled = request(&source, &scope, &table, None);
+        labelled.enum_labels = BTreeMap::from([(
+            QualifiedTable {
+                schema: "public".to_owned(),
+                table: "tasks".to_owned(),
+            },
+            BTreeMap::from([("title".to_owned(), declared.to_vec())]),
+        )])
+        .into();
+        let plan = BootstrapPlanner::plan(
+            &mut catalog,
+            &store,
+            &SameOriginProxyResolver::new("https://sync.test/base/").unwrap(),
+            &source,
+            &mut log,
+            &ResidentStateProofCodec::new([8_u8; 32]).unwrap(),
+            labelled,
+        )
+        .await
+        .unwrap();
+
+        let value = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            value["artifacts"][0]["runtime"]["tables"][0]["columns"],
+            serde_json::json!([
+                { "columnId": 1, "name": "id" },
+                { "columnId": 2, "name": "title", "enumLabels": declared },
+            ])
+        );
+        assert_eq!(
+            plan.artifacts[0].artifact_id,
+            manifest.manifest().artifact_id
+        );
+        let validator = plan_validator().unwrap();
+        let mut repeated = value;
+        repeated["artifacts"][0]["runtime"]["tables"][0]["columns"][1]["enumLabels"] =
+            serde_json::json!(["low", "low"]);
+        assert!(!validator.is_valid(&repeated));
     }
 
     #[tokio::test]

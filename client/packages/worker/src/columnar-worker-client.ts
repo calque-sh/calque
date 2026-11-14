@@ -1,5 +1,6 @@
 import type {
   ArtifactCapacity,
+  ColumnarEnumLabels,
   QueryCompletion,
   QueryExecutionOptions,
   QueryJsonValue,
@@ -217,6 +218,7 @@ export class EngineWorkerClient {
     queryCapacityBytes?: number,
     signal?: AbortSignal,
     changeStream?: ColumnarChangeContract,
+    enumLabels?: readonly ColumnarEnumLabels[],
   ): ReceivingWorkspace {
     this.#chunks = chunks;
     const opened = this.#open(
@@ -226,6 +228,7 @@ export class EngineWorkerClient {
       queryCapacityBytes,
       signal,
       changeStream,
+      enumLabels,
     );
     return {
       end: (count) => {
@@ -245,6 +248,7 @@ export class EngineWorkerClient {
     queryCapacityBytes: number | undefined,
     signal: AbortSignal | undefined,
     changeStream: ColumnarChangeContract | undefined,
+    enumLabels: readonly ColumnarEnumLabels[] | undefined,
   ): Promise<OpenedWorkspace> {
     const response = await this.#request(
       {
@@ -254,6 +258,9 @@ export class EngineWorkerClient {
         ...(capacity === undefined ? {} : { capacity }),
         ...(queryCapacityBytes === undefined ? {} : { queryCapacityBytes }),
         ...(changeStream === undefined ? {} : { changeStream }),
+        ...(enumLabels === undefined || enumLabels.length === 0
+          ? {}
+          : { enumLabels }),
       },
       hashers,
       signal,

@@ -438,9 +438,11 @@ async function handle(request: LiveRequest): Promise<WorkerResponse> {
         }),
       );
     if (request.queryCapacityBytes !== undefined && overlay)
-      queryEngine = new ColumnarQueryEngine(overlay, {
-        capacityBytes: request.queryCapacityBytes,
-      });
+      queryEngine = new ColumnarQueryEngine(
+        overlay,
+        { capacityBytes: request.queryCapacityBytes },
+        request.enumLabels,
+      );
     mark("open:engine");
     if (request.changeStream) {
       // The cursor is not empty: `receiveDirectColumnarArtifact` refused an

@@ -13,15 +13,22 @@ use canonical_log::PostgresDatastoreIdentity;
 use pg_walstream::{parse_lsn, PgReplicationConnection, PgReplicationShutdownHandle};
 use postgres::{error::SqlState, Client, Row};
 use source_control::{
-    ActivatedSource, QualifiedTable, SchemaRegistryBinding, SourceIdentity, ROLE_MAY_REPLICATE,
+    inspect_enum_labels, ActivatedSource, InspectError, QualifiedTable, RegisteredColumn,
+    SchemaRegistryBinding, SharedEnumLabels, SourceIdentity, ROLE_MAY_REPLICATE,
 };
 use sync_types::{SourceEpoch, SourceId};
 use thiserror::Error;
 
 use crate::{
-    inspect_owned_publication, ActivationEvidence, ActiveLease, FenceAuthority, FenceError,
-    OwnedPublication, PostgresFenceStore, PostgresRefusal, ProvisionalLease, RenewalClock,
-    PUBLICATION_CHECK_INTERVAL,
+    enum_labels::{
+        enrolled_labels, lock, published_enum_types, read_enum_values, EnumLabelGuard,
+        EnumLabelState, EnumReading,
+    },
+    inspect_owned_publication,
+    publication::changed_column,
+    ActivationEvidence, ActiveLease, EnumLabelDrift, FenceAuthority, FenceError, OwnedPublication,
+    PostgresFenceStore, PostgresRefusal, ProvisionalLease, RenewalClock, SeenEnumVersion,
+    ServedEnumLabel, PUBLICATION_CHECK_INTERVAL,
 };
 
 const SLOT_INACTIVE_POLL_ATTEMPTS: usize = 100;
@@ -94,9 +101,17 @@ pub struct SlotEnrollment {
     /// or before it, and must not be sent them again.
     pub(crate) retired_compacted_through_lsn_text: Option<String>,
     /// The publication's fingerprint when the slot was made, which every
-    /// session requires unchanged; `None` for an enrollment made before
-    /// enrollments recorded it, until the next session records it.
+    /// session requires unchanged.
     pub(crate) publication_fingerprint: Option<String>,
+    /// A WAL position at or before every change the slot decodes, from which
+    /// [`Self::enum_labels`] were read; `None` for an enrollment an earlier
+    /// release made, which recorded no enum labels.
+    pub(crate) enum_labels_from_lsn_text: Option<String>,
+    /// The labels served rows may carry for each enum a published column
+    /// uses, and the values that hold them.
+    pub(crate) enum_labels: Vec<ServedEnumLabel>,
+    /// The versions of those enums' values readings saw, as last recorded.
+    pub(crate) enum_versions: Vec<SeenEnumVersion>,
 }
 
 impl SlotEnrollment {
@@ -152,6 +167,9 @@ impl SlotEnrollment {
             durable_canonical_lsn_text: row.get(10),
             retired_compacted_through_lsn_text: None,
             publication_fingerprint: row.get(11),
+            enum_labels_from_lsn_text: row.get(12),
+            enum_labels: Vec::new(),
+            enum_versions: Vec::new(),
         })
     }
 }
@@ -191,6 +209,7 @@ pub struct ActiveSourceSession {
     pub(crate) expected_source: SourceIdentity,
     pub(crate) activated_source: ActivatedSource,
     pub(crate) ingest_state: crate::persistent_ingest::PersistentIngestState,
+    pub(crate) enum_guard: EnumLabelGuard,
     watchdog: Option<SessionWatchdog>,
 }
 
@@ -319,9 +338,18 @@ pub fn provision_persistent_slot(
             slot_name: config.slot_name.clone(),
         });
     }
+    let mut enum_types: Vec<u32> =
+        published_enum_types(&mut controller, &binding.publication().name)
+            .map_err(source_error)?
+            .into_values()
+            .collect();
+    enum_types.sort_unstable();
+    enum_types.dedup();
+    let before = read_enum_values(&mut controller, &enum_types).map_err(enum_reading_error)?;
     while_renewing(authority, provisional, || {
         create_slot(&mut controller, config)
     })?;
+    let after = read_enum_values(&mut controller, &enum_types).map_err(enum_reading_error)?;
     let slot = existing_slot(&mut controller, &config.slot_name)?;
     validate_slot(&slot, expected_source)?;
     let initial_lsn_text = format_lsn(slot.confirmed_flush_lsn);
@@ -339,6 +367,9 @@ pub fn provision_persistent_slot(
         durable_canonical_lsn_text: initial_lsn_text,
         retired_compacted_through_lsn_text: None,
         publication_fingerprint: Some(publication.fingerprint),
+        enum_labels_from_lsn_text: Some(format_lsn(before.bound)),
+        enum_labels: enrolled_labels(&before, &after),
+        enum_versions: Vec::new(),
     };
     authority.record_slot_enrollment(provisional, &enrollment)?;
     Ok(enrollment)
@@ -445,6 +476,7 @@ where
         flushed_lsn,
         fingerprint,
         wal_sender_timeout,
+        enum_guard,
     } = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -486,7 +518,7 @@ where
         expected_source.clone(),
         slot.slot_name.clone(),
         backend_pid,
-        PublicationWatch::new(activated_source.registry_binding(), fingerprint),
+        PublicationWatch::new(activated_source, fingerprint, &enum_guard),
     ) {
         Ok(watchdog) => watchdog,
         Err(error) => {
@@ -521,13 +553,15 @@ where
         expected_source,
         activated_source: activated_source.clone(),
         ingest_state,
+        enum_guard,
         watchdog: Some(watchdog),
     })
 }
 
 /// A session's replication stream, started on the slot it claimed, before the
 /// lease is active. `fingerprint` is the publication's as the session checked
-/// it, and `wal_sender_timeout` its walsender's.
+/// it, `wal_sender_timeout` its walsender's, and `enum_guard` holds the enum
+/// labels the session found unchanged.
 struct PreparedSession {
     replication: PgReplicationConnection,
     io_runtime: tokio::runtime::Runtime,
@@ -537,6 +571,7 @@ struct PreparedSession {
     flushed_lsn: u64,
     fingerprint: String,
     wal_sender_timeout: Duration,
+    enum_guard: EnumLabelGuard,
 }
 
 fn prepare_source_session<F>(
@@ -557,13 +592,27 @@ where
         connect_source_controller(source_connection, CONTROLLER_STATEMENT_TIMEOUT)?;
     verify_regular_source(&mut controller, expected_source)?;
     let publication = verify_publication(&mut controller, binding)?;
-    match &enrollment.publication_fingerprint {
-        Some(enrolled) if *enrolled != publication.fingerprint => {
-            return Err(SourceRuntimeError::PublicationDrift);
-        }
-        Some(_) => {}
-        None => authority.adopt_publication_fingerprint(provisional, &publication.fingerprint)?,
+    let (Some(enrolled_fingerprint), Some(enum_labels_from_lsn)) = (
+        &enrollment.publication_fingerprint,
+        &enrollment.enum_labels_from_lsn_text,
+    ) else {
+        return Err(SourceRuntimeError::EnrolledByEarlierRelease);
+    };
+    if *enrolled_fingerprint != publication.fingerprint {
+        return Err(SourceRuntimeError::PublicationDrift);
     }
+    if let Some(column) =
+        changed_column(&mut controller, binding.columns()).map_err(source_error)?
+    {
+        return Err(column_changed(column));
+    }
+    let enum_guard = check_enum_labels(
+        &mut controller,
+        source_connection,
+        activated_source,
+        enrollment,
+        parse_lsn(enum_labels_from_lsn).map_err(|_| SourceRuntimeError::InvalidSlotLsn)?,
+    )?;
     let mut slot = existing_slot(&mut controller, &enrollment.slot_name)?;
     validate_slot(&slot, expected_source)?;
     if slot.confirmed_flush_lsn > enrollment.durable_canonical_lsn()? {
@@ -628,7 +677,64 @@ where
         flushed_lsn,
         fingerprint: publication.fingerprint,
         wal_sender_timeout,
+        enum_guard,
     })
+}
+
+/// Requires every enum label `enrollment` serves to be held by the value it
+/// was recorded for, and every enum its columns use to be one Calque serves,
+/// and returns the guard the session checks changes with. Plans name the
+/// labels read here from then on.
+fn check_enum_labels(
+    controller: &mut Client,
+    source_connection: &str,
+    source: &ActivatedSource,
+    enrollment: &SlotEnrollment,
+    from_lsn: u64,
+) -> Result<EnumLabelGuard, SourceRuntimeError> {
+    let binding = source.registry_binding();
+    let publication = &binding.publication().name;
+    let labels = inspect_enum_labels(controller, publication, &enrolled_tables(binding)).map_err(
+        |error| match error {
+            InspectError::Postgres(error) => source_error(error),
+            error => SourceRuntimeError::EnumUnservable(error),
+        },
+    )?;
+    source.enum_labels().replace(labels);
+    let declared = published_enum_types(controller, publication).map_err(source_error)?;
+    let state = Arc::new(std::sync::Mutex::new(EnumLabelState::new(
+        &enrollment.enum_labels,
+        &enrollment.enum_versions,
+    )));
+    let connection = source_connection.to_owned();
+    let guard = EnumLabelGuard::new(
+        from_lsn,
+        declared,
+        Arc::clone(&state),
+        Box::new(move || connect_source_controller(&connection, CONTROLLER_STATEMENT_TIMEOUT).ok()),
+    );
+    let reading = read_enum_values(controller, guard.enum_types()).map_err(enum_reading_error)?;
+    let mut state = lock(&state);
+    state.observe(&reading);
+    if let Some(drift) = state.changed(&reading) {
+        return Err(drift.into());
+    }
+    drop(state);
+    Ok(guard)
+}
+
+fn column_changed(column: &RegisteredColumn) -> SourceRuntimeError {
+    SourceRuntimeError::ColumnChanged {
+        table: column.table.display_name(),
+        column: column.name.clone(),
+    }
+}
+
+fn enum_reading_error(error: crate::enum_labels::ReadingError) -> SourceRuntimeError {
+    match error {
+        crate::enum_labels::ReadingError::Postgres(error) => source_error(error),
+        crate::enum_labels::ReadingError::Invalid => SourceRuntimeError::SourceControlUnavailable,
+    }
 }
 
 /// Creates the slot, waiting up to `config.open_transaction_wait` for open
@@ -814,26 +920,40 @@ fn enrolled_tables(binding: &SchemaRegistryBinding) -> BTreeSet<QualifiedTable> 
 }
 
 /// What a session's publication check compares: the fingerprint the session
-/// opened on, and the definition it requires.
+/// opened on, the definition it requires, and the enum labels it serves.
 struct PublicationWatch {
     name: String,
     tables: BTreeSet<QualifiedTable>,
+    columns: Vec<RegisteredColumn>,
     fingerprint: String,
+    enum_types: Vec<u32>,
+    enum_labels: Arc<std::sync::Mutex<EnumLabelState>>,
+    /// The labels plans name in declared order, read again whenever the
+    /// enums' values differ from `planned`, the values they were read at.
+    plan_labels: SharedEnumLabels,
+    planned: Option<EnumReading>,
 }
 
 impl PublicationWatch {
-    fn new(binding: &SchemaRegistryBinding, fingerprint: String) -> Self {
+    fn new(source: &ActivatedSource, fingerprint: String, guard: &EnumLabelGuard) -> Self {
+        let binding = source.registry_binding();
         Self {
             name: binding.publication().name.clone(),
             tables: enrolled_tables(binding),
+            columns: binding.columns().to_vec(),
             fingerprint,
+            enum_types: guard.enum_types().to_vec(),
+            enum_labels: guard.state(),
+            plan_labels: source.enum_labels().clone(),
+            planned: None,
         }
     }
 
-    /// Whether the publication is gone or changed since the session opened.
-    /// A failed read changes nothing: the session's own connections fail on
-    /// what makes it fail.
-    fn changed(&self, controller: &mut Option<Client>, source_connection: &str) -> bool {
+    /// Whether the publication is gone or changed since the session opened,
+    /// a served column changed, or a value holding a served enum label
+    /// changed. A failed read changes nothing: the session's own connections
+    /// fail on what makes it fail.
+    fn changed(&mut self, controller: &mut Option<Client>, source_connection: &str) -> bool {
         if controller.is_none() {
             *controller =
                 connect_source_controller(source_connection, CONTROLLER_STATEMENT_TIMEOUT).ok();
@@ -842,12 +962,80 @@ impl PublicationWatch {
             return false;
         };
         match inspect_owned_publication(client, &self.name, &self.tables) {
-            Ok(OwnedPublication::Matches { fingerprint, .. }) => fingerprint != self.fingerprint,
-            Ok(OwnedPublication::Missing | OwnedPublication::Drifted) => true,
+            Ok(OwnedPublication::Matches { fingerprint, .. })
+                if fingerprint == self.fingerprint => {}
+            Ok(_) => {
+                tracing::warn!(
+                    publication = %self.name,
+                    "the publication changed while CDC streamed from it; stopping the session"
+                );
+                return true;
+            }
             Err(_) => {
+                *controller = None;
+                return false;
+            }
+        }
+        match changed_column(client, &self.columns) {
+            Ok(None) => {}
+            Ok(Some(column)) => {
+                tracing::warn!(
+                    table = %column.table.display_name(),
+                    column = %column.name,
+                    "a served column was dropped, renamed or retyped while CDC streamed; stopping the session"
+                );
+                return true;
+            }
+            Err(_) => {
+                *controller = None;
+                return false;
+            }
+        }
+        let Ok(reading) = read_enum_values(client, &self.enum_types) else {
+            *controller = None;
+            return false;
+        };
+        {
+            let mut state = lock(&self.enum_labels);
+            state.observe(&reading);
+            if let Some(drift) = state.changed(&reading) {
+                tracing::warn!(%drift, "an enum value the working set serves changed while CDC streamed; stopping the session");
+                return true;
+            }
+        }
+        if self
+            .planned
+            .as_ref()
+            .is_some_and(|planned| planned.enums == reading.enums)
+        {
+            return false;
+        }
+        match inspect_enum_labels(client, &self.name, &self.tables) {
+            Ok(labels) => {
+                self.plan_labels.replace(labels);
+                self.planned = Some(reading);
+                false
+            }
+            Err(InspectError::Postgres(_)) => {
                 *controller = None;
                 false
             }
+            Err(error) => {
+                tracing::warn!(%error, "the enums the publication's columns use can no longer be served; stopping the session");
+                true
+            }
+        }
+    }
+
+    /// Records the enum value versions readings saw, once they differ from
+    /// the versions last recorded, so a later session proves labels from what
+    /// this one saw. A failed record is tried again at the next check.
+    fn record_seen(&self, record: impl FnOnce(&[SeenEnumVersion]) -> Result<(), FenceError>) {
+        let Some(versions) = lock(&self.enum_labels).take_unrecorded() else {
+            return;
+        };
+        if record(&versions).is_err() {
+            lock(&self.enum_labels).record_failed();
         }
     }
 }
@@ -1023,6 +1211,7 @@ fn start_session_watchdog(
     });
     let (stop, receiver) = mpsc::channel();
     let renewal_kill = Arc::clone(&kill);
+    let recorder = Arc::clone(&authority);
     let join = thread::Builder::new()
         .name(format!("calque-source-watchdog-{backend_pid}"))
         .spawn(move || {
@@ -1040,17 +1229,16 @@ fn start_session_watchdog(
         .name(format!("calque-publication-watch-{backend_pid}"))
         .spawn(move || {
             let mut controller = None;
+            let mut publication = publication;
             while let Err(mpsc::RecvTimeoutError::Timeout) =
                 publication_receiver.recv_timeout(PUBLICATION_CHECK_INTERVAL)
             {
                 if publication.changed(&mut controller, &kill.source_connection) {
-                    tracing::warn!(
-                        publication = %publication.name,
-                        "the publication changed while CDC streamed from it; stopping the session"
-                    );
                     kill.kill();
                     return;
                 }
+                publication
+                    .record_seen(|versions| recorder.record_enum_versions(&kill.lease, versions));
             }
         });
     let publication_join = match publication_join {
@@ -1198,7 +1386,7 @@ fn validate_enrollment_binding(
     Ok(())
 }
 
-fn format_lsn(lsn: u64) -> String {
+pub(crate) fn format_lsn(lsn: u64) -> String {
     format!("{:X}/{:08X}", lsn >> 32, lsn & 0xffff_ffff)
 }
 
@@ -1367,6 +1555,14 @@ pub enum SourceRuntimeError {
     PublicationMissing,
     #[error("publication no longer has the definition the activated source registry enrolled")]
     PublicationDrift,
+    #[error("column {column} of {table} was dropped, renamed, or given another type or type modifier, which PostgreSQL applies to every row without a row change, so the working set may no longer match PostgreSQL's rows.")]
+    ColumnChanged { table: String, column: String },
+    #[error(transparent)]
+    EnumLabel(#[from] EnumLabelDrift),
+    #[error(transparent)]
+    EnumUnservable(InspectError),
+    #[error("this source was enrolled by an earlier release of calque, which did not record the enum labels it serves, so this release cannot resume it.")]
+    EnrolledByEarlierRelease,
     #[error("activated source epoch does not match the provisional lease")]
     ActivatedSourceLeaseMismatch,
     #[error("durable slot enrollment does not match the activated source and lease")]

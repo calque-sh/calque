@@ -19,6 +19,12 @@ An `int2` or `int4` column is a `number` in TypeScript and an `int8` one a
 `bigint`. `sum` over any of the three is a `bigint`, as PostgreSQL's `sum`
 over `int2` and `int4` is, and over a `float4` or `float8` column a `number`.
 
+An enum column is a `string`. `orderBy`, `lt`, `lte`, `gt`, `gte`, `min` and
+`max` order it as PostgreSQL does, in the order its type declares the labels.
+A value added to the type after the page loaded orders after every label the
+page knows, and such values among themselves by text, until the page loads
+again.
+
 `run()` returns the whole result or rejects with `RESULT_TOO_LARGE`, never part
 of it. By default it rejects a result over 1,000 rows or 4 MiB;
 `run({ maxRows, maxBytes })` raises those limits to at most 10,000 rows and
@@ -48,6 +54,14 @@ A call that does not resolve rejects with a `MutationSubmissionError`. Its
 | `MUTATION_AMBIGUOUS`, recovery `retry` | No decision reached the page through every resend. The write may have committed.                                       | Kept                          | `client.retryMutation(error.mutationId)` sends it again. Its change arriving from PostgreSQL also settles it. |
 | `MUTATION_AMBIGUOUS`, recovery `none`  | The client can no longer resend it: it rebuilt after `reset()` or a revocation, or held more than 64 undecided writes. | Gone with the state it was on | The rebuilt rows show whether it landed.                                                                      |
 | `AUTH_FAILED`                          | The server refused the credentials, and the client stopped in `error`.                                                 | Kept until `reset()`          | Get a new grant from `auth`, then `reset()`.                                                                  |
+
+When PostgreSQL refused the write for a constraint, `error.conflict.kind` is
+`constraint`, and `error.conflict.applicationPayload` holds the constraint's
+name as UTF-8 when the constraint is the written table's own and reads only
+columns Calque serves, a foreign key's referenced columns included, as the
+catalog held it when Calque started. Otherwise the payload is empty, since a
+constraint name can spell out a column the publication leaves out or a table
+the page was never shown.
 
 A write can also reject with a plain `SyncError` before anything is sent:
 `CANCELLED` with recovery `retry` when a `reset()` overtook it, so issuing it

@@ -71,9 +71,14 @@ and each tenant is built on its first request, as under `calque serve`.
 ## Running a server
 
 `calque dev` serves one disposable database on loopback with a development
-bearer, for working on a page. It needs `--table schema.table`, repeated for
-each table, and `--acknowledge-disposable-source`, which confirms the database
-holds nothing you need. It reads `CALQUE_DATABASE_URL`, or the variable
+bearer, for working on a page. It serves the tables and columns that
+`calque.config.json` in the directory it runs in names, or the manifest
+`--config` names, and publishes each table with a column list as `serve` does,
+so a column a collection leaves out never leaves PostgreSQL. Without a
+manifest it needs `--table schema.table`, repeated for each table, and serves
+every column of each; beside a manifest, `--table` must name the manifest's
+tables. It also needs `--acknowledge-disposable-source`, which confirms the
+database holds nothing you need. It reads `CALQUE_DATABASE_URL`, or the variable
 `--database-url-env` names, and keeps its state in `--state-dir`, `.calque-dev`
 by default, which holds `client.env`, the address and bearer the Vite plugin
 reads. It listens on `127.0.0.1:8787` and allows the origin
@@ -81,8 +86,7 @@ reads. It listens on `127.0.0.1:8787` and allows the origin
 those, and `--public-base-url` names the proxy that fronts it:
 
 ```sh
-calque dev --table public.tasks \
-  --public-base-url http://127.0.0.1:5173/_calque/ \
+calque dev --public-base-url http://127.0.0.1:5173/_calque/ \
   --acknowledge-disposable-source
 ```
 
@@ -155,7 +159,7 @@ docker run --rm --network host \
   --application-id my-app
 docker run --rm -e CALQUE_DATABASE_URL --network host \
   -v "$PWD":/work -w /work --user "$(id -u):$(id -g)" \
-  ghcr.io/calque-sh/calque dev --table public.tasks \
+  ghcr.io/calque-sh/calque dev \
   --public-base-url http://127.0.0.1:5173/_calque/ \
   --acknowledge-disposable-source
 ```
@@ -171,7 +175,7 @@ port on your loopback address only:
 export CALQUE_DATABASE_URL='postgresql://calque_sync:calque_sync@host.docker.internal:5432/app?sslmode=disable'
 docker run --rm -e CALQUE_DATABASE_URL -p 127.0.0.1:8787:8787 \
   -v "$PWD":/work -w /work --user "$(id -u):$(id -g)" \
-  ghcr.io/calque-sh/calque dev --table public.tasks --bind-address 0.0.0.0 \
+  ghcr.io/calque-sh/calque dev --bind-address 0.0.0.0 \
   --public-base-url http://127.0.0.1:5173/_calque/ \
   --acknowledge-disposable-source
 ```

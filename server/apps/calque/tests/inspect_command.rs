@@ -197,6 +197,49 @@ fn inspect_names_each_blocker_and_its_fix() {
     assert!(!stderr.contains("EnrollmentDiagnostic"), "{stderr}");
 }
 
+/// `inspect` refuses an enum of more labels than `dev` and `serve` start
+/// with, naming the column, and passes one of exactly as many.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn inspect_refuses_an_enum_of_more_labels_than_calque_serves() {
+    let database_url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let mut client = Client::connect(&database_url, NoTls).unwrap();
+    for count in [4_096, 4_097] {
+        let kind = format!(
+            "inspect_labels_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let labels = (0..count)
+            .map(|label| format!("'l{label}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        client
+            .batch_execute(&format!("CREATE TYPE public.{kind} AS ENUM ({labels})"))
+            .unwrap();
+        let relation = LiveRelation::create(&format!("id uuid PRIMARY KEY, kind public.{kind}"));
+        let table = format!("public.{}", relation.table);
+        let (success, stderr) = inspect_table(&database_url, &relation.publication, &table);
+        drop(relation);
+        client
+            .batch_execute(&format!("DROP TYPE public.{kind}"))
+            .unwrap();
+        assert_eq!(success, count == 4_096, "{count}: {stderr}");
+        if count == 4_097 {
+            assert!(
+                stderr.contains(&format!(
+                    "column kind of {table} is an enum of 4097 labels; \
+                     Calque serves an enum of at most 4096"
+                )),
+                "{stderr}"
+            );
+        }
+    }
+}
+
 /// `inspect` warns on stderr, after a successful inspection, exactly when the
 /// server bounds neither the WAL a slot may hold back nor how long it may sit
 /// idle.

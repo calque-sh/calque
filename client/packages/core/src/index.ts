@@ -30,6 +30,7 @@ export {
   MAX_QUERY_SPEC_BYTES,
   QueryError,
   validateQuerySpecification,
+  type ColumnarEnumLabels,
   type ColumnarQueryCapacity,
   type QueryAggregateOperator,
   type QueryComparisonOperator,

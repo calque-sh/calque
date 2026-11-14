@@ -9,7 +9,7 @@ This file walks a coding agent through adding Calque to a web application, from 
 - There is no SQL API and no server-side pagination. The page holds every row of each collection its grant allows, and every query runs locally through `client.db.<collection>`.
 - Calque is built and measured for working sets of about 100,000 rows. Every page load downloads the whole working set again, so its load time grows with its bytes.
 - A collection is one PostgreSQL table with a primary key. `calque inspect` refuses any table or column Calque cannot serve and names the reason; [docs/postgresql.md](docs/postgresql.md) lists the supported types.
-- Every column a collection names reaches the browser. If a table holds anything a user must not read, such as a password hash or an internal note, delete that column from the collection's `columns` and its command's `writableColumns` in `calque.config.json`: `calque serve` then publishes the table with a column list that leaves it out, as in `CREATE PUBLICATION calque_app FOR TABLE public.users (id, name)`, so PostgreSQL never sends it. `calque dev` publishes every column of the tables it names.
+- Every column a collection names reaches the browser. If a table holds anything a user must not read, such as a password hash or an internal note, delete that column from the collection's `columns` and its command's `writableColumns` in `calque.config.json`: `calque serve` and `calque dev` then publish the table with a column list that leaves it out, as in `CREATE PUBLICATION calque_app FOR TABLE public.users (id, name)`, so PostgreSQL never sends it. Only `calque dev --table`, run where there is no `calque.config.json`, publishes every column.
 - A grant gives a page whole tables, or one tenant's rows of them by a tenant column that leads the primary key. Visibility per user or per team needs a projection table the application maintains.
 - `int8` columns are `bigint` in TypeScript, so a key is `1n`, not `1`, and `sum()` over any integer column is a `bigint`.
 - `query().run()` returns the whole result or rejects with `RESULT_TOO_LARGE`: by default over 1,000 rows or 4 MiB, and at most 10,000 rows and 16 MiB with `run({ maxRows, maxBytes })`. For more, read a window with `window(offset, count)` or subscribe to one.
@@ -19,7 +19,7 @@ This file walks a coding agent through adding Calque to a web application, from 
 
 ## 1. PostgreSQL
 
-The database must be PostgreSQL 18 with `wal_level=logical`, a free replication slot and WAL sender for each Calque server, and UTF-8. Calque connects as a role that is not a superuser, has `REPLICATION` (on Amazon RDS and Aurora, membership in `rds_replication`) and `CREATE` on the database. `calque serve` reads a publication the tables' owner creates, and its role needs only `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the tables. `calque dev` creates its own publication, so its role owns the tables it serves or is a member of the role that does. For a database on this machine, write `127.0.0.1` in the connection string: any host name, `localhost` included, needs `sslmode=verify-full&sslrootcert=<absolute path of a CA file>`, as [docs/postgresql.md](docs/postgresql.md#the-database-url) shows. A managed database needs logical replication turned on and its direct endpoint, not a transaction pooler.
+The database must be PostgreSQL 18 with `wal_level=logical`, a free replication slot and WAL sender for each Calque server, and UTF-8. Calque connects as a role that is not a superuser, has `REPLICATION` (on Amazon RDS and Aurora, membership in `rds_replication`) and `CREATE` on the database. `calque serve` reads a publication the tables' owner creates, and its role needs only `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the tables. `calque dev` creates its own publication when its role owns the tables or is a member of the role that does, and otherwise refuses with the `CREATE PUBLICATION` statement for the tables' owner to run once. For a database on this machine, write `127.0.0.1` in the connection string: any host name, `localhost` included, needs `sslmode=verify-full&sslrootcert=<absolute path of a CA file>`, as [docs/postgresql.md](docs/postgresql.md#the-database-url) shows. A managed database needs logical replication turned on and its direct endpoint, not a transaction pooler.
 
 Create the role as [docs/postgresql.md](docs/postgresql.md#the-role) shows. For a new table that `calque dev` will serve, as `calque_sync`:
 
@@ -64,15 +64,14 @@ The Vite plugin of step 6 renders `calque.config.json` into `calque.generated.ts
 
 ## 5. A development server
 
-`calque dev` enrolls a disposable database and serves it on loopback with a development bearer instead of signed grants. It creates its own publication, replication slot and `calque_control` schema in that database, and writes its endpoint and bearer to `.calque-dev/client.env`. Run it from the application's root, because the Vite plugin reads the nearest `.calque-dev` at or above the page's root:
+`calque dev` enrolls a disposable database and serves it on loopback with a development bearer instead of signed grants. It creates its own publication, replication slot and `calque_control` schema in that database, and writes its endpoint and bearer to `.calque-dev/client.env`. It serves the tables and columns `calque.config.json` names, or the manifest `--config` names. Run it from the application's root, where that file is, and because the Vite plugin reads the nearest `.calque-dev` at or above the page's root:
 
 ```sh
-calque dev --table public.tasks \
-  --public-base-url http://127.0.0.1:5173/_calque/ \
+calque dev --public-base-url http://127.0.0.1:5173/_calque/ \
   --acknowledge-disposable-source
 ```
 
-It allows the origin `http://127.0.0.1:5173` unless `--allow-origin` names another, and `--public-base-url` is the Vite proxy's address, which every URL it hands the page names. `calque destroy --state-dir .calque-dev --yes` removes what it created.
+It allows the origin `http://127.0.0.1:5173` unless `--allow-origin` names another, and `--public-base-url` is the Vite proxy's address, which every URL it hands the page names. `calque destroy --state-dir .calque-dev --yes` removes what it created; run it after editing a collection's `columns`, and the next `calque dev` prepares the tables with the new ones.
 
 ## 6. The page
 

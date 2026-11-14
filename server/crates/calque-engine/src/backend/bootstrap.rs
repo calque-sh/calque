@@ -527,6 +527,7 @@ impl LocalBackend {
             long_poll_timeout_ms: LOCAL_LONG_POLL_TIMEOUT_MS,
             max_change_batch_bytes: self.inner.max_change_batch_bytes,
             unchanged,
+            enum_labels: self.inner.activated.enum_labels().current(),
         };
         // Bootstrap planning holds a SQLite transaction across provider awaits,
         // which makes that future !Send. Keep it on one dedicated thread while

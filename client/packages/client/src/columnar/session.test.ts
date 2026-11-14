@@ -70,6 +70,28 @@ describe("direct-columnar session", () => {
     vi.restoreAllMocks();
   });
 
+  it("hands the worker each enum column's labels in the order the plan declares", async () => {
+    const plain = makeClient();
+    expect(await settled(plain.client)).toEqual({ state: "ready" });
+    expect(plain.worker.requests[0]).not.toHaveProperty("enumLabels");
+
+    const labelled = plan();
+    const runtime = (labelled.artifacts as Record<string, unknown>[])[0]
+      ?.runtime as { tables: { columns: Record<string, unknown>[] }[] };
+    const level = runtime.tables[0]?.columns[1];
+    if (!level) throw new Error("fixture column missing");
+    level.enumLabels = ["debug", "info", "error"];
+    const { client, worker } = makeClient(labelled);
+    expect(await settled(client)).toEqual({ state: "ready" });
+    expect(worker.requests[0]?.enumLabels).toEqual([
+      {
+        collection: "events",
+        column: "level",
+        labels: ["debug", "info", "error"],
+      },
+    ]);
+  });
+
   it("activates the served artifact and answers typed facade queries", async () => {
     const { client, worker, fetcher, workerFactory } = makeClient();
     expect(await settled(client)).toEqual({ state: "ready" });

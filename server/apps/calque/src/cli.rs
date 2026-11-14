@@ -235,8 +235,15 @@ pub struct DevCommand {
     /// Private state directory. It is created with mode 0700.
     #[arg(long, value_name = "PATH", default_value = ".calque-dev")]
     pub state_dir: PathBuf,
-    /// Table to synchronize, as `schema.table`. Repeat for more than one.
-    #[arg(long = "table", value_name = "SCHEMA.TABLE", value_parser = QualifiedTable::parse_dotted, required = true)]
+    /// Manifest whose collections name the tables and the columns to serve,
+    /// as `calque serve` reads them. Without it, dev reads calque.config.json
+    /// in the current directory when there is one.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+    /// Table to serve with every column, as `schema.table`, when dev reads no
+    /// manifest. Repeat for more than one. With a manifest, the tables given
+    /// must be the ones it names.
+    #[arg(long = "table", value_name = "SCHEMA.TABLE", value_parser = QualifiedTable::parse_dotted)]
     pub tables: Vec<QualifiedTable>,
     /// Browser origin permitted to call this server. Repeat when needed.
     #[arg(

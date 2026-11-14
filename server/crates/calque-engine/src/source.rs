@@ -19,8 +19,9 @@ use cdc_ingest::{AppendFailure, FenceError as IngestFenceError, IngestError};
 use postgres::{error::SqlState, Client};
 use source_control::quote_identifier;
 use source_control::{
-    inspect_source, ActivatedSource, EnrollmentRequirements, EnrollmentSnapshot,
-    PgoutputLaunchProfile, QualifiedTable, SchemaRegistry, SourceIdentity, TableInspection,
+    inspect_enum_labels, inspect_source, ActivatedSource, EnrollmentRequirements,
+    EnrollmentSnapshot, PgoutputLaunchProfile, QualifiedTable, SchemaRegistry, SharedEnumLabels,
+    SourceIdentity, TableInspection,
 };
 use source_runtime::{
     establish_persistent_source, establish_persistent_source_interruptible,
@@ -123,7 +124,10 @@ fn inspect_local_source_unexplained(
         PostgresConnectionFamily::Inspect,
         "calque-inspect",
     )?;
-    Ok(inspect_source(&mut client, publication, tables)?)
+    let snapshot = inspect_source(&mut client, publication, tables)?;
+    // The labels are read only for the refusal `dev` and `serve` start with.
+    inspect_enum_labels(&mut client, publication, tables)?;
+    Ok(snapshot)
 }
 
 fn inspect_identity(client: &mut Client) -> Result<SourceIdentity, LocalSourceError> {
@@ -232,6 +236,11 @@ fn prepare_local_source_unexplained(
         }
         None => SchemaRegistry::initialize(&snapshot, &requirements)?,
     };
+    let enum_labels = inspect_enum_labels(
+        &mut client,
+        &state.names.publication_name,
+        &requirements.tables,
+    )?;
     let policy = source_wide_policy(&registry)?;
     let scope = policy.scope();
     let activated = ActivatedSource::new(
@@ -239,7 +248,8 @@ fn prepare_local_source_unexplained(
         state.source_epoch.clone(),
         CursorCodec::new(*secrets.cursor_secret.as_bytes())?,
         PgoutputLaunchProfile::V1,
-    );
+    )
+    .with_enum_labels(SharedEnumLabels::new(enum_labels));
     Ok(PreparedLocalSource {
         registry,
         activated,
@@ -383,6 +393,8 @@ fn destroy_local_source_unexplained(
         "calque_control.canonical_log_head",
         "calque_control.canonical_log_retention",
         "calque_internal.mutation_receipts",
+        "calque_control.source_enum_version",
+        "calque_control.source_enum_label",
         "calque_control.source_slot_enrollment",
         "calque_control.canonical_log_writer_fence",
         "calque_control.source_fence_lease",
@@ -1491,7 +1503,8 @@ fn transient_ingest_failure(error: &PersistentIngestError) -> bool {
         PersistentIngestError::SessionClosed
         | PersistentIngestError::ReplicationUnavailable
         | PersistentIngestError::ReplicationSilent(_)
-        | PersistentIngestError::MutationReceiptUnavailable => true,
+        | PersistentIngestError::MutationReceiptUnavailable
+        | PersistentIngestError::EnumReadingUnavailable => true,
         PersistentIngestError::CanonicalLog(error)
         | PersistentIngestError::Ingest(IngestError::Append(AppendFailure::CanonicalLog(error))) => {
             transient_append_failure(error)
@@ -1988,7 +2001,14 @@ fn select_publication_columns(
                                AND (listed.prattrs IS NULL
                                     OR attribute.attnum = ANY(listed.prattrs::int2[]))
                              ORDER BY attribute.attnum)
-                    END
+                    END,
+                    ARRAY(SELECT attribute.attname::text
+                            FROM pg_catalog.pg_index AS index
+                            JOIN pg_catalog.pg_attribute AS attribute
+                              ON attribute.attrelid = index.indrelid
+                             AND attribute.attnum = ANY(index.indkey)
+                           WHERE index.indrelid = class.oid AND index.indisprimary
+                           ORDER BY attribute.attnum)
                FROM pg_catalog.pg_class AS class
                JOIN pg_catalog.pg_namespace AS namespace
                  ON namespace.oid = class.relnamespace
@@ -2009,6 +2029,15 @@ fn select_publication_columns(
             return Err(LocalSourceError::SelectedColumnMissing {
                 table: table.display_name(),
                 column: missing.clone(),
+            });
+        }
+        // Enrollment refuses a list without the key too, but only after the
+        // publication exists.
+        let key: Vec<String> = row.get(3);
+        if let Some(omitted) = key.iter().find(|name| !selected.contains(*name)) {
+            return Err(LocalSourceError::SelectedColumnsOmitKey {
+                table: table.display_name(),
+                column: omitted.clone(),
             });
         }
         if let Some(published) = row.get::<_, Option<Vec<String>>>(2) {
@@ -2372,7 +2401,7 @@ pub enum LocalSourceError {
     EnrolledByAnotherState,
     #[error("the configured table set is empty")]
     EmptyTableSet,
-    #[error("the PostgreSQL publication {publication} was altered, or an enum its columns use gained or renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists and enum values it had at enrollment.")]
+    #[error("the PostgreSQL publication {publication} was altered: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists it had at enrollment.")]
     PublicationDrift { publication: String },
     #[error("the PostgreSQL publication {publication} does not exist, and Calque's role cannot create it because it does not own {table}. Have the tables' owner create it: {statement}")]
     PublicationMissing {
@@ -2390,6 +2419,8 @@ pub enum LocalSourceError {
     },
     #[error("the manifest selects column {column} of {table}, which has no such column.")]
     SelectedColumnMissing { table: String, column: String },
+    #[error("the manifest leaves out column {column} of {table}, which is in its primary key, and Calque identifies every row by its key; add {column} to the collection's columns.")]
+    SelectedColumnsOmitKey { table: String, column: String },
     #[error("the manifest selects some columns of {table}, whose replica identity is FULL, and PostgreSQL refuses UPDATE and DELETE on such a table under any column list; select every column of {table}, or run ALTER TABLE {table} REPLICA IDENTITY DEFAULT so that publication {publication} can list only the selected ones.")]
     SelectedColumnsUnderFullIdentity { publication: String, table: String },
     #[error("a lock on {table} was not granted within {bound:?}, so the publication was not created; another session holds a conflicting lock on it (VACUUM, ANALYZE, CREATE INDEX or other DDL, or an autovacuum preventing wraparound, which PostgreSQL never cancels); retry once that finishes")]
@@ -2422,12 +2453,14 @@ impl LocalSourceError {
     /// Whether only `calque destroy` gets past this refusal: a canonical log
     /// an earlier release wrote, whether connecting the log refused it or an
     /// ingest step met it, a schema registry that does not match the state
-    /// beside it, a source another state directory enrolled, a publication
-    /// whose columns are not the selected ones, which destroy drops so the
-    /// next start creates it with them, or a replication slot that was
-    /// dropped or that PostgreSQL invalidated, since the changes it held
-    /// cannot be replayed and the working set has to be prepared anew. A
-    /// failed session cleanup after one of them needs it too, since the cause
+    /// beside it, a source another state directory enrolled or an earlier
+    /// release enrolled, a publication whose columns are not the selected
+    /// ones, which destroy drops so the next start creates it with them, an
+    /// enum value whose label the working set may carry stale, or a
+    /// replication slot that was dropped or that PostgreSQL invalidated, since
+    /// the changes it held cannot be replayed and the working set has to be
+    /// prepared anew. A failed session cleanup after one of them needs it too,
+    /// since the cause
     /// stands.
     pub fn requires_destroying_state(&self) -> bool {
         match self {
@@ -2439,8 +2472,13 @@ impl LocalSourceError {
                 ))),
             ) => error.requires_destroying_state(),
             Self::Runtime(
-                SourceRuntimeError::SlotMissing { .. } | SourceRuntimeError::SlotLost { .. },
+                SourceRuntimeError::SlotMissing { .. }
+                | SourceRuntimeError::SlotLost { .. }
+                | SourceRuntimeError::ColumnChanged { .. }
+                | SourceRuntimeError::EnumLabel(_)
+                | SourceRuntimeError::EnrolledByEarlierRelease,
             )
+            | Self::Ingest(PersistentIngestError::EnumLabel(_))
             | Self::RegistryStateMismatch
             | Self::EnrolledByAnotherState
             | Self::PublishedColumnsDiffer { .. } => true,
@@ -2450,8 +2488,8 @@ impl LocalSourceError {
     }
 
     /// Whether this is the publication no longer having its enrolled
-    /// definition, or an enum its columns use having changed. Restoring the
-    /// definition and then `calque destroy` gets past it. A start meets it
+    /// definition. Restoring the definition and then `calque destroy` gets
+    /// past it. A start meets it
     /// during enrollment and a reconnect when it opens a session. A failed session cleanup after it
     /// is one too, since the cause stands.
     pub fn publication_drifted(&self) -> bool {
@@ -2466,6 +2504,8 @@ impl LocalSourceError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    use source_runtime::EnumLabelDrift;
 
     use super::*;
     use crate::{LocalNames, SecretToken};
@@ -2531,7 +2571,7 @@ mod tests {
                 publication: "calque_0123456789abcdef01234567".to_owned(),
             }
             .to_string(),
-            "the PostgreSQL publication calque_0123456789abcdef01234567 was altered, or an enum its columns use gained or renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists and enum values it had at enrollment."
+            "the PostgreSQL publication calque_0123456789abcdef01234567 was altered: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists it had at enrollment."
         );
         assert_eq!(
             LocalSourceError::SlotOwnershipMismatch.to_string(),
@@ -2943,6 +2983,10 @@ mod tests {
         let ingest_fence = |error: IngestFenceError| {
             LocalSourceError::Ingest(PersistentIngestError::Ingest(IngestError::Fence(error)))
         };
+        let gone = || EnumLabelDrift::Gone {
+            enum_type: "mood".to_owned(),
+            label: "calm".to_owned(),
+        };
         let cases = [
             // The replication or control connection went away mid-session.
             (ingest(PersistentIngestError::SessionClosed), Transient),
@@ -2958,6 +3002,10 @@ mod tests {
             ),
             (
                 ingest(PersistentIngestError::MutationReceiptUnavailable),
+                Transient,
+            ),
+            (
+                ingest(PersistentIngestError::EnumReadingUnavailable),
                 Transient,
             ),
             (
@@ -3185,6 +3233,15 @@ mod tests {
                 ingest(PersistentIngestError::AuthorizationPolicyChanged),
                 Fatal,
             ),
+            (ingest(PersistentIngestError::EnumLabel(gone())), Fatal),
+            (
+                LocalSourceError::Runtime(SourceRuntimeError::EnumLabel(gone())),
+                Fatal,
+            ),
+            (
+                LocalSourceError::Runtime(SourceRuntimeError::EnrolledByEarlierRelease),
+                Fatal,
+            ),
             // Protocol, decoding, or canonical-log integrity violations.
             (
                 ingest(PersistentIngestError::Decoder(
@@ -3351,10 +3408,24 @@ mod tests {
                 reason: "reason wal_removed".to_owned(),
             }),
         ];
+        let renamed = || EnumLabelDrift::Changed {
+            enum_type: "mood".to_owned(),
+            label: "calm".to_owned(),
+        };
+        let stale_label = [
+            LocalSourceError::Runtime(SourceRuntimeError::EnumLabel(renamed())),
+            LocalSourceError::Ingest(PersistentIngestError::EnumLabel(renamed())),
+            LocalSourceError::Runtime(SourceRuntimeError::EnrolledByEarlierRelease),
+            LocalSourceError::Runtime(SourceRuntimeError::ColumnChanged {
+                table: "public.items".to_owned(),
+                column: "kind".to_owned(),
+            }),
+        ];
         for error in paths(earlier)
             .into_iter()
             .chain([LocalSourceError::RegistryStateMismatch])
             .chain(slot_gone)
+            .chain(stale_label)
         {
             assert!(error.requires_destroying_state(), "{error:?}");
             let after = LocalSourceError::SessionCleanupFailedAfter(Box::new(error));
@@ -3367,6 +3438,7 @@ mod tests {
             LocalSourceError::PublicationDrift {
                 publication: "calque_drifted".to_owned(),
             },
+            LocalSourceError::Ingest(PersistentIngestError::EnumReadingUnavailable),
         ]) {
             assert!(!error.requires_destroying_state(), "{error:?}");
             let after = LocalSourceError::SessionCleanupFailedAfter(Box::new(error));
@@ -4080,8 +4152,9 @@ mod tests {
     /// Selected columns become the publication's column list, in table
     /// order, so a column added later is never published and needs no
     /// restart. A selection that differs from the published list, names a
-    /// column the table lacks, or leaves out a column of a REPLICA IDENTITY
-    /// FULL table is refused before anything is created.
+    /// column the table lacks, leaves out a primary-key column, or leaves
+    /// out a column of a REPLICA IDENTITY FULL table is refused before
+    /// anything is created.
     #[test]
     #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
     fn selected_columns_become_the_publication_column_list() {
@@ -4156,6 +4229,16 @@ mod tests {
         }
 
         destroy_local_source(&fixture.database_url, &fixture.state).unwrap();
+        match start(&fixture, None, &["value"]) {
+            Err(LocalSourceError::SelectedColumnsOmitKey { column, .. }) => {
+                assert_eq!(column, "id");
+            }
+            other => panic!(
+                "a selection without the key was not refused: {:?}",
+                other.err()
+            ),
+        }
+        assert!(!fixture.publication_exists());
         match start(&fixture, None, &["id", "missing"]) {
             Err(LocalSourceError::SelectedColumnMissing { column, .. }) => {
                 assert_eq!(column, "missing");
@@ -4293,6 +4376,15 @@ mod tests {
         }
 
         fn create_as(label: &str, own_role: bool) -> Self {
+            Self::create_holding(
+                label,
+                own_role,
+                "CREATE TABLE public.items (id bigint PRIMARY KEY, value text NOT NULL)",
+            )
+        }
+
+        /// `create`, with `public.items` and whatever it needs made by `ddl`.
+        fn create_holding(label: &str, own_role: bool, ddl: &str) -> Self {
             let url = live_database_url().expect("live source database URL");
             let suffix = uuid::Uuid::new_v4().simple().to_string();
             let (base, _) = url.rsplit_once('/').expect("database URL has a path");
@@ -4325,11 +4417,7 @@ mod tests {
             let source_url = source_url.to_string();
             let database_url = DatabaseUrl::parse(&source_url).unwrap();
             let mut client = Client::connect(&source_url, postgres::NoTls).unwrap();
-            client
-                .batch_execute(
-                    "CREATE TABLE public.items (id bigint PRIMARY KEY, value text NOT NULL)",
-                )
-                .unwrap();
+            client.batch_execute(ddl).unwrap();
             let state = LocalState::new(
                 inspect_local_identity(&database_url).unwrap(),
                 sync_types::SourceEpoch::new(format!("epoch-{suffix}")).unwrap(),
@@ -4923,7 +5011,7 @@ mod tests {
         wait_until(Duration::from_secs(30), "the runtime to stop", || {
             !health.is_healthy()
         });
-        let refusal = format!("the PostgreSQL publication {publication} was altered, or an enum its columns use gained or renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists and enum values it had at enrollment.");
+        let refusal = format!("the PostgreSQL publication {publication} was altered: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists it had at enrollment.");
         assert_eq!(
             health.failure(),
             Some(format!("persistent CDC failed: {refusal}"))
@@ -5021,55 +5109,530 @@ mod tests {
         assert!(refused.publication_drifted(), "{refused:?}");
     }
 
-    /// An enrollment made before enrollments recorded the publication's
-    /// fingerprint records it at its next start, and is held to it from then.
-    #[test]
-    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
-    fn an_older_enrollment_records_its_fingerprint_at_the_next_start() {
-        let mut fixture = ReconnectFixture::create("cdc_adopt");
-        let current = |fixture: &ReconnectFixture| {
-            let runtime = fixture.start(OperationsMetrics::new());
+    /// `public.items` with two enum columns: `direct` holds a value of
+    /// `direct_kind`, and `wrapped` one of `wrapped_kind` through a domain.
+    const ENUM_ITEMS: &str = "CREATE TYPE public.direct_kind AS ENUM ('a', 'b', 'c');
+         CREATE TYPE public.wrapped_kind AS ENUM ('a', 'b', 'c');
+         CREATE DOMAIN public.wrapped AS public.wrapped_kind;
+         CREATE TABLE public.items (
+             id bigint PRIMARY KEY,
+             value text NOT NULL,
+             direct public.direct_kind,
+             wrapped public.wrapped)";
+
+    /// How a published column of `ENUM_ITEMS` holds an enum value.
+    #[derive(Debug, Clone, Copy)]
+    enum EnumColumn {
+        Direct,
+        Domain,
+    }
+
+    impl EnumColumn {
+        const BOTH: [Self; 2] = [Self::Direct, Self::Domain];
+
+        fn column(self) -> &'static str {
+            match self {
+                Self::Direct => "direct",
+                Self::Domain => "wrapped",
+            }
+        }
+
+        fn enum_type(self) -> &'static str {
+            match self {
+                Self::Direct => "direct_kind",
+                Self::Domain => "wrapped_kind",
+            }
+        }
+
+        fn column_id(self) -> u64 {
+            match self {
+                Self::Direct => 3,
+                Self::Domain => 4,
+            }
+        }
+
+        fn changed(self, label: &str) -> EnumLabelDrift {
+            EnumLabelDrift::Changed {
+                enum_type: self.enum_type().to_owned(),
+                label: label.to_owned(),
+            }
+        }
+    }
+
+    impl ReconnectFixture {
+        fn create_with_enums(label: &str) -> Self {
+            Self::create_holding(label, false, ENUM_ITEMS)
+        }
+
+        /// Runs `sql`, one transaction however many statements it holds, with
+        /// `{enum}` and `{column}` naming `column`'s enum and column.
+        fn enum_sql(&mut self, column: EnumColumn, sql: &str) {
+            self.client
+                .batch_execute(
+                    &sql.replace("{enum}", &format!("public.{}", column.enum_type()))
+                        .replace("{column}", column.column()),
+                )
+                .unwrap();
+        }
+
+        fn insert_label(&mut self, column: EnumColumn, id: i64, label: &str) {
+            self.enum_sql(
+                column,
+                &format!("INSERT INTO public.items (id, value, {{column}}) VALUES ({id}, 'row', '{label}')"),
+            );
+        }
+
+        /// The label every logged insert or update writes to `column`, in
+        /// sequence order.
+        fn logged_labels(&mut self, column: EnumColumn) -> Vec<String> {
+            self.canonical_operations()
+                .iter()
+                .filter_map(|operation| {
+                    operation
+                        .get("columns")
+                        .or_else(|| operation.get("changed_columns"))?
+                        .as_array()?
+                        .iter()
+                        .find(|cell| cell["columnId"] == column.column_id())?["value"]["value"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .collect()
+        }
+
+        fn wait_for_labels(&mut self, column: EnumColumn, expected: &[&str]) {
+            wait_until(
+                Duration::from_secs(10),
+                "the rows in the canonical log",
+                || self.logged_labels(column).len() >= expected.len(),
+            );
+            assert_eq!(self.logged_labels(column), expected);
+        }
+
+        /// The labels of `column`'s enum the source's control rows record as
+        /// served.
+        fn served_labels(&mut self, column: EnumColumn) -> Vec<String> {
+            self.client
+                .query(
+                    "SELECT label FROM calque_control.source_enum_label
+                      WHERE source_id = $1 AND enum_type_oid = $2::text::regtype::oid::int8
+                      ORDER BY label",
+                    &[
+                        &self.state.names.source_id.as_str(),
+                        &format!("public.{}", column.enum_type()),
+                    ],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect()
+        }
+
+        /// The labels of `column`'s enum whose current version the source's
+        /// control rows record as seen by a reading.
+        fn seen_labels(&mut self, column: EnumColumn) -> Vec<String> {
+            self.client
+                .query(
+                    "SELECT value.enumlabel::text
+                       FROM calque_control.source_enum_version AS seen
+                       JOIN pg_catalog.pg_enum AS value
+                         ON value.oid = seen.value_oid
+                        AND value.xmin::text::int8 = seen.value_xmin
+                      WHERE seen.source_id = $1
+                        AND value.enumtypid = $2::text::regtype::oid
+                      ORDER BY 1",
+                    &[
+                        &self.state.names.source_id.as_str(),
+                        &format!("public.{}", column.enum_type()),
+                    ],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect()
+        }
+
+        fn wait_until_seen(&mut self, column: EnumColumn, labels: &[&str]) {
+            wait_until(
+                Duration::from_secs(10),
+                "the enum versions recorded as seen",
+                || {
+                    let seen = self.seen_labels(column);
+                    labels
+                        .iter()
+                        .all(|label| seen.iter().any(|seen| seen == label))
+                },
+            );
+        }
+
+        /// Starts a runtime and stops it again once it streams.
+        fn run_until_current(&self) {
+            let runtime = self.start(OperationsMetrics::new());
             let health = runtime.health();
             wait_until(Duration::from_secs(10), "a current runtime", || {
                 health.is_current()
             });
             runtime.shutdown().unwrap();
+        }
+
+        /// Starts a runtime and returns the enum label it stops on, whether
+        /// the start refuses it or the stream meets it.
+        fn start_stopping_on_enum_label(&self) -> EnumLabelDrift {
+            match self.try_start(OperationsMetrics::new()) {
+                Err(error) => {
+                    assert!(error.requires_destroying_state(), "{error:?}");
+                    enum_drift(&error)
+                        .unwrap_or_else(|| panic!("{error:?}"))
+                        .clone()
+                }
+                Ok(runtime) => stopped_on_enum_label(runtime),
+            }
+        }
+    }
+
+    /// Waits for `runtime` to stop, and returns the error it stopped on, past
+    /// any failed cleanup after it, and the remedy its health names.
+    fn stopped_on(runtime: LocalSourceRuntime) -> (LocalSourceError, CdcStopRemedy) {
+        let health = runtime.health();
+        wait_until(Duration::from_secs(30), "the runtime to stop", || {
+            !health.is_healthy()
+        });
+        let remedy = health.failure_remedy();
+        let mut error = runtime.shutdown().unwrap_err();
+        while let LocalSourceError::SessionCleanupFailedAfter(cause) = error {
+            error = *cause;
+        }
+        (error, remedy)
+    }
+
+    fn enum_drift(error: &LocalSourceError) -> Option<&EnumLabelDrift> {
+        match error {
+            LocalSourceError::Runtime(SourceRuntimeError::EnumLabel(drift))
+            | LocalSourceError::Ingest(PersistentIngestError::EnumLabel(drift)) => Some(drift),
+            LocalSourceError::SessionCleanupFailedAfter(cause) => enum_drift(cause),
+            _ => None,
+        }
+    }
+
+    /// Waits for `runtime` to stop, checks it stopped on an enum label with
+    /// `calque destroy` named as the way past it, and returns the label.
+    fn stopped_on_enum_label(runtime: LocalSourceRuntime) -> EnumLabelDrift {
+        let health = runtime.health();
+        wait_until(Duration::from_secs(30), "the runtime to stop", || {
+            !health.is_healthy()
+        });
+        assert_eq!(
+            health.failure_remedy(),
+            CdcStopRemedy::DestroyState,
+            "{:?}",
+            health.failure()
+        );
+        let error = runtime.shutdown().unwrap_err();
+        let drift = enum_drift(&error)
+            .unwrap_or_else(|| panic!("{error:?}"))
+            .clone();
+        assert_eq!(
+            health.failure(),
+            Some(format!("persistent CDC failed: {drift}"))
+        );
+        drift
+    }
+
+    /// Adding a value to an enum a published column uses, at its end, before
+    /// another or after one, changes no row the working set holds. The runtime
+    /// serves rows that take each new value with no rebuild and no reconnect,
+    /// and records each label it serves, for a column of the enum and for one
+    /// of a domain over it.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn an_enum_value_added_while_streaming_is_served_without_a_rebuild() {
+        for column in EnumColumn::BOTH {
+            let mut fixture = ReconnectFixture::create_with_enums("enum_added");
+            let metrics = OperationsMetrics::new();
+            let runtime = fixture.start(metrics.clone());
+            let health = runtime.health();
+            wait_until(Duration::from_secs(10), "a current runtime", || {
+                health.is_current()
+            });
+
+            let mut expected = Vec::new();
+            for (id, (change, label)) in [
+                (None, "a"),
+                (Some("ADD VALUE 'd'"), "d"),
+                (Some("ADD VALUE 'e' BEFORE 'a'"), "e"),
+                (Some("ADD VALUE 'f' AFTER 'b'"), "f"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if let Some(change) = change {
+                    fixture.enum_sql(column, &format!("ALTER TYPE {{enum}} {change}"));
+                }
+                fixture.insert_label(column, i64::try_from(id).unwrap() + 1, label);
+                expected.push(label);
+                fixture.wait_for_labels(column, &expected);
+            }
+            assert_eq!(health.failure(), None, "{column:?}");
+            assert_eq!(reconnects(&metrics), 0, "{column:?}");
+            assert_eq!(
+                fixture.served_labels(column),
+                ["a", "b", "c", "d", "e", "f"],
+                "{column:?}"
+            );
+            runtime.shutdown().unwrap();
+        }
+    }
+
+    /// A value added and served while the runtime ran, or added and taken by
+    /// a row while it was stopped, is served after a restart. A value the
+    /// start read is served even when the row that takes it shares its
+    /// transaction with the addition of another.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn an_enum_value_added_before_a_restart_is_served_after_it() {
+        for column in EnumColumn::BOTH {
+            let mut fixture = ReconnectFixture::create_with_enums("enum_restart");
+            let runtime = fixture.start(OperationsMetrics::new());
+            fixture.enum_sql(column, "ALTER TYPE {enum} ADD VALUE 'd'");
+            fixture.insert_label(column, 1, "d");
+            fixture.wait_for_labels(column, &["d"]);
+            runtime.shutdown().unwrap();
+
+            fixture.enum_sql(column, "ALTER TYPE {enum} ADD VALUE 'e'");
+            fixture.insert_label(column, 2, "e");
+            let runtime = fixture.start(OperationsMetrics::new());
+            fixture.wait_for_labels(column, &["d", "e"]);
+            fixture.insert_label(column, 3, "d");
+            fixture.wait_for_labels(column, &["d", "e", "d"]);
+            runtime.shutdown().unwrap();
+
+            fixture.enum_sql(column, "ALTER TYPE {enum} ADD VALUE 'g'");
+            let runtime = fixture.start(OperationsMetrics::new());
+            let health = runtime.health();
+            fixture.enum_sql(
+                column,
+                "ALTER TYPE {enum} ADD VALUE 'h';
+                 INSERT INTO public.items (id, value, {column}) VALUES (4, 'row', 'g')",
+            );
+            fixture.wait_for_labels(column, &["d", "e", "d", "g"]);
+            assert_eq!(health.failure(), None, "{column:?}");
+            assert_eq!(
+                fixture.served_labels(column),
+                ["a", "b", "c", "d", "e", "g"],
+                "{column:?}"
+            );
+            runtime.shutdown().unwrap();
+        }
+    }
+
+    /// Renaming a value the runtime enrolled stops it while it streams, with
+    /// no row change to notice: every served row holding the value now has
+    /// another label in PostgreSQL.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn renaming_an_enrolled_enum_value_stops_the_runtime() {
+        for column in EnumColumn::BOTH {
+            let mut fixture = ReconnectFixture::create_with_enums("enum_renamed");
+            let runtime = fixture.start(OperationsMetrics::new());
+            fixture.insert_label(column, 1, "b");
+            fixture.wait_for_labels(column, &["b"]);
+            fixture.enum_sql(column, "ALTER TYPE {enum} RENAME VALUE 'b' TO 'bb'");
+            assert_eq!(stopped_on_enum_label(runtime), column.changed("b"));
+        }
+    }
+
+    /// Renaming a value added and served after enrollment stops the runtime
+    /// as renaming an enrolled one does.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn renaming_an_enum_value_served_since_it_was_added_stops_the_runtime() {
+        for column in EnumColumn::BOTH {
+            let mut fixture = ReconnectFixture::create_with_enums("enum_added_renamed");
+            let runtime = fixture.start(OperationsMetrics::new());
+            fixture.enum_sql(column, "ALTER TYPE {enum} ADD VALUE 'd'");
+            fixture.insert_label(column, 1, "d");
+            fixture.wait_for_labels(column, &["d"]);
+            fixture.enum_sql(column, "ALTER TYPE {enum} RENAME VALUE 'd' TO 'dd'");
+            assert_eq!(stopped_on_enum_label(runtime), column.changed("d"));
+        }
+    }
+
+    /// A row that took a new value renamed before Calque read the row carries
+    /// a label no value holds any more, whether the runtime was stopped or the
+    /// rename shares the row's transaction. The runtime stops on it rather
+    /// than serving a label PostgreSQL no longer has.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_new_enum_value_renamed_before_its_row_is_read_stops_the_runtime() {
+        let gone = |column: EnumColumn| EnumLabelDrift::Gone {
+            enum_type: column.enum_type().to_owned(),
+            label: "d".to_owned(),
         };
-        current(&fixture);
-        let source_id = fixture.state.names.source_id.as_str().to_owned();
-        let fingerprint = |fixture: &mut ReconnectFixture| -> Option<String> {
-            fixture
-                .client
-                .query_one(
-                    "SELECT publication_fingerprint FROM calque_control.source_slot_enrollment
-                      WHERE source_id = $1",
-                    &[&source_id],
-                )
-                .unwrap()
-                .get(0)
-        };
-        let enrolled = fingerprint(&mut fixture).expect("enrollment records a fingerprint");
-        fixture
+        for column in EnumColumn::BOTH {
+            let mut fixture = ReconnectFixture::create_with_enums("enum_gone_stopped");
+            fixture.run_until_current();
+            fixture.enum_sql(column, "ALTER TYPE {enum} ADD VALUE 'd'");
+            fixture.insert_label(column, 1, "d");
+            fixture.enum_sql(column, "ALTER TYPE {enum} RENAME VALUE 'd' TO 'dd'");
+            assert_eq!(fixture.start_stopping_on_enum_label(), gone(column));
+
+            let mut fixture = ReconnectFixture::create_with_enums("enum_gone_running");
+            let runtime = fixture.start(OperationsMetrics::new());
+            fixture.insert_label(column, 1, "a");
+            fixture.wait_for_labels(column, &["a"]);
+            fixture.enum_sql(column, "ALTER TYPE {enum} ADD VALUE 'd'");
+            fixture.enum_sql(
+                column,
+                "UPDATE public.items SET {column} = 'd' WHERE id = 1;
+                 ALTER TYPE {enum} RENAME VALUE 'd' TO 'dd'",
+            );
+            assert_eq!(stopped_on_enum_label(runtime), gone(column));
+        }
+    }
+
+    /// Swapping two labels changes no value's OID, only the label each holds,
+    /// and stops the runtime.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn swapping_two_enum_labels_stops_the_runtime() {
+        for column in EnumColumn::BOTH {
+            let mut fixture = ReconnectFixture::create_with_enums("enum_swapped");
+            let runtime = fixture.start(OperationsMetrics::new());
+            fixture.insert_label(column, 1, "a");
+            fixture.wait_for_labels(column, &["a"]);
+            fixture.enum_sql(
+                column,
+                "ALTER TYPE {enum} RENAME VALUE 'a' TO 'swap';
+                 ALTER TYPE {enum} RENAME VALUE 'b' TO 'a';
+                 ALTER TYPE {enum} RENAME VALUE 'swap' TO 'b'",
+            );
+            let drift = stopped_on_enum_label(runtime);
+            assert!(
+                [column.changed("a"), column.changed("b")].contains(&drift),
+                "{drift:?}"
+            );
+        }
+    }
+
+    /// Renaming a value and adding its old label again leaves the label in the
+    /// enum, held by another value, and stops the runtime.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn renaming_an_enum_value_and_adding_its_old_label_stops_the_runtime() {
+        for column in EnumColumn::BOTH {
+            let mut fixture = ReconnectFixture::create_with_enums("enum_readded");
+            let runtime = fixture.start(OperationsMetrics::new());
+            fixture.insert_label(column, 1, "b");
+            fixture.wait_for_labels(column, &["b"]);
+            fixture.enum_sql(
+                column,
+                "ALTER TYPE {enum} RENAME VALUE 'b' TO 'bb';
+                 ALTER TYPE {enum} ADD VALUE 'b'",
+            );
+            assert_eq!(stopped_on_enum_label(runtime), column.changed("b"));
+        }
+    }
+
+    /// While the runtime is stopped, a value is added as `x`, a row takes it,
+    /// it is renamed `y` and `x` is added again. The enum then reads like two
+    /// plain additions, but the row holds the value now labelled `y`. Nothing
+    /// in the catalog orders those commits against the row, so the runtime
+    /// stops instead of serving `x`.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_label_moved_to_a_new_value_before_its_row_is_read_stops_the_runtime() {
+        for column in EnumColumn::BOTH {
+            let mut fixture = ReconnectFixture::create_with_enums("enum_moved");
+            fixture.run_until_current();
+            fixture.enum_sql(column, "ALTER TYPE {enum} ADD VALUE 'x'");
+            fixture.insert_label(column, 1, "x");
+            fixture.enum_sql(
+                column,
+                "ALTER TYPE {enum} RENAME VALUE 'x' TO 'y';
+                 ALTER TYPE {enum} ADD VALUE 'x'",
+            );
+            assert_eq!(
+                fixture.start_stopping_on_enum_label(),
+                EnumLabelDrift::Unproven {
+                    enum_type: column.enum_type().to_owned(),
+                    label: "x".to_owned(),
+                }
+            );
+        }
+    }
+
+    /// A value renamed while nothing ran refuses the next start, whether the
+    /// runtime enrolled it or served it once it was added.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn an_enum_value_renamed_while_stopped_refuses_the_next_start() {
+        for column in EnumColumn::BOTH {
+            for renamed in ["b", "d"] {
+                let mut fixture = ReconnectFixture::create_with_enums("enum_renamed_stopped");
+                let runtime = fixture.start(OperationsMetrics::new());
+                fixture.enum_sql(column, "ALTER TYPE {enum} ADD VALUE 'd'");
+                fixture.insert_label(column, 1, "d");
+                fixture.wait_for_labels(column, &["d"]);
+                runtime.shutdown().unwrap();
+                fixture.enum_sql(
+                    column,
+                    &format!(
+                        "ALTER TYPE {{enum}} RENAME VALUE '{renamed}' TO '{renamed}{renamed}'"
+                    ),
+                );
+                assert_eq!(
+                    fixture.start_stopping_on_enum_label(),
+                    column.changed(renamed),
+                    "{column:?}"
+                );
+            }
+        }
+    }
+
+    /// Adding many values before one another runs out of room between two
+    /// sort positions, and PostgreSQL renumbers the enum: it rewrites every
+    /// value whose position moves, labels unchanged. Calque cannot tell that
+    /// rewrite from a rename, so the runtime stops. Nothing it serves is
+    /// wrong; this is the one addition that still needs `calque destroy`.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn renumbering_an_enum_stops_the_runtime() {
+        for column in EnumColumn::BOTH {
+            let mut fixture = ReconnectFixture::create_with_enums("enum_renumbered");
+            let runtime = fixture.start(OperationsMetrics::new());
+            let health = runtime.health();
+            wait_until(Duration::from_secs(10), "a current runtime", || {
+                health.is_current()
+            });
+            let additions: Vec<String> = (0..30)
+                .map(|value| format!("ALTER TYPE {{enum}} ADD VALUE 'n{value}' BEFORE 'b'"))
+                .collect();
+            fixture.enum_sql(column, &additions.join(";\n"));
+            let drift = stopped_on_enum_label(runtime);
+            assert!(
+                [column.changed("b"), column.changed("c")].contains(&drift),
+                "{drift:?}"
+            );
+        }
+    }
+
+    /// An enrollment that records no enum labels was made by an earlier
+    /// release, and this one cannot know which labels its working set holds.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn an_enrollment_without_enum_labels_refuses_the_start() {
+        let mut fixture = ReconnectFixture::create_with_enums("enum_earlier");
+        fixture.run_until_current();
+        let cleared = fixture
             .client
             .execute(
                 "UPDATE calque_control.source_slot_enrollment
-                    SET publication_fingerprint = NULL WHERE source_id = $1",
-                &[&source_id],
+                    SET enum_labels_from_lsn = NULL WHERE source_id = $1",
+                &[&fixture.state.names.source_id.as_str()],
             )
             .unwrap();
-
-        current(&fixture);
-        assert_eq!(fingerprint(&mut fixture), Some(enrolled));
-
-        let publication = quote_identifier(&fixture.state.names.publication_name);
-        fixture
-            .client
-            .batch_execute(&format!(
-                "ALTER PUBLICATION {publication} DROP TABLE public.items;
-                 ALTER PUBLICATION {publication} ADD TABLE public.items;"
-            ))
-            .unwrap();
-        let refused = match fixture.try_start(OperationsMetrics::new()) {
+        assert_eq!(cleared, 1);
+        let error = match fixture.try_start(OperationsMetrics::new()) {
             Err(error) => error,
             Ok(runtime) => {
                 let health = runtime.health();
@@ -5079,7 +5642,168 @@ mod tests {
                 runtime.shutdown().unwrap_err()
             }
         };
-        assert!(refused.publication_drifted(), "{refused:?}");
+        assert!(
+            matches!(
+                error,
+                LocalSourceError::Runtime(SourceRuntimeError::EnrolledByEarlierRelease)
+            ),
+            "{error:?}"
+        );
+        assert!(error.requires_destroying_state());
+    }
+
+    /// A version a reading saw while the runtime streamed is recorded, so it
+    /// still proves a label after a restart: here `d`, seen while streaming,
+    /// leaves no unseen value but `e`, which a row took while the runtime was
+    /// stopped.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn an_enum_value_seen_before_a_restart_proves_a_label_added_while_stopped() {
+        for column in EnumColumn::BOTH {
+            let mut fixture = ReconnectFixture::create_with_enums("enum_seen");
+            let runtime = fixture.start(OperationsMetrics::new());
+            fixture.enum_sql(column, "ALTER TYPE {enum} ADD VALUE 'd'");
+            fixture.wait_until_seen(column, &["d"]);
+            runtime.shutdown().unwrap();
+
+            fixture.enum_sql(column, "ALTER TYPE {enum} ADD VALUE 'e'");
+            fixture.insert_label(column, 1, "e");
+            let runtime = fixture.start(OperationsMetrics::new());
+            let health = runtime.health();
+            fixture.wait_for_labels(column, &["e"]);
+            assert_eq!(health.failure(), None, "{column:?}");
+            runtime.shutdown().unwrap();
+        }
+    }
+
+    /// A source that subscribes to another database writes the rows it
+    /// applies under a replication origin, and the walsender sends the Begin
+    /// of such a transaction at WAL position 0. Its labels are proven at its
+    /// first positioned message, as any other transaction's are: `d`, which a
+    /// reading saw before the row, while `e` also changed since enrollment.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_row_written_under_a_replication_origin_is_proven_where_it_starts() {
+        let column = EnumColumn::Direct;
+        let mut fixture = ReconnectFixture::create_with_enums("enum_origin");
+        let runtime = fixture.start(OperationsMetrics::new());
+        let health = runtime.health();
+        fixture.enum_sql(column, "ALTER TYPE {enum} ADD VALUE 'd'");
+        fixture.enum_sql(column, "ALTER TYPE {enum} ADD VALUE 'e'");
+        fixture.wait_until_seen(column, &["d", "e"]);
+        let origin = format!("{}_upstream", fixture.database_name);
+        for statement in [
+            format!("SELECT pg_catalog.pg_replication_origin_create('{origin}')"),
+            format!("SELECT pg_catalog.pg_replication_origin_session_setup('{origin}')"),
+            "INSERT INTO public.items (id, value, direct) VALUES (1, 'row', 'd')".to_owned(),
+            "SELECT pg_catalog.pg_replication_origin_session_reset()".to_owned(),
+            format!("SELECT pg_catalog.pg_replication_origin_drop('{origin}')"),
+        ] {
+            fixture.client.batch_execute(&statement).unwrap();
+        }
+        fixture.wait_for_labels(column, &["d"]);
+        assert_eq!(health.failure(), None);
+        runtime.shutdown().unwrap();
+    }
+
+    /// A transaction writes a row while `d` is held by the value it was added
+    /// as, and commits only after that value was renamed `dd` and `d` added
+    /// again, with a reading of both in between. That reading saw `d`'s new
+    /// holder before the commit but after the row, so the row's own position
+    /// refuses it: the row holds the value now labelled `dd`.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_label_moved_while_its_row_is_uncommitted_stops_the_runtime() {
+        let column = EnumColumn::Direct;
+        let mut fixture = ReconnectFixture::create_with_enums("enum_open_moved");
+        let runtime = fixture.start(OperationsMetrics::new());
+        fixture.enum_sql(column, "ALTER TYPE {enum} ADD VALUE 'd'");
+        fixture.wait_until_seen(column, &["d"]);
+        let (base, _) = fixture.admin_url.rsplit_once('/').unwrap();
+        let mut open = Client::connect(
+            &format!("{base}/{}", fixture.database_name),
+            postgres::NoTls,
+        )
+        .unwrap();
+        open.batch_execute(
+            "BEGIN; INSERT INTO public.items (id, value, direct) VALUES (1, 'row', 'd')",
+        )
+        .unwrap();
+        fixture.enum_sql(column, "ALTER TYPE {enum} RENAME VALUE 'd' TO 'dd'");
+        fixture.enum_sql(column, "ALTER TYPE {enum} ADD VALUE 'd'");
+        fixture.wait_until_seen(column, &["d", "dd"]);
+        open.batch_execute("COMMIT").unwrap();
+        assert_eq!(
+            stopped_on_enum_label(runtime),
+            EnumLabelDrift::Unproven {
+                enum_type: column.enum_type().to_owned(),
+                label: "d".to_owned(),
+            }
+        );
+    }
+
+    /// Retyping a served column rewrites every row without a row change, here
+    /// moving its values to an enum the runtime never read. The runtime stops
+    /// on the column with no row change to notice it by.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn retyping_a_served_column_stops_the_runtime() {
+        let ddl = format!("{ENUM_ITEMS}; CREATE TYPE public.other_kind AS ENUM ('a', 'b', 'c')");
+        let mut fixture = ReconnectFixture::create_holding("column_retyped", false, &ddl);
+        let runtime = fixture.start(OperationsMetrics::new());
+        fixture.insert_label(EnumColumn::Direct, 1, "a");
+        fixture.wait_for_labels(EnumColumn::Direct, &["a"]);
+        fixture
+            .client
+            .batch_execute(
+                "ALTER TABLE public.items ALTER COLUMN direct TYPE public.other_kind
+                     USING direct::text::public.other_kind",
+            )
+            .unwrap();
+        let (error, remedy) = stopped_on(runtime);
+        assert!(
+            matches!(
+                &error,
+                LocalSourceError::Runtime(SourceRuntimeError::ColumnChanged { table, column })
+                    if table == "public.items" && column == "direct"
+            ),
+            "{error:?}"
+        );
+        assert_eq!(remedy, CdcStopRemedy::DestroyState);
+    }
+
+    /// An enum grown past the 4,096 labels Calque serves while it streams
+    /// stops the runtime at the reconnect the watch forces, as it refuses a
+    /// start, instead of reconnecting for ever.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn an_enum_grown_past_the_label_cap_stops_the_runtime() {
+        let ddl = "DO $$ BEGIN EXECUTE 'CREATE TYPE public.big AS ENUM (' ||
+                       (SELECT string_agg(quote_literal('l' || g), ',' ORDER BY g)
+                          FROM generate_series(1, 4096) AS g) || ')'; END $$;
+                   CREATE TABLE public.items (
+                       id bigint PRIMARY KEY, value text NOT NULL, big public.big)";
+        let mut fixture = ReconnectFixture::create_holding("enum_cap", false, ddl);
+        let runtime = fixture.start(OperationsMetrics::new());
+        let health = runtime.health();
+        wait_until(Duration::from_secs(10), "a current runtime", || {
+            health.is_current()
+        });
+        fixture
+            .client
+            .batch_execute("ALTER TYPE public.big ADD VALUE 'l4097'")
+            .unwrap();
+        let (error, remedy) = stopped_on(runtime);
+        assert!(
+            matches!(
+                &error,
+                LocalSourceError::Runtime(SourceRuntimeError::EnumUnservable(
+                    source_control::InspectError::TooManyEnumLabels { labels: 4_097, .. }
+                ))
+            ),
+            "{error:?}"
+        );
+        assert_eq!(remedy, CdcStopRemedy::Rerun);
     }
 
     #[test]
@@ -5137,6 +5861,57 @@ mod tests {
             error.to_string(),
             format!("role \"{role}\" lacks a privilege calque needs on the source. It needs CONNECT and CREATE on database \"{database}\" (GRANT CONNECT, CREATE ON DATABASE \"{database}\" TO \"{role}\") and SELECT on the enrolled tables, with INSERT, UPDATE and DELETE when pages write (GRANT SELECT, INSERT, UPDATE, DELETE ON <table> TO \"{role}\")"),
         );
+    }
+
+    /// `calque dev` serves a table its role does not own once the table's
+    /// owner creates the publication with the statement the refusal names,
+    /// and destroy leaves that publication to its owner.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_role_that_owns_no_table_serves_from_the_publication_its_owner_creates() {
+        let mut fixture = ReconnectFixture::create_with_own_role("dev_unowned");
+        let role = fixture.role.clone().unwrap();
+        let publication = fixture.state.names.publication_name.clone();
+        fixture.admin_in_database(&format!(
+            "ALTER TABLE public.items OWNER TO CURRENT_USER;
+             GRANT SELECT, INSERT, UPDATE, DELETE ON public.items TO {role}"
+        ));
+        let refusal = prepare_local_source(
+            &fixture.database_url,
+            &fixture.state,
+            &LocalSecrets::generate().unwrap(),
+            None,
+        )
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+        let (_, statement) = refusal
+            .split_once("Have the tables' owner create it: ")
+            .unwrap_or_else(|| panic!("{refusal}"));
+        fixture.admin_in_database(statement);
+
+        let runtime = fixture.start(OperationsMetrics::new());
+        let health = runtime.health();
+        let committed = fixture.commit_row(1);
+        wait_until(Duration::from_secs(10), "the transaction", || {
+            fixture.canonical_log() == vec![(1, committed)] && health.is_current()
+        });
+        runtime.shutdown().unwrap();
+
+        let destroyed = destroy_local_source(&fixture.database_url, &fixture.state).unwrap();
+        assert_eq!(
+            destroyed.kept_publication.as_deref(),
+            Some(publication.as_str())
+        );
+        let kept: bool = fixture
+            .client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_publication WHERE pubname = $1)",
+                &[&publication],
+            )
+            .unwrap()
+            .get(0);
+        assert!(kept, "destroy dropped a publication another role owns");
     }
 
     #[test]

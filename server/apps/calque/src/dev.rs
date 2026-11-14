@@ -21,13 +21,13 @@ use authz::{
 use blob_store::LocalFilesystemBlobStore;
 use calque_engine::{
     check_replication_capacity, destroy_local_source, inspect_local_identity, local_router,
-    metrics_router, prepare_local_source, start_local_source_runtime, ArtifactBuilder,
-    CanonicalHeadSignal, GenerationArtifactPublisher, HttpBinding, LocalArtifactResolver,
-    LocalBackend, LocalBackendConfig, LocalCredentialPolicy, LocalMemoryPolicy,
-    LocalMutationBackend, LocalMutationSupport, LocalNames, LocalSourceHealth,
+    metrics_router, prepare_local_source, prepare_selected_local_source,
+    start_local_source_runtime, ArtifactBuilder, CanonicalHeadSignal, GenerationArtifactPublisher,
+    HttpBinding, LocalArtifactResolver, LocalBackend, LocalBackendConfig, LocalCredentialPolicy,
+    LocalMemoryPolicy, LocalMutationBackend, LocalMutationSupport, LocalNames, LocalSourceHealth,
     LocalSourceRuntimeConfig, LocalState, MutationCommandPolicy, OperationsMetrics,
-    PreparedLocalSource, RecutConfig, ReencodeConfig, StateStore, TenantSettings, Tenants,
-    TenantsConfig, LOCAL_ACTIVE_ARTIFACT_CAPACITY_BYTES, LOCAL_DEVELOPMENT_SUBJECT,
+    PreparedLocalSource, RecutConfig, ReencodeConfig, SelectedColumns, StateStore, TenantSettings,
+    Tenants, TenantsConfig, LOCAL_ACTIVE_ARTIFACT_CAPACITY_BYTES, LOCAL_DEVELOPMENT_SUBJECT,
     MAX_LOCAL_ARTIFACT_BYTES,
 };
 use source_control::{PostgresTypeCodec, QualifiedTable, SourceIdentity};
@@ -48,6 +48,9 @@ use crate::recovery::{self, RecoveryCliError};
 use crate::remedy::{after_stopped_runtime, reconnect_or_forget, restore_publication, Destroy};
 
 const MAX_DEV_TABLES: usize = 256;
+/// The manifest dev reads, in the directory it runs in, when `--config`
+/// names none.
+const DEFAULT_CONFIG: &str = "calque.config.json";
 const MAX_DEV_ALLOWED_ORIGINS: usize = 16;
 const DEV_READY_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEV_READY_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -108,6 +111,21 @@ fn partitioned_by(
 ) -> Result<PreparedLocalSource, DevError> {
     let mut partitioned = BTreeMap::new();
     for table in prepared.registry.tables() {
+        // A column the manifest leaves out is not served, so it cannot tell
+        // a tenant's rows apart: the table would be served whole to every
+        // tenant. The primary key is always served, so such a column does
+        // not lead it.
+        if table
+            .inspection
+            .unlisted_columns
+            .iter()
+            .any(|candidate| candidate.name == column)
+        {
+            return Err(DevError::TenantColumnNotLeading {
+                table: table.inspection.table.display_name(),
+                column: column.to_owned(),
+            });
+        }
         let columns = &table.inspection.columns;
         let Some(index) = columns
             .iter()
@@ -165,6 +183,50 @@ fn partitioned_by(
     })
 }
 
+/// What dev serves: its tables, and the manifest that names their columns
+/// when it reads one.
+#[derive(Debug, PartialEq, Eq)]
+struct Served {
+    tables: Vec<QualifiedTable>,
+    manifest: Option<(PathBuf, SelectedColumns)>,
+}
+
+/// The tables and columns `command` serves. The manifest is `--config`, or
+/// `default_config` when that exists; without one, each `--table` is served
+/// whole.
+fn served(command: &DevCommand, default_config: &Path) -> Result<Served, DevError> {
+    let sorted = |tables: &[QualifiedTable]| {
+        let mut tables = tables.to_vec();
+        tables.sort();
+        tables
+    };
+    let path = match &command.config {
+        Some(path) => path.clone(),
+        None if default_config.exists() => default_config.to_owned(),
+        None if command.tables.is_empty() => return Err(DevError::NoTables),
+        None => {
+            return Ok(Served {
+                tables: sorted(&command.tables),
+                manifest: None,
+            })
+        }
+    };
+    let (tables, columns) = crate::serve::configured_columns(&path)
+        .map_err(|error| DevError::Config(Box::new(error)))?;
+    let tables = sorted(&tables);
+    if !command.tables.is_empty() && sorted(&command.tables) != tables {
+        return Err(DevError::TablesDifferFromConfig {
+            config: path,
+            configured: display_tables(&tables),
+            requested: display_tables(&sorted(&command.tables)),
+        });
+    }
+    Ok(Served {
+        tables,
+        manifest: Some((path, columns)),
+    })
+}
+
 /// The one principal the shared bearer stands for. Under a partitioned scope
 /// it carries `tenant` in the partition's attribute, typed as the column is.
 fn shared_principal(
@@ -201,6 +263,10 @@ pub async fn run_dev(command: DevCommand) -> Result<(), DevError> {
 
 async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
     command.validate()?;
+    let Served {
+        tables: requested_tables,
+        manifest,
+    } = served(&command, Path::new(DEFAULT_CONFIG))?;
     if let Some(name) = crate::serve::object_store_variable_set(|name| {
         std::env::var(name).ok().filter(|value| !value.is_empty())
     }) {
@@ -239,11 +305,6 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
         .transpose()?;
     let state_store = StateStore::open(&command.state_dir)?;
     tracing::info!(state_dir = %state_store.root().display(), "using state directory");
-    let requested_tables = {
-        let mut tables = command.tables.clone();
-        tables.sort();
-        tables
-    };
     let state = if state_store.state_path().exists() {
         let state = state_store.read_state()?;
         if state.tables != requested_tables {
@@ -295,16 +356,45 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
     let prepared_state = state.clone();
     let prepared_secrets = secrets.clone();
     let started = Instant::now();
+    let selected = manifest.as_ref().map(|(_, columns)| columns.clone());
     let prepared = run_blocking(move || {
-        prepare_local_source(
-            &prepared_database_url,
-            &prepared_state,
-            &prepared_secrets,
-            persisted_registry,
-        )
+        match &selected {
+            Some(columns) => prepare_selected_local_source(
+                &prepared_database_url,
+                &prepared_state,
+                &prepared_secrets,
+                persisted_registry,
+                columns,
+            ),
+            None => prepare_local_source(
+                &prepared_database_url,
+                &prepared_state,
+                &prepared_secrets,
+                persisted_registry,
+            ),
+        }
         .map_err(DevError::from)
     })
-    .await?;
+    .await
+    .map_err(|error| match (error, &manifest) {
+        (
+            DevError::Source(calque_engine::LocalSourceError::PublishedColumnsDiffer {
+                table,
+                published,
+                selected,
+                ..
+            }),
+            Some((config, _)),
+        ) => DevError::ConfigColumnsChanged(Box::new(ConfigColumnsChanged {
+            config: config.clone(),
+            table,
+            published: published.join(", "),
+            selected: selected.join(", "),
+            state_dir: command.state_dir.clone(),
+            database_url_env: command.database.database_url_env.clone(),
+        })),
+        (error, _) => error,
+    })?;
     startup_phase_finished("enrollment", started);
     if !had_registry {
         state_store.write_registry(&prepared.registry)?;
@@ -550,6 +640,12 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
         print_line(format_args!(
             "Scope: partitioned by {column}; the bearer reads tenant {tenant}"
         ));
+    }
+    match &manifest {
+        Some((config, _)) => {
+            print_line(format_args!("Columns: the ones {} names", config.display()))
+        }
+        None => print_line("Columns: every column of each --table"),
     }
     print_line(format_args!("Calque dev is ready at {base_url}"));
     print_line(format_args!(
@@ -805,6 +901,19 @@ async fn await_current_cdc_with(
     }
 }
 
+/// A manifest that names other columns of a table than the ones the state
+/// directory was prepared with.
+#[derive(Debug, Error)]
+#[error("{} names columns {selected} of {table}, but {} serves {published}, the columns it was prepared with. Calque will not change an existing enrollment in place. Run {destroy} and then rerun dev.", config.display(), state_dir.display(), destroy = Destroy::reading(state_dir, database_url_env))]
+pub struct ConfigColumnsChanged {
+    config: PathBuf,
+    table: String,
+    published: String,
+    selected: String,
+    state_dir: PathBuf,
+    database_url_env: String,
+}
+
 #[derive(Debug, Error)]
 pub enum DevError {
     #[error("calque dev creates a publication, a replication slot and the calque_control schema in the database it connects to; pass --acknowledge-disposable-source to confirm that database is disposable")]
@@ -829,11 +938,23 @@ pub enum DevError {
     DuplicateOrigin { origin: String },
     #[error("at most 256 --table values are allowed")]
     TooManyTables,
+    #[error("calque dev needs the tables to serve: run it where calque.config.json is, pass --config with the path of a manifest, or name each table with --table schema.table")]
+    NoTables,
+    #[error(transparent)]
+    Config(Box<crate::serve::ServeError>),
+    #[error("--table names [{requested}], but {} names [{configured}]. Dev serves the tables and columns its manifest names: drop --table, or edit the manifest", config.display())]
+    TablesDifferFromConfig {
+        config: PathBuf,
+        configured: String,
+        requested: String,
+    },
+    #[error(transparent)]
+    ConfigColumnsChanged(Box<ConfigColumnsChanged>),
     #[error("at most 16 --allow-origin values are allowed")]
     TooManyOrigins,
     #[error("table {table} has a {column} column, but its primary key does not lead with it; a tenant's table leads its primary key with the tenant column, so make {column} the key's first column, or rename the column if every tenant shares the table")]
     TenantColumnNotLeading { table: String, column: String },
-    #[error("no --table has a {column} column, so every table would be shared and none would hold a tenant's rows")]
+    #[error("no table dev serves has a {column} column, so every table would be shared and none would hold a tenant's rows")]
     NoTenantTable { column: String },
     #[error("--tenant {tenant} is not a value of {column}: pass an integer, or a UUID when {column} is a uuid")]
     InvalidTenant { tenant: String, column: String },
@@ -1047,6 +1168,7 @@ mod tests {
     fn dev_command() -> DevCommand {
         DevCommand {
             state_dir: PathBuf::from("state"),
+            config: None,
             tables: vec![QualifiedTable {
                 schema: "public".to_owned(),
                 table: "tasks".to_owned(),
@@ -1590,7 +1712,7 @@ mod tests {
         })
     }
 
-    const DRIFT: &str = "the PostgreSQL publication calque_0123456789abcdef01234567 was altered, or an enum its columns use gained or renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists and enum values it had at enrollment.";
+    const DRIFT: &str = "the PostgreSQL publication calque_0123456789abcdef01234567 was altered: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists it had at enrollment.";
 
     fn drift() -> calque_engine::LocalSourceError {
         calque_engine::LocalSourceError::PublicationDrift {
@@ -1601,6 +1723,148 @@ mod tests {
     /// The message `run_dev` returns for `error`.
     fn printed(error: DevError) -> String {
         with_state_remedy(error, Path::new(".calque-dev"), "CALQUE_DEV_SOURCE_URL").to_string()
+    }
+
+    fn table(schema: &str, name: &str) -> QualifiedTable {
+        QualifiedTable {
+            schema: schema.to_owned(),
+            table: name.to_owned(),
+        }
+    }
+
+    /// A manifest serving `public.tasks` with `columns`, as `calque init`
+    /// writes it.
+    fn manifest(columns: &[&str]) -> String {
+        serde_json::json!({
+            "application": { "id": "app", "version": "0.1.0" },
+            "protocol": { "manifest": 1, "artifact": 1, "changeStream": 1, "mutation": 1 },
+            "sources": [{
+                "id": "primary",
+                "databaseUrlEnv": "CALQUE_DATABASE_URL",
+                "publication": "calque_app",
+                "slot": "calque_app_slot",
+            }],
+            "scopes": [{ "id": "all", "source": "primary", "kind": "source-wide", "dataVersion": 1 }],
+            "collections": [{
+                "id": "tasks",
+                "source": "primary",
+                "kind": "table",
+                "relation": { "schema": "public", "table": "tasks" },
+                "columns": columns
+                    .iter()
+                    .map(|name| serde_json::json!({ "name": name, "postgresType": "text", "nullable": false }))
+                    .collect::<Vec<_>>(),
+                "primaryKey": ["id"],
+                "scope": "all",
+                "adapter": "direct-columnar",
+                "encoding": "calque-columnar",
+            }],
+            "commands": [{
+                "id": "edit-tasks",
+                "kind": "crud",
+                "collection": "tasks",
+                "operations": ["delete"],
+                "writableColumns": [],
+            }],
+        })
+        .to_string()
+    }
+
+    /// Dev serves what a manifest names: `--config`, or calque.config.json
+    /// where it runs. Without one it serves each `--table` whole, and with
+    /// neither it has nothing to serve. A `--table` beside a manifest has
+    /// to name the manifest's tables.
+    #[test]
+    fn dev_serves_the_tables_and_columns_its_manifest_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let default = directory.path().join("calque.config.json");
+        let tasks = table("public", "tasks");
+        let without_tables = DevCommand {
+            tables: Vec::new(),
+            ..dev_command()
+        };
+
+        assert_eq!(
+            served(&dev_command(), &default).unwrap(),
+            Served {
+                tables: vec![tasks.clone()],
+                manifest: None,
+            }
+        );
+        assert_eq!(
+            printed(served(&without_tables, &default).unwrap_err()),
+            "calque dev needs the tables to serve: run it where calque.config.json is, pass --config with the path of a manifest, or name each table with --table schema.table"
+        );
+
+        fs::write(&default, manifest(&["id", "title"])).unwrap();
+        let expected = Served {
+            tables: vec![tasks.clone()],
+            manifest: Some((
+                default.clone(),
+                BTreeMap::from([(
+                    tasks.clone(),
+                    BTreeSet::from(["id".to_owned(), "title".to_owned()]),
+                )]),
+            )),
+        };
+        assert_eq!(served(&without_tables, &default).unwrap(), expected);
+        assert_eq!(served(&dev_command(), &default).unwrap(), expected);
+        let other = DevCommand {
+            tables: vec![table("public", "projects"), tasks.clone()],
+            ..dev_command()
+        };
+        assert_eq!(
+            printed(served(&other, &default).unwrap_err()),
+            format!(
+                "--table names [public.projects, public.tasks], but {} names [public.tasks]. Dev serves the tables and columns its manifest names: drop --table, or edit the manifest",
+                default.display()
+            )
+        );
+
+        let elsewhere = directory.path().join("elsewhere.json");
+        fs::write(&elsewhere, manifest(&["id"])).unwrap();
+        let configured = DevCommand {
+            config: Some(elsewhere.clone()),
+            ..without_tables
+        };
+        assert_eq!(
+            served(&configured, &default).unwrap().manifest,
+            Some((
+                elsewhere.clone(),
+                BTreeMap::from([(tasks, BTreeSet::from(["id".to_owned()]))])
+            ))
+        );
+        fs::write(&elsewhere, manifest(&[])).unwrap();
+        assert_eq!(
+            printed(served(&configured, &default).unwrap_err()),
+            "invalid configuration: collection tasks: it names no columns"
+        );
+        fs::remove_file(&elsewhere).unwrap();
+        let refused = printed(served(&configured, &default).unwrap_err());
+        assert!(
+            refused.starts_with(&format!("cannot read configuration {}: ", elsewhere.display()))
+                && refused.ends_with(". Run calque init to write calque.config.json, or pass --config with the path of an existing manifest"),
+            "{refused}"
+        );
+    }
+
+    /// A manifest whose columns differ from the ones the state directory was
+    /// prepared with names the manifest, both sets and the destroy.
+    #[test]
+    fn a_manifest_with_other_columns_names_the_destroy() {
+        assert_eq!(
+            printed(DevError::ConfigColumnsChanged(Box::new(
+                ConfigColumnsChanged {
+                    config: PathBuf::from("calque.config.json"),
+                    table: "public.tasks".to_owned(),
+                    published: "id, title, secret".to_owned(),
+                    selected: "id, title".to_owned(),
+                    state_dir: PathBuf::from(".calque-dev"),
+                    database_url_env: "CALQUE_DEV_SOURCE_URL".to_owned(),
+                }
+            ))),
+            "calque.config.json names columns id, title of public.tasks, but .calque-dev serves id, title, secret, the columns it was prepared with. Calque will not change an existing enrollment in place. Run calque destroy --state-dir .calque-dev --database-url-env CALQUE_DEV_SOURCE_URL --yes and then rerun dev."
+        );
     }
 
     /// A refusal only `calque destroy` gets past ends with that command and
@@ -1660,7 +1924,7 @@ mod tests {
                     publication: "calque_0123456789abcdef01234567".to_owned(),
                 }
             )),
-            "the PostgreSQL publication calque_0123456789abcdef01234567 was altered, or an enum its columns use gained or renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists and enum values it had at enrollment. Restore the publication's definition if it was altered, then run calque destroy --state-dir .calque-dev --database-url-env CALQUE_DEV_SOURCE_URL --yes and rerun dev to prepare the working set anew, since the one it holds may no longer match PostgreSQL."
+            "the PostgreSQL publication calque_0123456789abcdef01234567 was altered: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists it had at enrollment. Restore the publication's definition if it was altered, then run calque destroy --state-dir .calque-dev --database-url-env CALQUE_DEV_SOURCE_URL --yes and rerun dev to prepare the working set anew, since the one it holds may no longer match PostgreSQL."
         );
         assert_eq!(
             printed(DevError::Source(

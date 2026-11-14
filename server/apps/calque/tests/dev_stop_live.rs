@@ -7,7 +7,8 @@
 //! serves the scrape only on the metrics port it is given, and under
 //! `--tenant-column` serves its bearer one tenant's rows. A state directory
 //! deleted and made anew at the same path is refused with the `calque destroy`
-//! that removes the old one's enrollment, and starts once it has run.
+//! that removes the old one's enrollment, and starts once it has run. With
+//! a manifest, `dev` publishes and serves only the columns it names.
 //!
 //! These tests are `#[ignore]`d and run through
 //! `scripts/live-postgres-suite.sh`; without `TEST_DATABASE_URL` they fail
@@ -106,6 +107,46 @@ impl Fixture {
 
     fn state(&self) -> PathBuf {
         self.directory.path().join("state")
+    }
+
+    /// Writes a manifest serving the fixture's table with `columns`, and
+    /// returns its path.
+    fn manifest(&self, columns: &[&str]) -> PathBuf {
+        let manifest = serde_json::json!({
+            "application": { "id": "app", "version": "0.1.0" },
+            "protocol": { "manifest": 1, "artifact": 1, "changeStream": 1, "mutation": 1 },
+            "sources": [{
+                "id": "primary",
+                "databaseUrlEnv": DATABASE_ENV,
+                "publication": "calque_app",
+                "slot": "calque_app_slot",
+            }],
+            "scopes": [{ "id": "all", "source": "primary", "kind": "source-wide", "dataVersion": 1 }],
+            "collections": [{
+                "id": self.table,
+                "source": "primary",
+                "kind": "table",
+                "relation": { "schema": "public", "table": self.table },
+                "columns": columns
+                    .iter()
+                    .map(|name| serde_json::json!({ "name": name, "postgresType": "text", "nullable": false }))
+                    .collect::<Vec<_>>(),
+                "primaryKey": ["id"],
+                "scope": "all",
+                "adapter": "direct-columnar",
+                "encoding": "calque-columnar",
+            }],
+            "commands": [{
+                "id": format!("edit-{}", self.table),
+                "kind": "crud",
+                "collection": self.table,
+                "operations": ["insert", "update", "delete"],
+                "writableColumns": columns.iter().filter(|name| **name != "id").collect::<Vec<_>>(),
+            }],
+        });
+        let path = self.directory.path().join("calque.config.json");
+        std::fs::write(&path, manifest.to_string()).unwrap();
+        path
     }
 
     fn bearer(&self) -> String {
@@ -801,6 +842,138 @@ fn holds(bytes: &[u8], text: &str) -> bool {
         .any(|window| window == text.as_bytes())
 }
 
+/// The artifact `dev` serves its bearer for `relations`, in identity
+/// encoding, and the plan that names it.
+fn served_artifact(port: u16, bearer: &str, relations: &[String]) -> (serde_json::Value, Vec<u8>) {
+    let body = serde_json::json!({
+        "protocolVersion": 1,
+        "requiredTables": relations,
+        "acceptedEncodings": ["zstd", "identity"],
+        "memoryBudgetBytes": 1_073_741_824_u64,
+        "clientHeapReserveBytes": 67_108_864_u64,
+        "clientInstanceId": "dev-artifact-live",
+        "deviceId": "dev-artifact-live-device",
+    })
+    .to_string();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    write!(
+        stream,
+        "POST /v1/bootstrap HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nconnection: close\r\n\
+         authorization: Bearer {bearer}\r\ncontent-type: application/json\r\n\
+         accept-encoding: identity\r\n\
+         x-calque-artifact-profile: chromium-native-artifact-v1\r\n\
+         content-length: {length}\r\n\r\n{body}",
+        length = body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let (head, plan) = response.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{response}");
+    let plan: serde_json::Value = serde_json::from_str(plan).unwrap();
+    let url = plan["artifacts"][0]["selectedRepresentation"]["downloadUrl"]
+        .as_str()
+        .unwrap();
+    let path = &url[url.find("/v1/").unwrap()..];
+    let (status, artifact) = get_bytes(port, path);
+    assert_eq!(status, 200);
+    assert_eq!(&artifact[..8], b"CALQART1");
+    (plan, artifact)
+}
+
+/// With a manifest, `dev` publishes each table with a column list naming
+/// the collection's columns: a column the manifest leaves out is in neither
+/// the publication, the plan nor the artifact. A manifest that names other
+/// columns of a prepared table is refused with the destroy that prepares
+/// them, and a manifest that leaves out a `--tenant-column` that is not in
+/// the key is refused rather than served to every tenant.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn dev_serves_only_the_columns_its_manifest_names() {
+    const SECRET: &str = "dev-unlisted-secret-8f2a";
+    let _one = exclusive();
+    let fixture = Fixture::create();
+    let relation = format!("public.{}", fixture.table);
+    Client::connect(&database_url(), NoTls)
+        .unwrap()
+        .batch_execute(&format!(
+            "ALTER TABLE {relation} ADD COLUMN secret text NOT NULL DEFAULT '{SECRET}',
+                 ADD COLUMN tenant_id int8 NOT NULL DEFAULT 1"
+        ))
+        .unwrap();
+    let config = fixture.manifest(&["id", "title"]);
+    let config_argument = config.to_str().unwrap();
+    let mut dev = Dev::start_with(&fixture, &["--config", config_argument]);
+    assert!(
+        dev.lines
+            .iter()
+            .any(|line| *line == format!("Columns: the ones {} names", config.display())),
+        "{:#?}",
+        dev.lines
+    );
+    let published: Vec<String> = Client::connect(&database_url(), NoTls)
+        .unwrap()
+        .query_one(
+            "SELECT attnames::text[] FROM pg_catalog.pg_publication_tables WHERE pubname = $1",
+            &[&fixture.names().publication_name],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(published, ["id", "title"]);
+    let (plan, artifact) =
+        served_artifact(dev.port, &fixture.bearer(), std::slice::from_ref(&relation));
+    assert!(
+        !plan.to_string().contains("secret"),
+        "the plan names an unlisted column: {plan}"
+    );
+    assert!(holds(&artifact, "row 1"));
+    assert!(
+        !holds(&artifact, SECRET),
+        "the artifact holds an unlisted value"
+    );
+    dev.signal("-INT");
+    let (status, took) = dev.exit_within(STOP_TIMEOUT);
+    assert!(status.success(), "{status} after {took:?}");
+
+    fixture.manifest(&["id", "title", "secret"]);
+    let mut widened = dev_command(&fixture, reserved_port(), &database_url());
+    widened.args(["--config", config_argument]);
+    let refused = output_within(widened, Duration::from_secs(60));
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "{} names columns id, secret, title of {relation}, but {} serves id, title, the columns it was prepared with.",
+            config.display(),
+            fixture.state().display()
+        )) && stderr.contains("calque destroy"),
+        "{stderr}"
+    );
+
+    fixture.manifest(&["id", "title"]);
+    let mut tenant = dev_command(&fixture, reserved_port(), &database_url());
+    tenant.args([
+        "--config",
+        config_argument,
+        "--tenant-column",
+        "tenant_id",
+        "--tenant",
+        "1",
+    ]);
+    let refused = output_within(tenant, Duration::from_secs(60));
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "table {relation} has a tenant_id column, but its primary key does not lead with it"
+        )),
+        "{stderr}"
+    );
+}
+
 /// Under `--tenant-column` and `--tenant`, `dev` serves the scope
 /// partitioned by that column: its bearer's artifact holds the tenant's rows
 /// and the shared table's, and none of another tenant's.
@@ -828,44 +1001,11 @@ fn dev_serves_its_bearer_one_tenant_of_a_partitioned_scope() {
         "{:#?}",
         dev.lines
     );
-    let body = serde_json::json!({
-        "protocolVersion": 1,
-        "requiredTables": [format!("public.{}", fixture.table), shared],
-        "acceptedEncodings": ["zstd", "identity"],
-        "memoryBudgetBytes": 1_073_741_824_u64,
-        "clientHeapReserveBytes": 67_108_864_u64,
-        "clientInstanceId": "dev-tenants-live",
-        "deviceId": "dev-tenants-live-device",
-    })
-    .to_string();
-    let mut stream = TcpStream::connect(("127.0.0.1", dev.port)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(60)))
-        .unwrap();
-    write!(
-        stream,
-        "POST /v1/bootstrap HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nconnection: close\r\n\
-         authorization: Bearer {bearer}\r\ncontent-type: application/json\r\n\
-         accept-encoding: identity\r\n\
-         x-calque-artifact-profile: chromium-native-artifact-v1\r\n\
-         content-length: {length}\r\n\r\n{body}",
-        port = dev.port,
-        bearer = fixture.bearer(),
-        length = body.len()
-    )
-    .unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    let (head, plan) = response.split_once("\r\n\r\n").unwrap();
-    assert!(head.starts_with("HTTP/1.1 200"), "{response}");
-    let plan: serde_json::Value = serde_json::from_str(plan).unwrap();
-    let url = plan["artifacts"][0]["selectedRepresentation"]["downloadUrl"]
-        .as_str()
-        .unwrap();
-    let path = &url[url.find("/v1/").unwrap()..];
-    let (status, artifact) = get_bytes(dev.port, path);
-    assert_eq!(status, 200);
-    assert_eq!(&artifact[..8], b"CALQART1");
+    let (_, artifact) = served_artifact(
+        dev.port,
+        &fixture.bearer(),
+        &[format!("public.{}", fixture.table), shared],
+    );
     assert!(holds(&artifact, "tenant-1-only"));
     assert!(holds(&artifact, "shared-row"));
     assert!(!holds(&artifact, "tenant-2-only"));

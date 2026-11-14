@@ -2,8 +2,8 @@ use std::{collections::BTreeSet, env};
 
 use postgres::{Client, NoTls};
 use source_control::{
-    inspect_source, validate_enrollment, EnrollmentRequirements, QualifiedTable, SchemaRegistry,
-    SchemaRegistryError, UnlistedColumn,
+    inspect_enum_labels, inspect_source, validate_enrollment, EnrollmentRequirements,
+    QualifiedTable, SchemaRegistry, SchemaRegistryError, UnlistedColumn,
 };
 
 #[test]
@@ -202,6 +202,95 @@ fn enrolls_a_text_key_only_under_a_deterministic_collation() {
              DROP COLLATION public.calque_case_insensitive;",
         )
         .expect("remove text-key fixture");
+}
+
+/// An enum column's labels are read in PostgreSQL's declaration order, which
+/// `ADD VALUE ... BEFORE` changes, through a chain of domains, for the columns
+/// the publication carries alone. Adding a value changes them and leaves the
+/// schema fingerprint and the table id as they were, so no artifact changes.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL and a disposable PostgreSQL database"]
+fn reads_each_enum_columns_labels_in_declaration_order() {
+    let database_url = env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set");
+    let mut client = Client::connect(&database_url, NoTls).expect("connect to test PostgreSQL");
+    client
+        .batch_execute(
+            "DROP PUBLICATION IF EXISTS calque_enum_order_test;
+             DROP TABLE IF EXISTS public.calque_enum_order;
+             DROP DOMAIN IF EXISTS public.calque_enum_level_outer, public.calque_enum_level_inner;
+             DROP TYPE IF EXISTS public.calque_enum_level;
+             CREATE TYPE public.calque_enum_level AS ENUM ('low', 'high');
+             ALTER TYPE public.calque_enum_level ADD VALUE 'medium' BEFORE 'high';
+             CREATE DOMAIN public.calque_enum_level_inner AS public.calque_enum_level;
+             CREATE DOMAIN public.calque_enum_level_outer AS public.calque_enum_level_inner;
+             CREATE TABLE public.calque_enum_order (
+               id uuid PRIMARY KEY,
+               level public.calque_enum_level,
+               nested public.calque_enum_level_outer NOT NULL,
+               hidden public.calque_enum_level,
+               note text
+             );
+             CREATE PUBLICATION calque_enum_order_test
+               FOR TABLE public.calque_enum_order (id, level, nested, note);",
+        )
+        .expect("create enum-order fixture");
+    let table = QualifiedTable {
+        schema: "public".to_owned(),
+        table: "calque_enum_order".to_owned(),
+    };
+    let tables = BTreeSet::from([table.clone()]);
+    let registry = |client: &mut Client| {
+        let snapshot = inspect_source(client, "calque_enum_order_test", &tables)
+            .expect("inspect enum-order source");
+        let requirements = EnrollmentRequirements {
+            expected_identity: snapshot.identity.clone(),
+            publication_name: "calque_enum_order_test".to_owned(),
+            tables: tables.clone(),
+            pgoutput_profile: source_control::PgoutputLaunchProfile::V1,
+        };
+        SchemaRegistry::initialize(&snapshot, &requirements).expect("enum columns enroll")
+    };
+    let labels = |client: &mut Client| {
+        let read = inspect_enum_labels(client, "calque_enum_order_test", &tables)
+            .expect("read enum labels");
+        ["id", "level", "nested", "hidden", "note"].map(|column| {
+            read.column(&table, column)
+                .map(<[String]>::to_vec)
+                .unwrap_or_default()
+        })
+    };
+    let declared = ["low", "medium", "high"].map(str::to_owned).to_vec();
+    assert_eq!(
+        labels(&mut client),
+        [vec![], declared.clone(), declared, vec![], vec![]]
+    );
+    let enrolled = registry(&mut client);
+
+    client
+        .batch_execute("ALTER TYPE public.calque_enum_level ADD VALUE 'none' BEFORE 'low';")
+        .expect("add a value before the first");
+    let added = ["none", "low", "medium", "high"]
+        .map(str::to_owned)
+        .to_vec();
+    assert_eq!(
+        labels(&mut client),
+        [vec![], added.clone(), added, vec![], vec![]]
+    );
+    let after = registry(&mut client);
+    assert_eq!(
+        after.source_schema_sha256(),
+        enrolled.source_schema_sha256()
+    );
+    assert_eq!(after.tables()[0].table_id, enrolled.tables()[0].table_id);
+
+    client
+        .batch_execute(
+            "DROP PUBLICATION calque_enum_order_test;
+             DROP TABLE public.calque_enum_order;
+             DROP DOMAIN public.calque_enum_level_outer, public.calque_enum_level_inner;
+             DROP TYPE public.calque_enum_level;",
+        )
+        .expect("remove enum-order fixture");
 }
 
 fn requirements_tables() -> BTreeSet<QualifiedTable> {

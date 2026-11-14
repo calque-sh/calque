@@ -6,14 +6,17 @@
 use std::{collections::BTreeSet, time::Duration};
 
 use postgres::GenericClient;
-use source_control::QualifiedTable;
+use source_control::{QualifiedTable, RegisteredColumn};
 
-/// How often a running session reads the publication's fingerprint. pgoutput
-/// applies a publication change from the change's own commit on, so the
-/// changes it leaves out until the check sees it are lost to the working set;
-/// the check stops the session, and the state is prepared anew. Renaming an
-/// enum's value changes the text of every row holding it without a row
-/// change, so the fingerprint covers the enums the published columns use.
+/// How often a running session reads the publication's fingerprint, and the
+/// values of the enums its columns use. pgoutput applies a publication change
+/// from the change's own commit on, so the changes it leaves out until the
+/// check sees it are lost to the working set; the check stops the session,
+/// and the state is prepared anew. Renaming an enum's value changes the text
+/// of every row holding it without a row change, which the enum check stops
+/// on (see `enum_labels`). Dropping, renaming or retyping a column changes
+/// every row without a row change too, which the column check stops on (see
+/// [`changed_column`]).
 pub(crate) const PUBLICATION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What the app-owned publication is, against the definition Calque creates
@@ -24,11 +27,9 @@ pub enum OwnedPublication {
     /// It exists without that definition.
     Drifted,
     /// It has that definition. `quoted_name` is its name as an SQL identifier.
-    /// `fingerprint` names the catalog rows that hold the definition and the
-    /// values of every enum a published column uses, directly or through a
-    /// domain: any `ALTER PUBLICATION` writes a new one, and so does
-    /// dropping and creating the publication again, even when the definition
-    /// is put back as it was, and so does adding or renaming an enum value.
+    /// `fingerprint` names the catalog rows that hold the definition: any
+    /// `ALTER PUBLICATION` writes a new one, and so does dropping and creating
+    /// the publication again, even when the definition is put back as it was.
     Matches {
         quoted_name: String,
         fingerprint: String,
@@ -67,32 +68,7 @@ pub fn inspect_owned_publication(
                     SELECT string_agg(namespace.oid::text || ':' || namespace.xmin::text, ','
                                       ORDER BY namespace.oid)
                       FROM pg_catalog.pg_publication_namespace AS namespace
-                     WHERE namespace.pnpubid = publication.oid), ''),
-                  (SELECT 'enums=' || string_agg(enum_value.oid::text || ':'
-                                                 || enum_value.xmin::text, ','
-                                                 ORDER BY enum_value.oid)
-                     FROM pg_catalog.pg_enum AS enum_value
-                    WHERE enum_value.enumtypid IN (
-                      WITH RECURSIVE chain(oid) AS (
-                        SELECT attribute.atttypid
-                          FROM pg_catalog.pg_publication_tables AS published
-                          JOIN pg_catalog.pg_namespace AS namespace
-                            ON namespace.nspname = published.schemaname
-                          JOIN pg_catalog.pg_class AS class
-                            ON class.relnamespace = namespace.oid
-                           AND class.relname = published.tablename
-                          JOIN pg_catalog.pg_attribute AS attribute
-                            ON attribute.attrelid = class.oid
-                         WHERE published.pubname = publication.pubname
-                           AND attribute.attnum > 0
-                           AND NOT attribute.attisdropped
-                           AND attribute.attname = ANY(published.attnames)
-                        UNION
-                        SELECT domain.typbasetype
-                          FROM chain
-                          JOIN pg_catalog.pg_type AS domain ON domain.oid = chain.oid
-                         WHERE domain.typtype = 'd')
-                      SELECT oid FROM chain)))
+                     WHERE namespace.pnpubid = publication.oid), ''))
            FROM pg_catalog.pg_publication AS publication
           WHERE publication.pubname = $1",
         &[&publication],
@@ -126,4 +102,44 @@ pub fn inspect_owned_publication(
         quoted_name: row.get(7),
         fingerprint: row.get(8),
     })
+}
+
+/// The first of `columns` the catalog no longer holds as registered: dropped,
+/// renamed, or of another type or type modifier. PostgreSQL applies each to
+/// every row without a row change, so the working set may no longer match
+/// its rows.
+pub(crate) fn changed_column<'a>(
+    client: &mut impl GenericClient,
+    columns: &'a [RegisteredColumn],
+) -> Result<Option<&'a RegisteredColumn>, postgres::Error> {
+    let relations: Vec<u32> = columns.iter().map(|column| column.relation_oid).collect();
+    let attributes: Vec<i16> = columns
+        .iter()
+        .map(|column| column.attribute_number)
+        .collect();
+    let names: Vec<&str> = columns.iter().map(|column| column.name.as_str()).collect();
+    let types: Vec<u32> = columns.iter().map(|column| column.type_oid).collect();
+    let modifiers: Vec<i32> = columns.iter().map(|column| column.type_modifier).collect();
+    let changed = client.query_opt(
+        "SELECT registered.ordinal
+           FROM unnest($1::oid[], $2::int2[], $3::text[], $4::oid[], $5::int4[])
+                WITH ORDINALITY AS registered(relation, attnum, name, type_oid, type_modifier,
+                                              ordinal)
+           LEFT JOIN pg_catalog.pg_attribute AS attribute
+             ON attribute.attrelid = registered.relation
+            AND attribute.attnum = registered.attnum
+            AND NOT attribute.attisdropped
+            AND attribute.attname = registered.name
+            AND attribute.atttypid = registered.type_oid
+            AND attribute.atttypmod = registered.type_modifier
+          WHERE attribute.attrelid IS NULL
+          ORDER BY registered.ordinal
+          LIMIT 1",
+        &[&relations, &attributes, &names, &types, &modifiers],
+    )?;
+    Ok(changed.and_then(|row| {
+        usize::try_from(row.get::<_, i64>(0) - 1)
+            .ok()
+            .and_then(|index| columns.get(index))
+    }))
 }

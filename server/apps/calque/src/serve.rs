@@ -1550,6 +1550,17 @@ fn load_grant_verifier(
     Ok(GrantVerifier::new(audience, keys)?)
 }
 
+/// The tables the manifest at `path` serves, in its order, and the columns
+/// each collection names, validated as `serve` validates them. `dev` serves
+/// these.
+pub(crate) fn configured_columns(
+    path: &Path,
+) -> Result<(Vec<QualifiedTable>, SelectedColumns), ServeError> {
+    let config = load_and_validate_config(path)?;
+    let columns = selected_columns(&config);
+    Ok((config.tables, columns))
+}
+
 /// The columns each collection names, which are all the source publishes of
 /// its table.
 fn selected_columns(config: &ValidatedServeConfig) -> SelectedColumns {
@@ -1834,31 +1845,31 @@ fn missing_config_hint(source: &std::io::Error) -> &'static str {
 
 #[derive(Debug, Error)]
 pub enum ServeError {
-    #[error("cannot read serve configuration {}: {source}{}", path.display(), missing_config_hint(source))]
+    #[error("cannot read configuration {}: {source}{}", path.display(), missing_config_hint(source))]
     ReadConfig {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("serve configuration {} is not valid JSON for a manifest: {source}", path.display())]
+    #[error("configuration {} is not valid JSON for a manifest: {source}", path.display())]
     ParseConfig {
         path: PathBuf,
         source: serde_json::Error,
     },
-    #[error("serve configuration {} names sources[].connectionEnv, which is now sources[].databaseUrlEnv; rename the field", path.display())]
+    #[error("configuration {} names sources[].connectionEnv, which is now sources[].databaseUrlEnv; rename the field", path.display())]
     RenamedConnectionEnv { path: PathBuf },
-    #[error("invalid serve configuration: {0}")]
+    #[error("invalid configuration: {0}")]
     InvalidConfig(&'static str),
-    #[error("invalid serve configuration: {field} {reason}")]
+    #[error("invalid configuration: {field} {reason}")]
     InvalidConfigField { field: String, reason: String },
-    #[error("invalid serve configuration: collection {collection}: {reason}")]
+    #[error("invalid configuration: collection {collection}: {reason}")]
     InvalidCollection { collection: String, reason: String },
-    #[error("invalid serve configuration: relations {first} and {second} would both be served as collection {collection}, which is named by the table alone")]
+    #[error("invalid configuration: relations {first} and {second} would both be served as collection {collection}, which is named by the table alone")]
     SharedCollectionName {
         first: String,
         second: String,
         collection: String,
     },
-    #[error("invalid serve configuration: collection {collection} reads {relation}, but a collection's id must be its table's name, because the client binds each collection to the artifact table of that name; rename the collection to {table}, along with every command that names it")]
+    #[error("invalid configuration: collection {collection} reads {relation}, but a collection's id must be its table's name, because the client binds each collection to the artifact table of that name; rename the collection to {table}, along with every command that names it")]
     CollectionIdIsNotItsTable {
         collection: String,
         relation: String,
@@ -2321,7 +2332,7 @@ mod tests {
         assert_eq!(
             load_and_validate_config(&path).err().unwrap().to_string(),
             format!(
-                "serve configuration {} names sources[].connectionEnv, which is now sources[].databaseUrlEnv; rename the field",
+                "configuration {} names sources[].connectionEnv, which is now sources[].databaseUrlEnv; rename the field",
                 path.display()
             )
         );
@@ -2337,10 +2348,7 @@ mod tests {
 
         let missing = refusal();
         assert!(
-            missing.starts_with(&format!(
-                "cannot read serve configuration {}: ",
-                path.display()
-            )),
+            missing.starts_with(&format!("cannot read configuration {}: ", path.display())),
             "{missing}"
         );
         assert!(
@@ -2353,7 +2361,7 @@ mod tests {
         let unparsable = refusal();
         assert!(
             unparsable.starts_with(&format!(
-                "serve configuration {} is not valid JSON for a manifest: ",
+                "configuration {} is not valid JSON for a manifest: ",
                 path.display()
             )),
             "{unparsable}"
@@ -2372,18 +2380,18 @@ mod tests {
 
         assert_eq!(
             refusal(|tasks| tasks["kind"] = "view".into()),
-            "invalid serve configuration: collection tasks: its kind must be \"table\""
+            "invalid configuration: collection tasks: its kind must be \"table\""
         );
         assert_eq!(
             refusal(|tasks| {
                 let id = tasks["columns"][0].clone();
                 tasks["columns"].as_array_mut().unwrap().push(id);
             }),
-            "invalid serve configuration: collection tasks: column id is named twice"
+            "invalid configuration: collection tasks: column id is named twice"
         );
         assert_eq!(
             refusal(|tasks| tasks["primaryKey"] = serde_json::json!(["key"])),
-            "invalid serve configuration: collection tasks: primaryKey column key is not one of its columns"
+            "invalid configuration: collection tasks: primaryKey column key is not one of its columns"
         );
     }
 
@@ -2573,7 +2581,7 @@ mod tests {
     #[test]
     fn a_partitioned_collection_is_refused_unless_its_tenant_column_leads_its_key() {
         let partitioned =
-            |collection: &str| format!("invalid serve configuration: collection {collection}: ");
+            |collection: &str| format!("invalid configuration: collection {collection}: ");
         assert_eq!(
             tenant_refusal(|manifest| {
                 manifest["collections"][2]["primaryKey"] = serde_json::json!(["id", "tenant_id"]);
@@ -2617,7 +2625,7 @@ mod tests {
             tenant_refusal(|manifest| {
                 manifest["collections"][2]["columns"][0]["postgresType"] = "int4".into();
             }),
-            "invalid serve configuration: the partition columns of a scope must have one type"
+            "invalid configuration: the partition columns of a scope must have one type"
         );
         assert_eq!(
             tenant_refusal(|manifest| {
@@ -2627,7 +2635,7 @@ mod tests {
                     collection.insert("shared".to_owned(), true.into());
                 }
             }),
-            "invalid serve configuration: a partitioned scope needs at least one partitioned collection"
+            "invalid configuration: a partitioned scope needs at least one partitioned collection"
         );
     }
 
@@ -2638,7 +2646,7 @@ mod tests {
         let manifest: ServeManifest = serde_json::from_value(manifest).unwrap();
         assert_eq!(
             validate_manifest(manifest).err().unwrap().to_string(),
-            "invalid serve configuration: collection tasks: it sets partitionColumn or shared, which only a partitioned scope reads"
+            "invalid configuration: collection tasks: it sets partitionColumn or shared, which only a partitioned scope reads"
         );
     }
 
@@ -2707,7 +2715,7 @@ mod tests {
             .to_string();
         assert_eq!(
             rendered,
-            "invalid serve configuration: relations archive.tasks and public.tasks would both be \
+            "invalid configuration: relations archive.tasks and public.tasks would both be \
              served as collection tasks, which is named by the table alone"
         );
     }
@@ -2757,12 +2765,14 @@ mod tests {
             &mut commands,
             registry.tables(),
             &everything,
+            &mutation_crud::DisclosedConstraints::default(),
         )
         .expect("the enrolled tables register");
         let error = mutation_crud::register_crud_commands_per_table(
             &mut commands,
             registry.tables(),
             &everything,
+            &mutation_crud::DisclosedConstraints::default(),
         )
         .expect_err("the same table cannot register twice");
         assert!(
@@ -3273,7 +3283,7 @@ mod tests {
         })
     }
 
-    const DRIFT: &str = "the PostgreSQL publication calque_incident was altered, or an enum its columns use gained or renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists and enum values it had at enrollment.";
+    const DRIFT: &str = "the PostgreSQL publication calque_incident was altered: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists it had at enrollment.";
 
     fn drift() -> calque_engine::LocalSourceError {
         calque_engine::LocalSourceError::PublicationDrift {
@@ -3348,7 +3358,7 @@ mod tests {
                     publication: "calque_incident".to_owned(),
                 }
             )),
-            "the PostgreSQL publication calque_incident was altered, or an enum its columns use gained or renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists and enum values it had at enrollment. Restore the publication's definition if it was altered, then run calque destroy --state-dir /srv/calque/source-a --database-url-env CALQUE_DATABASE_URL --yes and rerun serve to prepare the working set anew, since the one it holds may no longer match PostgreSQL."
+            "the PostgreSQL publication calque_incident was altered: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists it had at enrollment. Restore the publication's definition if it was altered, then run calque destroy --state-dir /srv/calque/source-a --database-url-env CALQUE_DATABASE_URL --yes and rerun serve to prepare the working set anew, since the one it holds may no longer match PostgreSQL."
         );
         assert_eq!(
             printed(ServeError::Source(
@@ -3579,7 +3589,7 @@ mod tests {
             .to_string();
         assert_eq!(
             rendered,
-            "invalid serve configuration: collection todo reads public.tasks, but a collection's id must be its table's name, because the client binds each collection to the artifact table of that name; rename the collection to tasks, along with every command that names it"
+            "invalid configuration: collection todo reads public.tasks, but a collection's id must be its table's name, because the client binds each collection to the artifact table of that name; rename the collection to tasks, along with every command that names it"
         );
     }
 

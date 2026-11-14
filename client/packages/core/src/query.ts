@@ -201,6 +201,18 @@ export interface ColumnarQueryCapacity {
   readonly maxReservations?: number;
 }
 
+/**
+ * The labels of the enum one column carries, in PostgreSQL's declaration
+ * order. The engine orders and compares the column by them wherever it would
+ * compare text: a value outside them orders after every one, and those values
+ * among themselves by text.
+ */
+export interface ColumnarEnumLabels {
+  readonly collection: string;
+  readonly column: string;
+  readonly labels: readonly string[];
+}
+
 export interface QueryExecutionOptions {
   readonly maxRows?: number;
   readonly maxBytes?: number;
@@ -642,15 +654,91 @@ function canonicalQuery(specification: ValidatedQuerySpecification): string {
   });
 }
 
+/**
+ * One enum's declaration order, shared by every column of the same labels in
+ * the same order. The plan names labels, not types, so two types that declare
+ * the same labels share an order, and compare where PostgreSQL would refuse.
+ */
+interface EnumOrder {
+  readonly rank: ReadonlyMap<string, number>;
+  readonly labels: readonly string[];
+}
+
+/** Each collection's enum columns, by column name. */
+type EnumOrders = ReadonlyMap<string, ReadonlyMap<string, EnumOrder>>;
+
+function enumOrders(entries: readonly ColumnarEnumLabels[]): EnumOrders {
+  if (!Array.isArray(entries)) invalid("enum labels must be an array");
+  const shared = new Map<string, EnumOrder>();
+  const orders = new Map<string, Map<string, EnumOrder>>();
+  for (const entry of entries) {
+    const { collection, column, labels } = entry;
+    if (typeof collection !== "string" || typeof column !== "string")
+      invalid("enum labels must name a collection and a column");
+    if (
+      !Array.isArray(labels) ||
+      labels.length === 0 ||
+      labels.some((label) => typeof label !== "string") ||
+      new Set(labels).size !== labels.length
+    )
+      invalid(
+        `enum labels of ${collection}.${column} must be distinct strings, at least one`,
+      );
+    const columns = orders.get(collection) ?? new Map<string, EnumOrder>();
+    if (columns.has(column))
+      invalid(`enum labels of ${collection}.${column} are given twice`);
+    const key = labels.map((label) => `${label.length}:${label}`).join("");
+    let order = shared.get(key);
+    if (!order) {
+      order = Object.freeze({
+        rank: new Map(labels.map((label, index) => [label, index])),
+        labels: Object.freeze([...labels]),
+      });
+      shared.set(key, order);
+    }
+    columns.set(column, order);
+    orders.set(collection, columns);
+  }
+  return orders;
+}
+
+/**
+ * Two texts of one enum in declaration order: a label before any other text,
+ * and two texts that are not labels by code unit.
+ */
+function compareEnum(order: EnumOrder, left: string, right: string): number {
+  const a = order.rank.get(left);
+  const b = order.rank.get(right);
+  if (a !== undefined && b !== undefined) return a - b;
+  if (a !== undefined) return -1;
+  if (b !== undefined) return 1;
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/** `totalCompare`, in declaration order where both values are enum texts. */
+function compareIn(
+  order: EnumOrder | undefined,
+  left: QueryValue,
+  right: QueryValue,
+): number {
+  return order && typeof left === "string" && typeof right === "string"
+    ? compareEnum(order, left, right)
+    : totalCompare(left, right);
+}
+
 interface CompiledField {
   readonly source: number;
   readonly column: number;
   readonly key: string;
+  /** Set for an enum column, which orders by it instead of by text. */
+  readonly order: EnumOrder | undefined;
 }
 
 type CompiledExpression =
   | { readonly kind: "field"; readonly field: CompiledField }
   | { readonly kind: "literal"; readonly value: QueryValue };
+
+type RangeOperator = "lt" | "lte" | "gt" | "gte";
 
 type CompiledPredicate =
   | {
@@ -658,6 +746,20 @@ type CompiledPredicate =
       readonly operator: QueryComparisonOperator;
       readonly left: CompiledExpression;
       readonly right: CompiledExpression;
+      /** The order two enum fields of the same labels compare in. */
+      readonly order?: EnumOrder;
+    }
+  | {
+      /**
+       * An enum field ordered against a text literal, by declaration order.
+       * Text order would decide it differently, so it never reaches a text
+       * comparison or a chunk's text bounds.
+       */
+      readonly kind: "rank";
+      readonly field: CompiledField;
+      readonly order: EnumOrder;
+      readonly operator: RangeOperator;
+      readonly literal: string;
     }
   | {
       readonly kind: "is-null";
@@ -697,6 +799,8 @@ interface CompiledOrder {
   readonly column: number;
   readonly direction: "asc" | "desc";
   readonly nulls: "first" | "last";
+  /** The projection's enum order: its field's, or a `min` or `max` of one. */
+  readonly order: EnumOrder | undefined;
 }
 
 interface CompiledQuery {
@@ -724,9 +828,58 @@ const COMPLEMENT_OPERATOR: Readonly<
   gt: "lte",
 };
 
+/** The operator that holds with the operands swapped. */
+const REVERSED_RANGE: Readonly<Record<RangeOperator, RangeOperator>> = {
+  lt: "gt",
+  lte: "gte",
+  gt: "lt",
+  gte: "lte",
+};
+
+/**
+ * An ordering comparison that reads an enum field, compiled by declaration
+ * order: a rank leaf against a text literal, or a comparison carrying the
+ * order when both sides are fields of the same labels. `undefined` leaves the
+ * comparison as it is, as for a field against a non-text literal, which no
+ * order decides. An enum field ordered against a field of other labels, or of
+ * none, has no order to compare in, as in PostgreSQL, and is refused.
+ */
+function compileEnumRange(
+  operator: RangeOperator,
+  left: CompiledExpression,
+  right: CompiledExpression,
+): CompiledPredicate | undefined {
+  if (left.kind === "field" && right.kind === "field") {
+    const order = left.field.order;
+    if (order === undefined && right.field.order === undefined)
+      return undefined;
+    if (order === undefined || order !== right.field.order)
+      invalid(
+        "an enum column orders only against a text or an enum column of the same labels",
+      );
+    return { kind: "compare", operator, left, right, order };
+  }
+  const [field, literal, fieldOperator] =
+    left.kind === "field" && right.kind === "literal"
+      ? [left.field, right.value, operator]
+      : left.kind === "literal" && right.kind === "field"
+        ? [right.field, left.value, REVERSED_RANGE[operator]]
+        : [undefined, undefined, operator];
+  if (field?.order === undefined || typeof literal !== "string")
+    return undefined;
+  return {
+    kind: "rank",
+    field,
+    order: field.order,
+    operator: fieldOperator,
+    literal,
+  };
+}
+
 function compileQuery(
   specification: ValidatedQuerySpecification,
   snapshots: readonly OverlayQuerySnapshot[],
+  enums: EnumOrders,
 ): CompiledQuery {
   const aliases = [
     specification.from.as,
@@ -744,7 +897,16 @@ function compileQuery(
     const column = columns[source]?.get(field.column);
     if (column === undefined)
       invalid(`unknown column ${field.source}.${field.column}`);
-    return { source, column, key: fieldIdentity(field) };
+    const collection = snapshots[source]?.collection;
+    return {
+      source,
+      column,
+      key: fieldIdentity(field),
+      order:
+        collection === undefined
+          ? undefined
+          : enums.get(collection)?.get(field.column),
+    };
   };
   const compileExpression = (
     expression: QueryExpression,
@@ -768,15 +930,24 @@ function compileQuery(
   ): CompiledPredicate => {
     if (predicate.kind === "not")
       return compilePredicate(predicate.predicate, !negated);
-    if (predicate.kind === "compare")
-      return {
-        kind: "compare",
-        operator: negated
-          ? COMPLEMENT_OPERATOR[predicate.operator]
-          : predicate.operator,
-        left: compileExpression(predicate.left),
-        right: compileExpression(predicate.right),
-      };
+    if (predicate.kind === "compare") {
+      const operator = negated
+        ? COMPLEMENT_OPERATOR[predicate.operator]
+        : predicate.operator;
+      const left = compileExpression(predicate.left);
+      const right = compileExpression(predicate.right);
+      // Complementing stays exact by declaration order, which is total.
+      return (
+        (operator === "eq" || operator === "neq"
+          ? undefined
+          : compileEnumRange(operator, left, right)) ?? {
+          kind: "compare",
+          operator,
+          left,
+          right,
+        }
+      );
+    }
     if (predicate.kind === "is-null")
       return {
         kind: "is-null",
@@ -844,10 +1015,17 @@ function compileQuery(
       (projection) => projection.as === order.by,
     );
     if (column < 0) invalid(`order references unknown projection ${order.by}`);
+    const projection = projections[column];
     return {
       column,
       direction: order.direction,
       nulls: order.nulls ?? "last",
+      order:
+        projection?.kind === "field" ||
+        projection?.operator === "min" ||
+        projection?.operator === "max"
+          ? projection.field?.order
+          : undefined,
     };
   });
   return {
@@ -1195,6 +1373,18 @@ function matchesPredicate(
       expressionValue(predicate.expression, relation, row, snapshots) === null;
     return predicate.negated ? !result : result;
   }
+  if (predicate.kind === "rank") {
+    inspection.materializedComparisons++;
+    const value = relationValue(relation, row, predicate.field, snapshots);
+    // A null is UNKNOWN, and no other type orders against text.
+    return (
+      typeof value === "string" &&
+      rangeHolds(
+        predicate.operator,
+        compareEnum(predicate.order, value, predicate.literal),
+      )
+    );
+  }
   const encoded = encodedPredicateDecision(predicate, relation, row, snapshots);
   if (encoded !== undefined) {
     inspection.encodedComparisons++;
@@ -1207,11 +1397,18 @@ function matchesPredicate(
   if (left === null || right === null) return false;
   if (predicate.operator === "eq") return exactEqual(left, right);
   if (predicate.operator === "neq") return !exactEqual(left, right);
-  const comparison = sameTypeCompare(left, right);
+  const comparison =
+    predicate.order && typeof left === "string" && typeof right === "string"
+      ? compareEnum(predicate.order, left, right)
+      : sameTypeCompare(left, right);
   if (comparison === undefined) return false;
-  if (predicate.operator === "lt") return comparison < 0;
-  if (predicate.operator === "lte") return comparison <= 0;
-  if (predicate.operator === "gt") return comparison > 0;
+  return rangeHolds(predicate.operator, comparison);
+}
+
+function rangeHolds(operator: RangeOperator, comparison: number): boolean {
+  if (operator === "lt") return comparison < 0;
+  if (operator === "lte") return comparison <= 0;
+  if (operator === "gt") return comparison > 0;
   return comparison >= 0;
 }
 
@@ -1510,6 +1707,7 @@ function predicateReadsOnly(
     );
   if (predicate.kind === "is-null")
     return expressionReadsOnly(predicate.expression, source);
+  if (predicate.kind === "rank") return predicate.field.source === source;
   return (
     expressionReadsOnly(predicate.left, source) &&
     expressionReadsOnly(predicate.right, source)
@@ -1767,6 +1965,82 @@ const ALL_POSITIONS = Uint32Array.from(
   (_unused, index) => index,
 );
 
+/**
+ * Each clean base cell's label rank, for a column whose encoded form tells
+ * exactly which text a cell holds: 0 to `labels.length - 1` for a label, -1
+ * for any other text. `undefined` where the form cannot tell, as when two
+ * dictionary entries read back as one text. The caller checks `validAt`
+ * first.
+ */
+function labelRanks(
+  cells: ArtifactEncodedColumn,
+  order: EnumOrder,
+): ((address: number) => number) | undefined {
+  if (cells.kind === "dict") {
+    if (!cells.codesAreText()) return undefined;
+    const ranks = new Int32Array(cells.codes).fill(-1);
+    order.labels.forEach((label, rank) => {
+      const code = cells.codeOf(label);
+      if (code !== undefined) ranks[code] = rank;
+    });
+    return (address) => ranks[cells.codeAt(address)] ?? -1;
+  }
+  // Equal bytes mean equal texts once `rowsAreText` holds.
+  if (cells.kind !== "text" || !cells.rowsAreText()) return undefined;
+  const byLength = new Map<number, { bytes: Uint8Array; rank: number }[]>();
+  order.labels.forEach((label, rank) => {
+    const bytes = encoder.encode(label);
+    const same = byLength.get(bytes.length) ?? [];
+    same.push({ bytes, rank });
+    byLength.set(bytes.length, same);
+  });
+  const { offsets, bytes } = cells;
+  return (address) => {
+    const start = offsets[address] ?? 0;
+    const candidates = byLength.get((offsets[address + 1] ?? 0) - start);
+    if (!candidates) return -1;
+    for (const candidate of candidates) {
+      const label = candidate.bytes;
+      let index = 0;
+      while (index < label.length && bytes[start + index] === label[index])
+        index++;
+      if (index === label.length) return candidate.rank;
+    }
+    return -1;
+  };
+}
+
+/**
+ * A rank leaf's decision at a base address: `FALSE` or `TRUE`, or `UNDECIDED`
+ * for an overlay row, a dirty cell, or a text outside the labels when the
+ * literal is outside them too, which only their text order decides.
+ * `undefined` when the encoded form cannot tell which label a cell holds.
+ */
+function prepareRankLeaf(
+  leaf: Extract<CompiledPredicate, { readonly kind: "rank" }>,
+  snapshot: OverlayQuerySnapshot,
+): ((address: number) => number) | undefined {
+  if (leaf.field.source !== 0) return undefined;
+  const base = snapshot.baseEncoded(leaf.field.column);
+  if (!base) return undefined;
+  const { cells, dirty } = base;
+  const ranks = labelRanks(cells, leaf.order);
+  if (!ranks) return undefined;
+  const { baseRows } = snapshot;
+  const literal = leaf.order.rank.get(leaf.literal);
+  const below = leaf.operator === "lt" || leaf.operator === "lte";
+  // A text outside the labels orders after every label.
+  const unlabelled = literal === undefined ? UNDECIDED : below ? FALSE : TRUE;
+  return (address) => {
+    if (address >= baseRows || dirty?.(address)) return UNDECIDED;
+    if (!cells.validAt(address)) return FALSE;
+    const rank = ranks(address);
+    if (rank < 0) return unlabelled;
+    if (literal === undefined) return below ? TRUE : FALSE;
+    return rangeHolds(leaf.operator, rank - literal) ? TRUE : FALSE;
+  };
+}
+
 interface BlockPredicate {
   /** `FALSE`, `UNDECIDED` or `TRUE` per position after `evaluate`. */
   readonly out: Uint8Array;
@@ -1856,6 +2130,20 @@ function prepareBlockPredicate(
             if (merged !== settled) level.selection[kept++] = position;
           }
           remaining = kept;
+        }
+        return decided;
+      };
+    }
+    if (node.kind === "rank") {
+      const decide = prepareRankLeaf(node, snapshot);
+      if (!decide) return undefined;
+      return (selection, count, out) => {
+        let decided = count;
+        for (let index = 0; index < count; index++) {
+          const position = selection[index] ?? 0;
+          const value = decide(addresses[position] ?? 0);
+          out[position] = value;
+          if (value === UNDECIDED) decided--;
         }
         return decided;
       };
@@ -1966,6 +2254,16 @@ function prepareEncodedPredicate(
         if (decision === undefined) undecided = true;
       }
       return undecided ? undefined : !decisive;
+    };
+  }
+  if (predicate.kind === "rank") {
+    const decide = prepareRankLeaf(predicate, snapshot);
+    if (!decide) return undefined;
+    return (address) => {
+      const value = decide(address);
+      if (value === UNDECIDED) return undefined;
+      tally.comparisons++;
+      return value === TRUE;
     };
   }
   let compare: EncodedDecision | undefined;
@@ -2097,6 +2395,8 @@ function predicateChunkMayMatch(
     // only null count here, so negated null predicates conservatively scan.
     return predicate.negated ? undefined : contains;
   }
+  // A chunk's bounds are text bounds, which say nothing of declaration order.
+  if (predicate.kind === "rank") return undefined;
   if (predicate.kind === "and") {
     let unknown = false;
     for (const child of predicate.predicates) {
@@ -2185,7 +2485,7 @@ function updateAggregate(
     state.value = value;
     return;
   }
-  const comparison = totalCompare(value, state.value);
+  const comparison = compareIn(projection.field?.order, value, state.value);
   if (
     (projection.operator === "min" && comparison < 0) ||
     (projection.operator === "max" && comparison > 0)
@@ -2620,7 +2920,7 @@ function compareOrdered(
           ? 1
           : -1;
     }
-    const comparison = totalCompare(a, b);
+    const comparison = compareIn(order.order, a, b);
     if (comparison !== 0)
       return order.direction === "desc" ? -comparison : comparison;
   }
@@ -2642,8 +2942,8 @@ const SORT_RUN = 32;
  * One ordering column of a relation sort.
  *
  * A column whose base cells carry an order-preserving number (an exact
- * integer's or timestamp's `orderAt`, or a dictionary code when the codes
- * order as their texts do) gets a key per row: that number, negated for a
+ * integer's or timestamp's `orderAt`, a dictionary code when the codes order
+ * as their texts do, or an enum label's rank) gets a key per row: that number, negated for a
  * descending order, or -Infinity or Infinity for null by its placement. A row
  * no such number stands for, such as an overlay value the encoded form does
  * not hold or a cell outside the safe range, gets NaN, and its value is read
@@ -2651,7 +2951,7 @@ const SORT_RUN = 32;
  * `valueAt`.
  *
  * Two keys are equal exactly when the two values are, and order as
- * `totalCompare` orders them, so either form compares rows exactly as
+ * `compareIn` orders them, so either form compares rows exactly as
  * `compareOrdered` compares their projected values.
  */
 interface SortColumn {
@@ -2712,6 +3012,44 @@ function overlayKey(
     : undefined;
 }
 
+/**
+ * An enum column's key for a clean base cell: its label's rank, or past every
+ * rank for any other text, by its code where dictionary codes order as their
+ * texts do, and `undefined` otherwise. `undefined` for the whole column when
+ * its encoded form cannot tell which label a cell holds.
+ */
+function enumKey(
+  cells: ArtifactEncodedColumn,
+  order: EnumOrder,
+): ((address: number) => number | undefined) | undefined {
+  const ranks = labelRanks(cells, order);
+  if (!ranks) return undefined;
+  const after = order.labels.length;
+  if (cells.kind === "dict" && cells.codesOrderAsText())
+    return (address) => {
+      const rank = ranks(address);
+      return rank >= 0 ? rank : after + cells.codeAt(address);
+    };
+  return (address) => {
+    const rank = ranks(address);
+    return rank >= 0 ? rank : undefined;
+  };
+}
+
+/** `enumKey` for an overlay value, which no base cell holds. */
+function enumOverlayKey(
+  cells: ArtifactEncodedColumn,
+  order: EnumOrder,
+  value: QueryValue,
+): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const rank = order.rank.get(value);
+  if (rank !== undefined) return rank;
+  if (cells.kind !== "dict" || !cells.codesOrderAsText()) return undefined;
+  const code = cells.codeOf(value);
+  return code === undefined ? undefined : order.labels.length + code;
+}
+
 function* sortColumn(
   relation: AddressRelation,
   field: CompiledField,
@@ -2723,12 +3061,15 @@ function* sortColumn(
   const snapshot = snapshots[field.source];
   const base = snapshot?.baseEncoded(field.column);
   const cells = base?.cells;
-  const cleanKey =
-    cells?.kind === "exact"
-      ? (address: number) => cells.orderAt(address)
-      : cells?.kind === "dict" && cells.codesOrderAsText()
-        ? (address: number) => cells.codeAt(address)
-        : undefined;
+  const { order: enumOrder } = field;
+  const cleanKey: ((address: number) => number | undefined) | undefined =
+    enumOrder
+      ? cells && enumKey(cells, enumOrder)
+      : cells?.kind === "exact"
+        ? (address: number) => cells.orderAt(address)
+        : cells?.kind === "dict" && cells.codesOrderAsText()
+          ? (address: number) => cells.codeAt(address)
+          : undefined;
   if (!snapshot || !base || !cells || !cleanKey) {
     // A UUID cell reads as its 16 bytes or null and an overlay value as
     // itself, neither of which can throw, so such a column reads a row only
@@ -2789,7 +3130,12 @@ function* sortColumn(
       key = cells.validAt(address) ? cleanKey(address) : null;
     else {
       const value = snapshot.valueAt(address, field.column);
-      key = value === null ? null : overlayKey(cells, value);
+      key =
+        value === null
+          ? null
+          : enumOrder
+            ? enumOverlayKey(cells, enumOrder, value)
+            : overlayKey(cells, value);
     }
     if (key === undefined) {
       keys[row] = Number.NaN;
@@ -2808,7 +3154,7 @@ function compareSortValues(
     if (left === right) return 0;
     return (left === null) === column.nullsFirst ? -1 : 1;
   }
-  const comparison = totalCompare(left, right);
+  const comparison = compareIn(column.field.order, left, right);
   return column.descending ? -comparison : comparison;
 }
 
@@ -3536,6 +3882,7 @@ function* executePlan(
   features: QueryExecutionFeatures,
   growth: QueryReservationGrowth,
   maxRows: number | undefined,
+  enums: EnumOrders,
 ): Sliced<PlanOutput> {
   const snapshots = [specification.from, ...specification.joins].map(
     ({ collection }) => {
@@ -3544,7 +3891,7 @@ function* executePlan(
       return snapshot;
     },
   );
-  const compiled = compileQuery(specification, snapshots);
+  const compiled = compileQuery(specification, snapshots, enums);
   if (specification.limit === 0)
     return compiled.aggregateMode
       ? { kind: "groups", compiled, rows: [] }
@@ -3810,6 +4157,7 @@ export class ColumnarQueryEngine {
   readonly #capacityBytes: number;
   readonly #maxReservations: number;
   readonly #reservations = new Map<number, number>();
+  readonly #enumOrders: EnumOrders;
   /** Statistics each collection holds resident, as last observed. */
   readonly #statistics = new Map<string, number>();
   /** Least recently read first. */
@@ -3817,7 +4165,11 @@ export class ColumnarQueryEngine {
   #reservedBytes = 0;
   #nextReservation = 1;
 
-  constructor(overlay: OverlayEngine, capacity: ColumnarQueryCapacity) {
+  constructor(
+    overlay: OverlayEngine,
+    capacity: ColumnarQueryCapacity,
+    enumLabels: readonly ColumnarEnumLabels[] = [],
+  ) {
     if (
       !Number.isSafeInteger(capacity.capacityBytes) ||
       capacity.capacityBytes <= 0
@@ -3833,6 +4185,7 @@ export class ColumnarQueryEngine {
     this.#overlay = overlay;
     this.#capacityBytes = capacity.capacityBytes;
     this.#maxReservations = maxReservations;
+    this.#enumOrders = enumOrders(enumLabels);
   }
 
   /**
@@ -4005,6 +4358,7 @@ export class ColumnarQueryEngine {
         rowsJoined: 0,
       };
       const features = QUERY_FEATURES.get(this) ?? DEFAULT_QUERY_FEATURES;
+      const enums = this.#enumOrders;
       const growth: QueryReservationGrowth = {
         grow: (bytes, detail) => this.#grow(reservation, bytes, detail),
       };
@@ -4026,6 +4380,7 @@ export class ColumnarQueryEngine {
               features,
               growth,
               maxRows,
+              enums,
             ));
           return { result: yield* publish(output), output };
         })(),

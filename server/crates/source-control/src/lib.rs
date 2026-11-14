@@ -1,6 +1,9 @@
 //! PostgreSQL source enrollment inspection and fail-closed validation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, PoisonError, RwLock},
+};
 
 use postgres::{Client, IsolationLevel, Row};
 use serde::{Deserialize, Serialize};
@@ -11,7 +14,9 @@ mod registry;
 mod type_codec;
 
 pub use pgoutput_decoder::{PgoutputLaunchProfile, PgoutputProfileError};
-pub use registry::{RegisteredTable, SchemaRegistry, SchemaRegistryBinding, SchemaRegistryError};
+pub use registry::{
+    RegisteredColumn, RegisteredTable, SchemaRegistry, SchemaRegistryBinding, SchemaRegistryError,
+};
 pub use type_codec::PostgresTypeCodec;
 
 pub const MIN_POSTGRES_MAJOR: u32 = 18;
@@ -31,6 +36,7 @@ pub struct ActivatedSource {
     source_epoch: SourceEpoch,
     cursor_codec: CursorCodec,
     pgoutput_profile: PgoutputLaunchProfile,
+    enum_labels: SharedEnumLabels,
 }
 
 impl ActivatedSource {
@@ -45,7 +51,20 @@ impl ActivatedSource {
             source_epoch,
             cursor_codec,
             pgoutput_profile,
+            enum_labels: SharedEnumLabels::default(),
         }
+    }
+
+    /// The source with `labels` as its enum columns' labels, which the
+    /// running session keeps current.
+    #[must_use]
+    pub fn with_enum_labels(mut self, labels: SharedEnumLabels) -> Self {
+        self.enum_labels = labels;
+        self
+    }
+
+    pub fn enum_labels(&self) -> &SharedEnumLabels {
+        &self.enum_labels
     }
 
     pub fn registry_binding(&self) -> &SchemaRegistryBinding {
@@ -377,7 +396,19 @@ pub enum InspectError {
     InvalidCatalogOid { name: &'static str, value: i64 },
     #[error("PostgreSQL returned invalid one-character catalog value {field}={value:?}")]
     InvalidCatalogCharacter { field: &'static str, value: String },
+    #[error(
+        "column {column} of {table} is an enum of {labels} labels; Calque serves an enum of at most {MAX_ENUM_LABELS}"
+    )]
+    TooManyEnumLabels {
+        table: String,
+        column: String,
+        labels: usize,
+    },
 }
+
+/// The most labels an enum column may have: every plan carries them all, and
+/// `spec/bootstrap-plan.schema.json` bounds them so.
+pub const MAX_ENUM_LABELS: usize = 4_096;
 
 /// Captures enrollment facts in one repeatable-read transaction.
 ///
@@ -686,6 +717,114 @@ pub fn inspect_source(
         publication,
         tables,
     })
+}
+
+/// The labels of each enum a column carries, directly or through any chain of
+/// domains, in PostgreSQL's declaration order (`pg_enum.enumsortorder`, which
+/// `ALTER TYPE ... ADD VALUE ... BEFORE` places between two others), by table
+/// and column name. They are read beside the inspection and kept out of it,
+/// so adding a value changes no schema fingerprint, table id or artifact.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnumLabels(Arc<BTreeMap<QualifiedTable, BTreeMap<String, Vec<String>>>>);
+
+impl EnumLabels {
+    /// The labels of `column` of `table`, or `None` when it carries no enum.
+    pub fn column(&self, table: &QualifiedTable, column: &str) -> Option<&[String]> {
+        self.0.get(table)?.get(column).map(Vec::as_slice)
+    }
+}
+
+impl From<BTreeMap<QualifiedTable, BTreeMap<String, Vec<String>>>> for EnumLabels {
+    fn from(labels: BTreeMap<QualifiedTable, BTreeMap<String, Vec<String>>>) -> Self {
+        Self(Arc::new(labels))
+    }
+}
+
+/// [`EnumLabels`] that a running session replaces when it reads them again
+/// after a value is added, so a plan made since orders that value where its
+/// type declares it. Clones share the labels.
+#[derive(Debug, Clone, Default)]
+pub struct SharedEnumLabels(Arc<RwLock<EnumLabels>>);
+
+impl SharedEnumLabels {
+    pub fn new(labels: EnumLabels) -> Self {
+        Self(Arc::new(RwLock::new(labels)))
+    }
+
+    pub fn current(&self) -> EnumLabels {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn replace(&self, labels: EnumLabels) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = labels;
+    }
+}
+
+/// Reads [`EnumLabels`] for every column `publication_name` carries of
+/// `tables`, in one statement.
+pub fn inspect_enum_labels(
+    client: &mut Client,
+    publication_name: &str,
+    tables: &BTreeSet<QualifiedTable>,
+) -> Result<EnumLabels, InspectError> {
+    let schemas: Vec<&str> = tables.iter().map(|table| table.schema.as_str()).collect();
+    let names: Vec<&str> = tables.iter().map(|table| table.table.as_str()).collect();
+    let mut labels: BTreeMap<QualifiedTable, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+    for row in client.query(
+        "WITH RECURSIVE chain(schema_name, table_name, column_name, oid) AS (
+             SELECT published.schemaname::text, published.tablename::text,
+                    attribute.attname::text, attribute.atttypid
+               FROM unnest($2::name[], $3::name[]) AS required(schema_name, table_name)
+               JOIN pg_catalog.pg_publication_tables AS published
+                 ON published.pubname = $1
+                AND published.schemaname = required.schema_name
+                AND published.tablename = required.table_name
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.nspname = published.schemaname
+               JOIN pg_catalog.pg_class AS class
+                 ON class.relnamespace = namespace.oid
+                AND class.relname = published.tablename
+               JOIN pg_catalog.pg_attribute AS attribute
+                 ON attribute.attrelid = class.oid
+              WHERE attribute.attnum > 0
+                AND NOT attribute.attisdropped
+                AND attribute.attname = ANY(published.attnames)
+             UNION ALL
+             SELECT chain.schema_name, chain.table_name, chain.column_name,
+                    domain.typbasetype
+               FROM chain
+               JOIN pg_catalog.pg_type AS domain ON domain.oid = chain.oid
+              WHERE domain.typtype = 'd'
+         )
+         SELECT chain.schema_name, chain.table_name, chain.column_name,
+                array_agg(enum_value.enumlabel::text ORDER BY enum_value.enumsortorder)
+           FROM chain
+           JOIN pg_catalog.pg_enum AS enum_value ON enum_value.enumtypid = chain.oid
+          GROUP BY chain.schema_name, chain.table_name, chain.column_name",
+        &[&publication_name, &schemas, &names],
+    )? {
+        let table = QualifiedTable {
+            schema: row.get(0),
+            table: row.get(1),
+        };
+        let column: String = row.get(2);
+        let column_labels: Vec<String> = row.get(3);
+        if column_labels.len() > MAX_ENUM_LABELS {
+            return Err(InspectError::TooManyEnumLabels {
+                table: table.display_name(),
+                column,
+                labels: column_labels.len(),
+            });
+        }
+        labels
+            .entry(table)
+            .or_default()
+            .insert(column, column_labels);
+    }
+    Ok(labels.into())
 }
 
 /// Calque sets these on every connection it opens, so a session that reports

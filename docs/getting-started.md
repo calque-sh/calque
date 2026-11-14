@@ -11,8 +11,8 @@ says what changes for a deployment.
 - PostgreSQL 18 that you can reach as a superuser once, to create a role and a
   publication, and `psql` to run SQL. The examples use a database named `app`
   on `127.0.0.1:5432` with a superuser named `postgres`.
-- A table to serve. `calque dev`, which this guide runs, serves every column
-  of it. `calque serve` serves only the columns a collection names
+- A table to serve. Calque serves the columns its collection in
+  `calque.config.json` names, and no other
   ([Publishing only some columns](postgresql.md#publishing-only-some-columns)).
   A table needs a primary key and supported column types
   ([What Calque needs from PostgreSQL](postgresql.md)).
@@ -121,6 +121,11 @@ that [the refusal table](postgresql.md#when-calque-refuses-a-table-or-a-setting)
 explains. After you change the tables, run both commands again, with
 `calque init --force`.
 
+Each collection names every column of its table. To keep one off the page,
+such as a password hash, delete it from the collection's `columns` and from
+its command's `writableColumns`: `calque dev` and `calque serve` then publish
+the table without it, and PostgreSQL never sends it.
+
 ## 5. Install the packages
 
 ```sh
@@ -209,21 +214,23 @@ component.
 
 `calque dev` enrolls the database, creates its own publication, replication
 slot and `calque_control` schema in it, serves it on `127.0.0.1:8787`, and
-writes its address and bearer to `.calque-dev/client.env`. Run it from your
-application's root, because the Vite plugin reads the nearest `.calque-dev` at
-or above the page's root. It reads `CALQUE_DATABASE_URL`, so export the
-variable from step 3 in this terminal as well.
+writes its address and bearer to `.calque-dev/client.env`. It serves the tables
+and columns `calque.config.json` names. Run it from your application's root,
+where step 4 wrote that file, and where the Vite plugin reads the nearest
+`.calque-dev` at or above the page's root. It reads `CALQUE_DATABASE_URL`, so
+export the variable from step 3 in this terminal as well.
 
 ### With the calque binary
 
 ```sh
-calque dev --table public.tasks \
-  --public-base-url http://127.0.0.1:5173/_calque/ \
+calque dev --public-base-url http://127.0.0.1:5173/_calque/ \
   --acknowledge-disposable-source
 ```
 
 `--public-base-url` is the Vite proxy's address, which every URL the server
-hands the page names. Name each table you serve with its own `--table`. The
+hands the page names. After you edit the columns in `calque.config.json`, stop
+the server, run `calque destroy --state-dir .calque-dev --yes`, and start it
+again: it prepares the tables anew with the columns the file names. The
 server keeps running; leave it in this terminal. `calque dev` allows the origin
 `http://127.0.0.1:5173` unless `--allow-origin` names another.
 
@@ -238,7 +245,7 @@ directory stays yours. On Linux the container shares the host's network, so
 export CALQUE_DATABASE_URL='postgresql://calque_sync:calque_sync@127.0.0.1:5432/app'
 docker run --rm -e CALQUE_DATABASE_URL --network host \
   -v "$PWD":/work -w /work --user "$(id -u):$(id -g)" \
-  ghcr.io/calque-sh/calque dev --table public.tasks \
+  ghcr.io/calque-sh/calque dev \
   --public-base-url http://127.0.0.1:5173/_calque/ \
   --acknowledge-disposable-source
 ```
@@ -255,7 +262,7 @@ loopback address:
 export CALQUE_DATABASE_URL='postgresql://calque_sync:calque_sync@host.docker.internal:5432/app?sslmode=disable'
 docker run --rm -e CALQUE_DATABASE_URL -p 127.0.0.1:8787:8787 \
   -v "$PWD":/work -w /work --user "$(id -u):$(id -g)" \
-  ghcr.io/calque-sh/calque dev --table public.tasks --bind-address 0.0.0.0 \
+  ghcr.io/calque-sh/calque dev --bind-address 0.0.0.0 \
   --public-base-url http://127.0.0.1:5173/_calque/ \
   --acknowledge-disposable-source
 ```

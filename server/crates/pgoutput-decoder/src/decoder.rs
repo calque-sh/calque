@@ -797,6 +797,21 @@ impl Decoder {
         if data_xid.is_some() && !is_streaming {
             return Err(DecodeError::InvalidStreamingContext);
         }
+        // A transaction carrying a replication origin starts at position 0:
+        // the walsender sends its Begin without a position, so the
+        // transaction's first position is the first message that has one.
+        if wal_lsn.get() != 0 {
+            let pending = if is_streaming {
+                envelope_xid.and_then(|xid| self.streamed.get_mut(&xid))
+            } else {
+                self.normal.as_mut()
+            };
+            if let Some(pending) =
+                pending.filter(|pending| pending.first_observed_wal_lsn.get() == 0)
+            {
+                pending.first_observed_wal_lsn = wal_lsn;
+            }
+        }
         match message {
             M::Begin {
                 final_lsn,
@@ -3772,6 +3787,48 @@ mod tests {
         assert_eq!(transaction.xid, 9);
         assert_eq!(transaction.first_observed_wal_lsn, PgLsn::new(13));
         assert_eq!(transaction.changes.len(), 1);
+    }
+
+    #[test]
+    fn a_transaction_with_an_origin_starts_at_its_first_positioned_message() {
+        let mut decoder = decoder();
+        decoder
+            .decode_copy_data(copy_data(10, 11, 12, relation(columns())))
+            .unwrap();
+        let begin = M::Begin {
+            final_lsn: 20,
+            timestamp: 5,
+            xid: 9,
+        };
+        decoder
+            .decode_copy_data(copy_data(0, 0, 13, begin))
+            .unwrap();
+        let origin = M::Origin {
+            origin_lsn: 4,
+            origin_name: "pg_16400".to_owned(),
+        };
+        decoder
+            .decode_copy_data(copy_data(15, 15, 14, origin))
+            .unwrap();
+        decoder
+            .decode_copy_data(copy_data(16, 16, 15, insert("1", "task")))
+            .unwrap();
+        let commit = M::Commit {
+            flags: 0,
+            commit_lsn: 20,
+            end_lsn: 21,
+            timestamp: 5,
+        };
+        let ReplicationCopyData::Wal { events, .. } = decoder
+            .decode_copy_data(copy_data(22, 22, 16, commit))
+            .unwrap()
+        else {
+            panic!("expected XLogData")
+        };
+        let [DecoderEvent::TransactionCommitted(transaction)] = events.as_slice() else {
+            panic!("expected complete transaction")
+        };
+        assert_eq!(transaction.first_observed_wal_lsn, PgLsn::new(15));
     }
 
     #[test]

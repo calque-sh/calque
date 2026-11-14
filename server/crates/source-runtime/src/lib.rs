@@ -22,9 +22,12 @@ use postgres::{error::SqlState, Client, Transaction};
 use sync_types::{SourceEpoch, SourceId};
 use thiserror::Error;
 
+mod enum_labels;
 mod persistent_ingest;
 mod publication;
 mod slot_owner;
+
+pub use enum_labels::{EnumLabelDrift, SeenEnumVersion, ServedEnumLabel};
 
 pub use persistent_ingest::{
     PersistentIngestBoundary, PersistentIngestConfig, PersistentIngestDisposition,
@@ -119,7 +122,10 @@ const RENEWAL_RETRY_MAX_PAUSE: Duration = Duration::from_millis(400);
 // Runs on every connect and reconnect, under a 1 s lock timeout. On existing
 // tables `CREATE ... IF NOT EXISTS` takes no table lock, whereas any `ALTER
 // TABLE` here would take ACCESS EXCLUSIVE and wait behind an autovacuum, so
-// the one column added since runs `ALTER TABLE` only while it is missing.
+// each column added since runs `ALTER TABLE` only while it is missing.
+//
+// `enum_labels_from_lsn` is null only for an enrollment an earlier release
+// made, which recorded no enum labels and cannot be resumed.
 const INSTALL_SQL: &str = r#"
 CREATE SCHEMA IF NOT EXISTS calque_control;
 CREATE SEQUENCE IF NOT EXISTS calque_control.source_fence_token_seq
@@ -169,7 +175,8 @@ CREATE TABLE IF NOT EXISTS calque_control.source_slot_enrollment (
     pgoutput_profile text NOT NULL,
     initial_lsn text NOT NULL,
     durable_canonical_lsn text NOT NULL,
-    publication_fingerprint text
+    publication_fingerprint text,
+    enum_labels_from_lsn text
 );
 DO $$
 BEGIN
@@ -181,7 +188,36 @@ BEGIN
         ALTER TABLE calque_control.source_slot_enrollment
             ADD COLUMN publication_fingerprint text;
     END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_attribute
+         WHERE attrelid = 'calque_control.source_slot_enrollment'::regclass
+           AND attname = 'enum_labels_from_lsn' AND NOT attisdropped
+    ) THEN
+        ALTER TABLE calque_control.source_slot_enrollment
+            ADD COLUMN enum_labels_from_lsn text;
+    END IF;
 END $$;
+CREATE TABLE IF NOT EXISTS calque_control.source_enum_label (
+    source_id text NOT NULL
+        REFERENCES calque_control.source_slot_enrollment (source_id) ON DELETE CASCADE,
+    source_epoch text NOT NULL,
+    enum_type_oid bigint NOT NULL,
+    label text NOT NULL,
+    value_oid bigint NOT NULL,
+    value_xmin bigint NOT NULL,
+    held_from_lsn text NOT NULL,
+    seen_from_lsn text NOT NULL,
+    PRIMARY KEY (source_id, enum_type_oid, label)
+);
+CREATE TABLE IF NOT EXISTS calque_control.source_enum_version (
+    source_id text NOT NULL
+        REFERENCES calque_control.source_slot_enrollment (source_id) ON DELETE CASCADE,
+    source_epoch text NOT NULL,
+    value_oid bigint NOT NULL,
+    value_xmin bigint NOT NULL,
+    seen_from_lsn text NOT NULL,
+    PRIMARY KEY (source_id, value_oid, value_xmin)
+);
 "#;
 
 /// A non-secret process identity used for exact lease ownership checks.
@@ -424,12 +460,21 @@ pub trait FenceStore: Send + Sync {
         durable_lsn: u64,
     ) -> Result<(), FenceError>;
 
-    /// Records the publication fingerprint of an enrollment made before
-    /// enrollments recorded one. A recorded fingerprint is never replaced.
-    fn adopt_publication_fingerprint(
+    /// Adds `labels` to the enum labels an active lease's enrollment serves,
+    /// or moves the positions a served one holds from earlier. A served label
+    /// is never given to another value.
+    fn record_enum_labels(
         &self,
         lease: &LeaseIdentity,
-        fingerprint: &str,
+        labels: &[ServedEnumLabel],
+    ) -> Result<(), FenceError>;
+
+    /// Replaces the enum value versions an active lease's enrollment records
+    /// as seen with `versions`.
+    fn record_enum_versions(
+        &self,
+        lease: &LeaseIdentity,
+        versions: &[SeenEnumVersion],
     ) -> Result<(), FenceError>;
 
     fn transition_active(
@@ -702,17 +747,6 @@ where
         })
     }
 
-    fn adopt_publication_fingerprint(
-        &self,
-        lease: &ProvisionalLease,
-        fingerprint: &str,
-    ) -> Result<(), FenceError> {
-        self.operate(lease, |identity| {
-            self.store
-                .adopt_publication_fingerprint(identity, fingerprint)
-        })
-    }
-
     fn activate(
         &self,
         lease: ProvisionalLease,
@@ -812,6 +846,26 @@ where
         self.operate_active(lease, |identity| {
             self.store
                 .advance_durable_canonical_lsn(identity, durable_lsn)
+        })
+    }
+
+    pub(crate) fn record_enum_labels(
+        &self,
+        lease: &ActiveLease,
+        labels: &[ServedEnumLabel],
+    ) -> Result<(), FenceError> {
+        self.operate_active(lease, |identity| {
+            self.store.record_enum_labels(identity, labels)
+        })
+    }
+
+    pub(crate) fn record_enum_versions(
+        &self,
+        lease: &ActiveLease,
+        versions: &[SeenEnumVersion],
+    ) -> Result<(), FenceError> {
+        self.operate_active(lease, |identity| {
+            self.store.record_enum_versions(identity, versions)
         })
     }
 
@@ -1160,7 +1214,8 @@ impl FenceStore for PostgresFenceStore {
                     "SELECT source_id, source_epoch, slot_name, publication_name,
                             system_identifier, database_name, timeline_id,
                             previous_timeline_id, pgoutput_profile, initial_lsn,
-                            durable_canonical_lsn, publication_fingerprint
+                            durable_canonical_lsn, publication_fingerprint,
+                            enum_labels_from_lsn
                        FROM calque_control.source_slot_enrollment
                       WHERE source_id = $1",
                     &[&lease.source_id.as_str()],
@@ -1170,6 +1225,29 @@ impl FenceStore for PostgresFenceStore {
                 return Ok(None);
             };
             let mut enrollment = SlotEnrollment::from_control_row(row)?;
+            enrollment.enum_labels = transaction
+                .query(
+                    "SELECT enum_type_oid, label, value_oid, value_xmin, held_from_lsn,
+                            seen_from_lsn
+                       FROM calque_control.source_enum_label
+                      WHERE source_id = $1 AND source_epoch = $2",
+                    &[&lease.source_id.as_str(), &lease.source_epoch.as_str()],
+                )
+                .map_err(store_error)?
+                .into_iter()
+                .map(served_enum_label_from_row)
+                .collect::<Result<_, _>>()?;
+            enrollment.enum_versions = transaction
+                .query(
+                    "SELECT value_oid, value_xmin, seen_from_lsn
+                       FROM calque_control.source_enum_version
+                      WHERE source_id = $1 AND source_epoch = $2",
+                    &[&lease.source_id.as_str(), &lease.source_epoch.as_str()],
+                )
+                .map_err(store_error)?
+                .into_iter()
+                .map(seen_enum_version_from_row)
+                .collect::<Result<_, _>>()?;
             // The canonical log creates its retention table on first connect.
             let log_installed: bool = transaction
                 .query_one(
@@ -1217,8 +1295,8 @@ impl FenceStore for PostgresFenceStore {
                         source_id, source_epoch, slot_name, publication_name,
                         system_identifier, database_name, timeline_id,
                         previous_timeline_id, pgoutput_profile, initial_lsn,
-                        durable_canonical_lsn, publication_fingerprint
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11)
+                        durable_canonical_lsn, publication_fingerprint, enum_labels_from_lsn
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11, $12)
                      ON CONFLICT (source_id) DO NOTHING",
                     &[
                         &enrollment.source_id.as_str(),
@@ -1232,13 +1310,14 @@ impl FenceStore for PostgresFenceStore {
                         &enrollment.pgoutput_profile,
                         &enrollment.initial_lsn_text,
                         &enrollment.publication_fingerprint,
+                        &enrollment.enum_labels_from_lsn_text,
                     ],
                 )
                 .map_err(store_error)?;
             if affected != 1 {
                 return Err(FenceError::SlotLifecycleAlreadyInitialized);
             }
-            Ok(())
+            insert_enum_labels(transaction, lease, &enrollment.enum_labels)
         })
     }
 
@@ -1276,31 +1355,72 @@ impl FenceStore for PostgresFenceStore {
         })
     }
 
-    fn adopt_publication_fingerprint(
+    fn record_enum_labels(
         &self,
         lease: &LeaseIdentity,
-        fingerprint: &str,
+        labels: &[ServedEnumLabel],
     ) -> Result<(), FenceError> {
         self.with_owned_lease(lease, |transaction, current| {
-            if current.phase != LeasePhase::Provisional {
+            if current.phase != LeasePhase::Active {
                 return Err(FenceError::WrongLeasePhase {
-                    expected: LeasePhase::Provisional,
+                    expected: LeasePhase::Active,
+                    actual: current.phase,
+                });
+            }
+            insert_enum_labels(transaction, lease, labels)
+        })
+    }
+
+    fn record_enum_versions(
+        &self,
+        lease: &LeaseIdentity,
+        versions: &[SeenEnumVersion],
+    ) -> Result<(), FenceError> {
+        self.with_owned_lease(lease, |transaction, current| {
+            if current.phase != LeasePhase::Active {
+                return Err(FenceError::WrongLeasePhase {
+                    expected: LeasePhase::Active,
                     actual: current.phase,
                 });
             }
             transaction
                 .execute(
-                    "UPDATE calque_control.source_slot_enrollment
-                        SET publication_fingerprint = $3
-                      WHERE source_id = $1 AND source_epoch = $2
-                        AND publication_fingerprint IS NULL",
+                    "DELETE FROM calque_control.source_enum_version WHERE source_id = $1",
+                    &[&lease.source_id.as_str()],
+                )
+                .map_err(store_error)?;
+            let oids: Vec<i64> = versions
+                .iter()
+                .map(|version| i64::from(version.value.oid))
+                .collect();
+            let xmins: Vec<i64> = versions
+                .iter()
+                .map(|version| i64::from(version.value.xmin))
+                .collect();
+            let positions: Vec<String> = versions
+                .iter()
+                .map(|version| slot_owner::format_lsn(version.seen_from))
+                .collect();
+            let affected = transaction
+                .execute(
+                    "INSERT INTO calque_control.source_enum_version (
+                        source_id, source_epoch, value_oid, value_xmin, seen_from_lsn
+                     )
+                     SELECT $1, $2, version.oid, version.xmin, version.seen_from
+                       FROM unnest($3::int8[], $4::int8[], $5::text[])
+                            AS version(oid, xmin, seen_from)",
                     &[
                         &lease.source_id.as_str(),
                         &lease.source_epoch.as_str(),
-                        &fingerprint,
+                        &oids,
+                        &xmins,
+                        &positions,
                     ],
                 )
                 .map_err(store_error)?;
+            if usize::try_from(affected).ok() != Some(versions.len()) {
+                return Err(FenceError::SlotEnrollmentMismatch);
+            }
             Ok(())
         })
     }
@@ -1574,6 +1694,103 @@ fn validate_ttl(ttl: Duration) -> Result<(), FenceError> {
         return Err(FenceError::InvalidLeaseTtl);
     }
     Ok(())
+}
+
+/// Adds `labels` to the ones `lease`'s enrollment serves. A label the same
+/// value already serves keeps the earlier of each position; one another value
+/// serves is refused, since the working set already carries it. One statement
+/// writes them all: enrollment records every label of every enum, up to
+/// 4,096 for each, while it holds the lease row.
+fn insert_enum_labels(
+    transaction: &mut Transaction<'_>,
+    lease: &LeaseIdentity,
+    labels: &[ServedEnumLabel],
+) -> Result<(), FenceError> {
+    if labels.is_empty() {
+        return Ok(());
+    }
+    let column = |value: fn(&ServedEnumLabel) -> i64| labels.iter().map(value).collect::<Vec<_>>();
+    let enum_types = column(|label| i64::from(label.enum_type));
+    let oids = column(|label| i64::from(label.value.oid));
+    let xmins = column(|label| i64::from(label.value.xmin));
+    let texts: Vec<&str> = labels.iter().map(|label| label.label.as_str()).collect();
+    let held_from: Vec<String> = labels
+        .iter()
+        .map(|label| slot_owner::format_lsn(label.held_from))
+        .collect();
+    let seen_from: Vec<String> = labels
+        .iter()
+        .map(|label| slot_owner::format_lsn(label.seen_from))
+        .collect();
+    let affected = transaction
+        .execute(
+            "INSERT INTO calque_control.source_enum_label AS served (
+                source_id, source_epoch, enum_type_oid, label, value_oid, value_xmin,
+                held_from_lsn, seen_from_lsn
+             )
+             SELECT $1, $2, label.enum_type, label.text, label.oid, label.xmin,
+                    label.held_from, label.seen_from
+               FROM unnest($3::int8[], $4::text[], $5::int8[], $6::int8[], $7::text[],
+                           $8::text[])
+                    AS label(enum_type, text, oid, xmin, held_from, seen_from)
+             ON CONFLICT (source_id, enum_type_oid, label) DO UPDATE
+                SET held_from_lsn = LEAST(served.held_from_lsn::pg_lsn,
+                                          excluded.held_from_lsn::pg_lsn)::text,
+                    seen_from_lsn = LEAST(served.seen_from_lsn::pg_lsn,
+                                          excluded.seen_from_lsn::pg_lsn)::text
+              WHERE served.source_epoch = excluded.source_epoch
+                AND served.value_oid = excluded.value_oid
+                AND served.value_xmin = excluded.value_xmin",
+            &[
+                &lease.source_id.as_str(),
+                &lease.source_epoch.as_str(),
+                &enum_types,
+                &texts,
+                &oids,
+                &xmins,
+                &held_from,
+                &seen_from,
+            ],
+        )
+        .map_err(store_error)?;
+    if usize::try_from(affected).ok() != Some(labels.len()) {
+        return Err(FenceError::SlotEnrollmentMismatch);
+    }
+    Ok(())
+}
+
+fn seen_enum_version_from_row(row: postgres::Row) -> Result<SeenEnumVersion, FenceError> {
+    let oid = |index: usize| {
+        u32::try_from(row.get::<_, i64>(index)).map_err(|_| FenceError::SlotEnrollmentMismatch)
+    };
+    Ok(SeenEnumVersion {
+        value: enum_labels::ValueVersion {
+            oid: oid(0)?,
+            xmin: oid(1)?,
+        },
+        seen_from: pg_walstream::parse_lsn(row.get::<_, &str>(2))
+            .map_err(|_| FenceError::SlotEnrollmentMismatch)?,
+    })
+}
+
+fn served_enum_label_from_row(row: postgres::Row) -> Result<ServedEnumLabel, FenceError> {
+    let oid = |index: usize| {
+        u32::try_from(row.get::<_, i64>(index)).map_err(|_| FenceError::SlotEnrollmentMismatch)
+    };
+    let lsn = |index: usize| {
+        pg_walstream::parse_lsn(row.get::<_, &str>(index))
+            .map_err(|_| FenceError::SlotEnrollmentMismatch)
+    };
+    Ok(ServedEnumLabel {
+        enum_type: oid(0)?,
+        label: row.get(1),
+        value: enum_labels::ValueVersion {
+            oid: oid(2)?,
+            xmin: oid(3)?,
+        },
+        held_from: lsn(4)?,
+        seen_from: lsn(5)?,
+    })
 }
 
 fn store_error(error: postgres::Error) -> FenceError {
@@ -1905,10 +2122,18 @@ mod tests {
             unreachable!("not scripted")
         }
 
-        fn adopt_publication_fingerprint(
+        fn record_enum_labels(
             &self,
             _: &LeaseIdentity,
-            _: &str,
+            _: &[ServedEnumLabel],
+        ) -> Result<(), FenceError> {
+            unreachable!("not scripted")
+        }
+
+        fn record_enum_versions(
+            &self,
+            _: &LeaseIdentity,
+            _: &[SeenEnumVersion],
         ) -> Result<(), FenceError> {
             unreachable!("not scripted")
         }

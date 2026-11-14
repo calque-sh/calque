@@ -56,6 +56,19 @@ struct BindingFields {
     schema_generation: u64,
     source_schema_sha256: String,
     tables: Vec<(TableId, QualifiedTable)>,
+    columns: Vec<RegisteredColumn>,
+}
+
+/// A served column as the registry recorded it, which the catalog must still
+/// hold: PostgreSQL retypes, renames or drops a column without a row change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredColumn {
+    pub table: QualifiedTable,
+    pub relation_oid: u32,
+    pub attribute_number: i16,
+    pub name: String,
+    pub type_oid: u32,
+    pub type_modifier: i32,
 }
 
 impl SchemaRegistryBinding {
@@ -73,6 +86,10 @@ impl SchemaRegistryBinding {
 
     pub fn tables(&self) -> &[(TableId, QualifiedTable)] {
         &self.0.tables
+    }
+
+    pub fn columns(&self) -> &[RegisteredColumn] {
+        &self.0.columns
     }
 }
 
@@ -152,6 +169,24 @@ impl SchemaRegistry {
                 .tables
                 .iter()
                 .map(|table| (table.table_id.clone(), table.inspection.table.clone()))
+                .collect(),
+            columns: self
+                .tables
+                .iter()
+                .flat_map(|table| {
+                    table
+                        .inspection
+                        .columns
+                        .iter()
+                        .map(|column| RegisteredColumn {
+                            table: table.inspection.table.clone(),
+                            relation_oid: table.inspection.relation_oid,
+                            attribute_number: column.attribute_number,
+                            name: column.name.clone(),
+                            type_oid: column.type_oid,
+                            type_modifier: column.type_modifier,
+                        })
+                })
                 .collect(),
         }))
     }

@@ -1,5 +1,6 @@
 import type {
   ArtifactCapacity,
+  ColumnarEnumLabels,
   QueryExecutionOptions,
   QueryResult,
   QuerySpecification,
@@ -32,6 +33,8 @@ export type WorkerRequest =
       readonly capacity?: ArtifactCapacity;
       /** Pool allocated to query structures by the caller's memory plan. */
       readonly queryCapacityBytes?: number;
+      /** The enum columns, which queries order by their declared labels. */
+      readonly enumLabels?: readonly ColumnarEnumLabels[];
       /**
        * Makes the mount live. Absent, the mount is frozen at the artifact's
        * cursor and `change` is refused.

@@ -18,7 +18,7 @@ use mutation_api::{
 };
 use mutation_crud::{
     crud_command_summaries_per_table, register_crud_commands_per_table, CrudOperationName,
-    CrudOperations, PerTableOperations,
+    CrudOperations, DisclosedConstraints, PerTableOperations,
 };
 use mutation_http::{BearerToken, MutationHttpBackend, MutationHttpError};
 use postgres_connect::DropOffRuntime;
@@ -88,8 +88,15 @@ impl LocalMutationSupport {
             "calque-mutations",
         )?;
         install_metadata(&mut client)?;
+        let disclosed = DisclosedConstraints::load(&mut client, prepared.registry.tables())
+            .map_err(LocalSourceError::Postgres)?;
         let mut registry = CommandRegistry::default();
-        register_crud_commands_per_table(&mut registry, prepared.registry.tables(), operations)?;
+        register_crud_commands_per_table(
+            &mut registry,
+            prepared.registry.tables(),
+            operations,
+            &disclosed,
+        )?;
         let capability = CommandCapability::new(
             crud_command_summaries_per_table(prepared.registry.tables(), operations)
                 .into_iter()

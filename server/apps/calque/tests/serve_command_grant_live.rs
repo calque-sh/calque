@@ -1071,6 +1071,148 @@ fn a_command_grant_writes_exactly_the_collection_and_operation_it_names() {
     fixture.drop_source();
 }
 
+/// The name of the constraint a refused write broke, from its outcome.
+fn conflict_constraint(response: &HttpResponse) -> String {
+    assert_eq!(
+        response.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let decoded =
+        MutationBatchResponse::decode(response.body.as_slice()).expect("a protobuf response");
+    let outcome = &decoded.outcomes[0];
+    assert_eq!(
+        outcome.code,
+        MutationOutcomeCode::Conflict as i32,
+        "{outcome:?}"
+    );
+    let conflict = outcome.conflict.as_ref().expect("a conflict has details");
+    assert_eq!(conflict.kind, "constraint");
+    String::from_utf8(conflict.application_payload.clone()).unwrap()
+}
+
+/// A refused write names the constraint it broke only when the constraint is
+/// the written table's own and reads served columns alone. A name can spell
+/// out a column the publication's column list hides, or a table the client
+/// was never shown. mutation-crud's catalog test covers every constraint
+/// shape; this one covers the path to the browser.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn a_refused_write_names_only_its_own_tables_constraints_on_listed_columns() {
+    let _exclusive = exclusive();
+    let fixture = Fixture::new("disclosure");
+    fixture.seed_tables();
+    let tasks = fixture.tasks();
+    let notes = fixture.notes();
+    let links = format!("links_{}", fixture.suffix);
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..12];
+    let title_unique = format!("title_unique_{tag}");
+    let status_secret_unique = format!("status_secret_unique_{tag}");
+    let blocked_needs_secret = format!("blocked_needs_secret_{tag}");
+    let status_unique_unset = format!("status_unique_unset_{tag}");
+    let body_not_empty = format!("body_not_empty_{tag}");
+    Client::connect(&fixture.owner_url, NoTls)
+        .unwrap()
+        .batch_execute(&format!(
+            "ALTER TABLE {tasks} REPLICA IDENTITY DEFAULT;
+             ALTER TABLE {tasks} ADD COLUMN secret text;
+             UPDATE {tasks} SET secret = 'a' WHERE id IN ('{row0}', '{row1}');
+             UPDATE {tasks} SET status = 'closed' WHERE id = '{row1}';
+             UPDATE {tasks} SET status = 'waiting' WHERE id = '{row3}';
+             ALTER TABLE {tasks} ADD CONSTRAINT {title_unique} UNIQUE (title);
+             ALTER TABLE {tasks} ADD CONSTRAINT {status_secret_unique} UNIQUE (status, secret);
+             ALTER TABLE {tasks} ADD CONSTRAINT {blocked_needs_secret}
+                 CHECK (status <> 'blocked' OR secret IS NOT NULL);
+             CREATE UNIQUE INDEX {status_unique_unset} ON {tasks} (status) WHERE secret IS NULL;
+             ALTER TABLE {notes} ADD CONSTRAINT {body_not_empty} CHECK (body <> '');
+             CREATE TABLE {links} (note_id uuid NOT NULL REFERENCES {notes} (id));
+             INSERT INTO {links} VALUES ('{row3}');
+             CREATE PUBLICATION {publication} FOR TABLE {tasks} (id, title, status), {notes};",
+            row0 = row_id(0),
+            row1 = row_id(1),
+            row3 = row_id(3),
+            publication = fixture.publication(),
+        ))
+        .unwrap();
+    let serving = serve(&fixture);
+    let grant = fixture.grant(
+        vec![
+            capability(&tasks, &[GrantCommandOperation::Update]),
+            capability(
+                &notes,
+                &[GrantCommandOperation::Update, GrantCommandOperation::Delete],
+            ),
+        ],
+        1,
+        unix_seconds(),
+        600,
+    );
+    let plan = bootstrap(
+        serving.port,
+        &grant,
+        &[format!("public.{tasks}"), format!("public.{notes}")],
+    );
+    let task_table = plan.table(&tasks);
+    let note_table = plan.table(&notes);
+    let refused = |envelope| post_mutation(serving.port, &grant, &plan, envelope);
+
+    // On listed columns: the client may act on the name.
+    assert_eq!(
+        conflict_constraint(&refused(update(
+            &plan,
+            task_table,
+            row_id(1),
+            "title",
+            "task 0"
+        ))),
+        title_unique
+    );
+    // Each of these reads the hidden column, in its key, its check or its
+    // predicate, so its name could spell that column out.
+    for (row, status, constraint) in [
+        (1, "open", &status_secret_unique),
+        (2, "blocked", &blocked_needs_secret),
+        (3, "open", &status_unique_unset),
+    ] {
+        assert_eq!(
+            conflict_constraint(&refused(update(
+                &plan,
+                task_table,
+                row_id(row),
+                "status",
+                status
+            ))),
+            "",
+            "{constraint}"
+        );
+    }
+    // A table published whole names its own constraint...
+    assert_eq!(
+        conflict_constraint(&refused(update(&plan, note_table, row_id(0), "body", ""))),
+        body_not_empty
+    );
+    // ...and none of the table referencing it, which the client was never
+    // shown.
+    let delete = envelope(
+        &plan,
+        note_table,
+        &format!("mutation-{}", uuid::Uuid::new_v4()),
+        row_id(3),
+        OperationKind::DeleteByKey,
+        Payload::Delete(Delete {}),
+    );
+    assert_eq!(conflict_constraint(&refused(delete)), "");
+    assert_eq!(fixture.title_of(1).as_deref(), Some("task 1"));
+    assert_eq!(fixture.body_of(3).as_deref(), Some("note 3"));
+
+    assert!(serving.shutdown(), "serve must exit cleanly on SIGTERM");
+    let _ = Client::connect(&database_url(), NoTls)
+        .unwrap()
+        .batch_execute(&format!("DROP TABLE IF EXISTS {links}"));
+    fixture.drop_source();
+}
+
 #[test]
 #[ignore = "requires TEST_DATABASE_URL"]
 fn an_expired_forged_or_replayed_capability_writes_nothing() {
@@ -1391,11 +1533,29 @@ fn rewrite_payload(token: &str, from: &str, to: &str) -> String {
 /// privileges on the tables. Before the publication exists, serve refuses
 /// and prints the statement the tables' owner runs; once it does, serve
 /// writes a row, and `calque destroy` keeps the publication it did not make.
+///
+/// No superuser takes part. The role that creates the database, the tables,
+/// the publication and serve's role has `CREATEROLE`, `CREATEDB` and
+/// `REPLICATION` and nothing more, which stands in for a managed database's
+/// admin role; it is not a trial on any provider.
 #[test]
 #[ignore = "requires TEST_DATABASE_URL"]
 fn a_role_that_owns_no_table_serves_writes_and_destroys_without_dropping_the_publication() {
     let _exclusive = exclusive();
     let fixture = Fixture::least_privilege("leastpriv");
+    let attributes = |url: &str| -> (bool, bool, bool, bool) {
+        let row = Client::connect(url, NoTls)
+            .unwrap()
+            .query_one(
+                "SELECT rolsuper, rolcreaterole, rolreplication, rolbypassrls
+                   FROM pg_catalog.pg_roles WHERE rolname = current_user",
+                &[],
+            )
+            .unwrap();
+        (row.get(0), row.get(1), row.get(2), row.get(3))
+    };
+    assert_eq!(attributes(&fixture.owner_url), (false, true, true, false));
+    assert_eq!(attributes(&fixture.serve_url), (false, false, true, false));
 
     let refused = serve_until_exit(&fixture);
     let statement = format!(

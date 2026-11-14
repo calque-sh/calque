@@ -1806,6 +1806,7 @@ export class ColumnarSession {
       artifact,
       trusted,
       contract: planContract,
+      enumLabels,
     } = bindColumnarPlan(this.#collections, plan);
     // With no key configured, the mount refuses every barrier.
     const contract = this.#options.grantVerificationKey
@@ -1850,6 +1851,7 @@ export class ColumnarSession {
       plan.memory.queryResultReserveBytes,
       download.signal,
       contract,
+      enumLabels,
     );
     // The decoder worker of the response being read, when the plan selected
     // `brotli-large-window` or `packed-brotli-large-window`. No other plan

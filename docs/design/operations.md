@@ -525,7 +525,7 @@ land where the other store looks for them. And the object half of the oracle is
 one definition rather than one per store: the SHA-256 of the objects the unit's
 own catalog publishes, in that order, read off the tree or out of the bucket.
 
-A unit's manifest records `formatVersion` 3, and `restore` and
+A unit's manifest records `formatVersion` 4, and `restore` and
 `verify-restore` read only that version. A unit of any other version is refused
 before anything is read, uploaded or committed, with a message that says to
 restore it with the release that took it or take a fresh one with `backup`.
@@ -744,9 +744,7 @@ start or reconnect reads them too. Any `ALTER PUBLICATION`, or dropping and
 creating the publication again, stops the runtime, even when the definition
 `sources[].publication` requires is put back: pgoutput leaves out what an
 altered definition does not publish, from the alteration's commit on, so the
-working set may miss those changes. Adding or renaming a value of an enum an
-enrolled column uses stops it the same way, because the rows holding a renamed
-label change with no row change in the WAL. The `failure` field names the
+working set may miss those changes. The `failure` field names the
 publication. When the process is then stopped, it prints the refusal a start
 that meets the same publication prints, then `Restore the publication's
 definition if it was altered, then run calque destroy ... and rerun serve to
@@ -754,6 +752,29 @@ prepare the working set anew` (`dev` under `calque dev`). Destroy drops only a
 publication Calque's role owns and that it can verify, which is why the
 definition is restored first. Changing the publication's owner counts as an
 alteration too.
+
+The same reads cover every enum a published column uses, directly or through
+domains. Adding a value keeps the runtime serving. Renaming a value
+Calque enrolled or has served, or giving its label to another value, stops it
+with `state_must_be_destroyed` `true` and a `failure` that names the enum and
+the label: the rows holding the value now carry another label, and the WAL
+logged no row change. Two cases stop it the same way with nothing served
+wrong: PostgreSQL renumbering an enum, which it does after many values were
+added before one another, and a row that takes a new value while another value
+of the same enum changed and no read saw either change before the row, as with
+two values added while Calque was stopped, or within the second before a row
+takes one while the runtime streams. Adding values while it runs, a few
+seconds before a row takes one, avoids the second. An enum grown past the
+4,096 labels Calque serves stops the runtime with `state_must_be_destroyed`
+`false` and a `failure` that names the column, and a start refuses it.
+
+The reads also cover the definition of every published column. Dropping or
+renaming one, or changing its type or type modifier, stops the runtime with
+`state_must_be_destroyed` `true` and a `failure` that names the table and the
+column: PostgreSQL applies each to every row and logs no row change.
+`ALTER COLUMN ... TYPE` to the column's own type and modifier with a `USING`
+expression rewrites every value and leaves the definition as it was, so
+nothing stops for it: run `calque destroy` and restart after one.
 
 #### When the server is stopped or killed
 
@@ -936,6 +957,15 @@ state directory another build wrote, and name the command that clears it:
   <NAME> --yes, then rerun <command> to prepare the working set anew.
   ```
 
+- a source an earlier release enrolled, which recorded no enum labels:
+
+  ```text
+  this source was enrolled by an earlier release of calque, which did not
+  record the enum labels it serves, so this release cannot resume it. Run
+  calque destroy --state-dir <dir> --database-url-env <NAME> --yes, then
+  rerun <command> to prepare the working set anew.
+  ```
+
 - a published artifact whose stored manifest this build's contract refuses,
   because another build wrote it or it is damaged;
 - an interrupted build of an artifact this build does not make.
@@ -948,11 +978,10 @@ for the incidents demo). `<command>` is `dev` or `serve`, whichever refused, and
 database URL from the variable its own `--database-url-env` names, so the
 printed line connects to the source the refusing command read.
 
-Recovery units follow the same rule, with one exception: `restore` and
-`verify-restore` read the unit format this build writes, version 3, and
-version 2, which lacks only the log's compaction watermark and restores with
-none recorded. An older unit is refused with the remedy named (see
-"Backup and restore against the composition").
+Recovery units follow the same rule: `restore` and `verify-restore` read only
+the unit format this build writes, version 4, which carries the enum labels
+the source serves. An older unit is refused with the remedy named
+(see "Backup and restore against the composition").
 
 ## Tenants
 

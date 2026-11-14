@@ -1674,10 +1674,9 @@ fn a_publication_altered_while_serving_stops_cdc_and_exits_naming_its_remedy() {
         .unwrap();
 
     let drift = format!(
-        "the PostgreSQL publication {} was altered, or an enum its columns use gained or \
-         renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, \
-         update, delete and truncate, without publish_via_partition_root or row filters, with \
-         the column lists and enum values it had at enrollment.",
+        "the PostgreSQL publication {} was altered: Calque needs it to publish exactly the \
+         enrolled tables, for insert, update, delete and truncate, without \
+         publish_via_partition_root or row filters, with the column lists it had at enrollment.",
         fixture.publication(),
     );
     let deadline = Instant::now() + DELIVERY_TIMEOUT;

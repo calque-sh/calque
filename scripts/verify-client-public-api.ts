@@ -725,6 +725,7 @@ const CORE_ROOT_TYPES: readonly string[] = [
   "CanonicalTruncate",
   "CanonicalUpdate",
   "ColumnChange",
+  "ColumnarEnumLabels",
   "ColumnarQueryCapacity",
   "DirectColumnarArtifactIdentity",
   "DirectColumnarColumnKind",
@@ -775,7 +776,7 @@ const CORE_ROOT_TYPES: readonly string[] = [
 // Every declaration reachable from `dist/index.d.ts`, digested, so a changed
 // field type or a widened union fails the gate.
 const CORE_DECLARATION_GRAPH_SHA256 =
-  "975591e5bb2b1586087af2db40406058c22d2b486523b6a63020c852737e5e52";
+  "9c9e63d6200fccfc52b1fb8c0f6221f616c3181fd374baa2a95bc3cb154c0fce";
 // Core is the bottom of the client stack and names no package above it.
 const CORE_FORBIDDEN_UPWARD_PACKAGES: readonly string[] = [
   "@calque/client",

@@ -29,7 +29,10 @@ use source_control::SchemaRegistry;
 use sync_types::{CursorPosition, MutationId, SourceEpoch, SourceId};
 use thiserror::Error;
 
-use crate::{ActiveLease, ActiveSourceSession, FenceAuthority, FenceError, PostgresFenceStore};
+use crate::{
+    enum_labels::{EnumLabelGuard, GuardError},
+    ActiveLease, ActiveSourceSession, FenceAuthority, FenceError, PostgresFenceStore,
+};
 
 const MAX_BOUNDED_TRANSACTIONS: usize = 10_000;
 const MAX_INGEST_DURATION: Duration = Duration::from_secs(300);
@@ -483,6 +486,20 @@ pub enum PersistentIngestError {
         "PostgreSQL replication stream carried nothing for {0:?}, even after a reply was requested"
     )]
     ReplicationSilent(Duration),
+    #[error(transparent)]
+    EnumLabel(#[from] crate::EnumLabelDrift),
+    #[error("reading the source's enum values failed or returned an uncertain result; if this persists, check that PostgreSQL is running, reachable at the address in the database URL, and has free connections (max_connections)")]
+    EnumReadingUnavailable,
+}
+
+impl From<GuardError> for PersistentIngestError {
+    fn from(error: GuardError) -> Self {
+        match error {
+            GuardError::Drift(drift) => Self::EnumLabel(drift),
+            GuardError::Reading => Self::EnumReadingUnavailable,
+            GuardError::Fence(error) => Self::Fence(error),
+        }
+    }
 }
 
 impl PersistentIngestError {
@@ -494,7 +511,9 @@ impl PersistentIngestError {
             Self::SessionClosed
             | Self::MutationReceiptUnavailable
             | Self::ReplicationUnavailable
-            | Self::ReplicationSilent(_) => PersistentIngestDisposition::Retry,
+            | Self::ReplicationSilent(_)
+            | Self::EnumReadingUnavailable => PersistentIngestDisposition::Retry,
+            Self::EnumLabel(_) => PersistentIngestDisposition::EpochReseed,
             Self::RegistryBindingMismatch => PersistentIngestDisposition::Resnapshot,
             Self::CanonicalLog(error) => log_disposition(error),
             Self::Decoder(_) => PersistentIngestDisposition::OperatorAction,
@@ -926,6 +945,7 @@ impl ActiveSourceSession {
                 &mut self.ingest_state.pending_events,
                 &mut self.ingest_state.silence,
                 ingest,
+                &mut self.enum_guard,
                 &self.authority,
                 &self.lease,
                 &observer,
@@ -977,6 +997,7 @@ fn run_ingest_loop<A, F, N>(
     pending_events: &mut VecDeque<DecoderEvent>,
     silence: &mut StreamSilence,
     ingest: &mut IngestSession<A, F, N>,
+    enum_guard: &mut EnumLabelGuard,
     authority: &Arc<FenceAuthority<PostgresFenceStore>>,
     lease: &ActiveLease,
     observer: &Arc<dyn PersistentIngestObserver>,
@@ -1030,6 +1051,8 @@ where
             }
             let transactions = group.len();
             let stamps = DeliveryStamps::of(&group, stats.newest_send_postgres_micros);
+            // A label is recorded as served before the append that serves it.
+            enum_guard.verify(&group, |labels| authority.record_enum_labels(lease, labels))?;
             let pending = ingest.ingest_group(group)?;
             let authorized = ingest.authorize_ack(pending)?;
             stamps.appended(transactions);
@@ -1672,6 +1695,20 @@ mod tests {
             })
             .disposition(),
             PersistentIngestDisposition::Resnapshot
+        );
+        assert_eq!(
+            PersistentIngestError::EnumReadingUnavailable.disposition(),
+            PersistentIngestDisposition::Retry
+        );
+        // The canonical log already holds rows with the label, so a new
+        // snapshot under the same epoch would leave them to every replay.
+        assert_eq!(
+            PersistentIngestError::EnumLabel(crate::EnumLabelDrift::Gone {
+                enum_type: "mood".to_owned(),
+                label: "calm".to_owned(),
+            })
+            .disposition(),
+            PersistentIngestDisposition::EpochReseed
         );
     }
 }

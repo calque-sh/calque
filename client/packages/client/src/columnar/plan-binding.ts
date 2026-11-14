@@ -1,4 +1,5 @@
 import type {
+  ColumnarEnumLabels,
   DirectColumnarColumnKind,
   DirectColumnarTableSchema,
   TrustedArtifact,
@@ -54,6 +55,12 @@ interface BoundColumnarPlan {
   readonly trusted: TrustedArtifact;
   /** The change contract the plan's wire column ids compile to. */
   readonly contract: ColumnarChangeContract;
+  /**
+   * Each enum column's labels in declaration order, which the server reads
+   * when it starts, so a value added since the bindings were generated still
+   * orders as PostgreSQL orders it.
+   */
+  readonly enumLabels: readonly ColumnarEnumLabels[];
 }
 
 function invalid(detail: string): SyncError {
@@ -271,6 +278,19 @@ export function bindColumnarPlan(
     artifact,
     trusted,
     contract: changeContract(plan, runtime),
+    enumLabels: runtime.tables.flatMap((table) =>
+      (table.columns ?? []).flatMap(({ name, enumLabels }) =>
+        enumLabels === undefined
+          ? []
+          : [
+              {
+                collection: table.localTable,
+                column: name,
+                labels: enumLabels,
+              },
+            ],
+      ),
+    ),
   });
 }
 

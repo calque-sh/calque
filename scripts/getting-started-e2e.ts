@@ -64,8 +64,7 @@ import {
 const STOP = "## Production";
 const SKIPPED_SECTIONS = ["### With the container"] as const;
 const DEV_START = [
-  "calque dev --table public.tasks \\",
-  "  --public-base-url http://127.0.0.1:5173/_calque/ \\",
+  "calque dev --public-base-url http://127.0.0.1:5173/_calque/ \\",
   "  --acknowledge-disposable-source",
 ].join("\n");
 const PAGE_START = "npx vite";

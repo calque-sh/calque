@@ -480,4 +480,40 @@ describe("direct-columnar bootstrap plans", () => {
       "duplicate column IDs",
     );
   });
+
+  it("reads an enum column's labels in declared order, and refuses a list no enum has", () => {
+    const withLabels = (labels: unknown) => {
+      const value = columnarPlan();
+      const column = (
+        firstRuntimeTable(firstArtifact(value).runtime as Mutable)
+          .columns as Mutable[]
+      )[1];
+      if (!column) throw new Error("fixture column missing");
+      column.enumLabels = labels;
+      return value;
+    };
+    const runtime = parseBootstrapPlan(withLabels(["todo", "doing", ""]))
+      .artifacts[0]?.runtime;
+    if (runtime?.format !== "directColumnar")
+      throw new Error("fixture runtime is not direct columnar");
+    expect(runtime.tables[0]?.columns).toEqual([
+      { columnId: 1, name: "id" },
+      { columnId: 2, name: "title", enumLabels: ["todo", "doing", ""] },
+    ]);
+
+    for (const [labels, message] of [
+      [[], "must hold 1 to 4096 labels"],
+      [Array.from({ length: 4_097 }, (_, index) => `l${index}`), "4096"],
+      ["todo", "enumLabels"],
+      [["todo", 1], "enumLabels[1] must be a text"],
+      [["x".repeat(64)], "at most 63 characters"],
+      [["todo", "todo"], "duplicate labels"],
+    ] as const)
+      expect(() => parseBootstrapPlan(withLabels(labels)), message).toThrow(
+        message,
+      );
+    expect(() =>
+      parseBootstrapPlan(withLabels(["x".repeat(63)])),
+    ).not.toThrow();
+  });
 });

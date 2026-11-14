@@ -610,20 +610,31 @@ fn artifact_bytes(port: u16, artifact: &Value) -> Vec<u8> {
 /// A publication's column list keeps the columns it leaves out inside
 /// PostgreSQL: neither the plan, the artifact nor the log holds a hidden
 /// value, while an enum column arrives as its label's text and a domain
-/// column as its base type. Renaming an enum value then stops CDC, since it
-/// changes every row holding the value without a row change.
+/// column as its base type. The plan names each enum column's labels in
+/// declaration order, a domain over an enum included, so the browser orders
+/// them as PostgreSQL does. A value added to the enum is served with no
+/// rebuild, and the next plans name it in its declared place. Renaming a
+/// value then stops CDC, since it changes every row holding the value without
+/// a row change.
 #[test]
 #[ignore = "requires TEST_DATABASE_URL"]
 fn a_column_list_keeps_hidden_values_in_postgres_and_enums_arrive_as_labels() {
     let _exclusive = exclusive();
     let mut fixture = Fixture::new("listed");
     let mood = format!("mood_{}", fixture.suffix);
+    let pace = format!("pace_{}", fixture.suffix);
     let points = format!("points_{}", fixture.suffix);
     let hidden = format!("hidden-{}", uuid::Uuid::new_v4().simple());
     let mut client = Client::connect(&database_url(), NoTls).unwrap();
     client
         .batch_execute(&format!(
             "CREATE TYPE {mood} AS ENUM ('calm', 'busy');
+             ALTER TYPE {mood} ADD VALUE 'idle' BEFORE 'calm';"
+        ))
+        .unwrap();
+    client
+        .batch_execute(&format!(
+            "CREATE DOMAIN {pace} AS {mood};
              CREATE DOMAIN {points} AS int4 CHECK (VALUE >= 0);
              CREATE TABLE {table} (
                  id uuid NOT NULL PRIMARY KEY,
@@ -631,16 +642,17 @@ fn a_column_list_keeps_hidden_values_in_postgres_and_enums_arrive_as_labels() {
                  status text NOT NULL,
                  mood {mood} NOT NULL,
                  points {points} NOT NULL,
+                 pace {pace},
                  secret text NOT NULL,
                  elapsed interval
              );
              CREATE PUBLICATION {publication}
-                 FOR TABLE {table} (id, title, status, mood, points);
+                 FOR TABLE {table} (id, title, status, mood, points, pace);
              INSERT INTO {table} VALUES
                  ('00000000-0000-0000-0000-000000000001', 'listed title 1', 'open', 'calm', 3,
-                  '{hidden}', '1 hour'),
+                  'idle', '{hidden}', '1 hour'),
                  ('00000000-0000-0000-0000-000000000002', 'listed title 2', 'open', 'busy', 5,
-                  '{hidden}', '2 hours');",
+                  NULL, '{hidden}', '2 hours');",
             table = fixture.table(),
             publication = fixture.publication(),
         ))
@@ -651,6 +663,7 @@ fn a_column_list_keeps_hidden_values_in_postgres_and_enums_arrive_as_labels() {
         { "name": "status", "postgresType": "text", "nullable": false },
         { "name": "mood", "postgresType": "text", "nullable": false },
         { "name": "points", "postgresType": "int4", "nullable": false },
+        { "name": "pace", "postgresType": "text", "nullable": true },
     ]);
     let serving = serve(
         &fixture,
@@ -659,7 +672,7 @@ fn a_column_list_keeps_hidden_values_in_postgres_and_enums_arrive_as_labels() {
             "kind": "crud",
             "collection": fixture.table(),
             "operations": ["update"],
-            "writableColumns": ["title", "status", "mood", "points"],
+            "writableColumns": ["title", "status", "mood", "points", "pace"],
         }]),
     );
 
@@ -677,13 +690,37 @@ fn a_column_list_keeps_hidden_values_in_postgres_and_enums_arrive_as_labels() {
     );
     let plan = response.json();
     let artifact = &plan["artifacts"][0];
-    let names: Vec<&str> = artifact["runtime"]["schema"]["tables"][0]["columns"]
+    let columns = artifact["runtime"]["schema"]["tables"][0]["columns"]
         .as_array()
-        .unwrap_or_else(|| panic!("plan names no columns: {plan}"))
+        .unwrap_or_else(|| panic!("plan names no columns: {plan}"));
+    let names: Vec<&str> = columns
         .iter()
         .map(|column| column["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["id", "title", "status", "mood", "points"], "{plan}");
+    assert_eq!(
+        names,
+        ["id", "title", "status", "mood", "points", "pace"],
+        "{plan}"
+    );
+    let labels: Vec<&Value> = artifact["runtime"]["tables"][0]["columns"]
+        .as_array()
+        .unwrap_or_else(|| panic!("plan names no wire columns: {plan}"))
+        .iter()
+        .map(|column| &column["enumLabels"])
+        .collect();
+    let declared = serde_json::json!(["idle", "calm", "busy"]);
+    assert_eq!(
+        labels,
+        [
+            &Value::Null,
+            &Value::Null,
+            &Value::Null,
+            &declared,
+            &Value::Null,
+            &declared
+        ],
+        "{plan}"
+    );
     assert!(!plan.to_string().contains(&hidden), "{plan}");
 
     let bytes = artifact_bytes(serving.port, artifact);
@@ -711,7 +748,7 @@ fn a_column_list_keeps_hidden_values_in_postgres_and_enums_arrive_as_labels() {
         .batch_execute(&format!(
             "INSERT INTO {table} VALUES
                  ('00000000-0000-0000-0000-000000000003', 'listed title 3', 'open', 'busy', 8,
-                  '{hidden}', '3 hours');
+                  'busy', '{hidden}', '3 hours');
              UPDATE {table} SET secret = '{hidden}-changed', title = 'listed title 1b'
               WHERE id = '00000000-0000-0000-0000-000000000001';",
             table = fixture.table(),
@@ -743,10 +780,64 @@ fn a_column_list_keeps_hidden_values_in_postgres_and_enums_arrive_as_labels() {
         .find(|operation| operation["kind"] == "INSERT_FULL_ROW")
         .unwrap_or_else(|| panic!("no insert in {entry}"));
     let cells = cells(&insert["columns"]);
-    assert_eq!(cells.len(), 5, "{insert}");
+    assert_eq!(cells.len(), 6, "{insert}");
     assert_eq!(text(cells[&4]), "busy");
     assert_eq!(cells[&5]["kind"], "INT64", "{insert}");
     assert_eq!(cells[&5]["value"], 8, "{insert}");
+    assert_eq!(text(cells[&6]), "busy");
+
+    client
+        .batch_execute(&format!("ALTER TYPE {mood} ADD VALUE 'away' BEFORE 'busy'"))
+        .unwrap();
+    let mut transaction = client.transaction().unwrap();
+    transaction
+        .batch_execute(&format!(
+            "INSERT INTO {table} VALUES
+                 ('00000000-0000-0000-0000-000000000004', 'listed title 4', 'open', 'away', 13,
+                  'away', '{hidden}', '4 hours');",
+            table = fixture.table(),
+        ))
+        .unwrap();
+    let xid: i64 = transaction
+        .query_one("SELECT pg_current_xact_id()::text::bigint", &[])
+        .unwrap()
+        .get(0);
+    transaction.commit().unwrap();
+    wait_until("the added value is logged", &serving.stderr, || {
+        logged(&mut control, &source_id, xid)
+    });
+    let records = canonical_records(&mut control, &source_id);
+    let (_, entry) = records
+        .iter()
+        .find(|(_, entry)| entry.to_string().contains("listed title 4"))
+        .expect("the added value's record");
+    let added = crate::cells(&entry["record"]["operations"][0]["columns"]);
+    assert_eq!(text(added[&4]), "away");
+    assert_eq!(text(added[&6]), "away");
+    assert!(
+        !serving
+            .stderr
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("CDC runtime stopped")),
+        "CDC stopped on an added enum value"
+    );
+    // A plan made once the session reads the enum again names the added
+    // label where the type declares it, so the browser orders it as
+    // PostgreSQL does without a restart.
+    let added_labels = serde_json::json!(["idle", "calm", "away", "busy"]);
+    wait_until("a plan names the added label", &serving.stderr, || {
+        let plan = bootstrap(
+            serving.port,
+            &fixture.grant(1, 600),
+            &format!("public.{}", fixture.table()),
+            "identity",
+        )
+        .json();
+        let columns = &plan["artifacts"][0]["runtime"]["tables"][0]["columns"];
+        columns[3]["enumLabels"] == added_labels && columns[5]["enumLabels"] == added_labels
+    });
 
     client
         .batch_execute(&format!(
@@ -771,7 +862,7 @@ fn a_column_list_keeps_hidden_values_in_postgres_and_enums_arrive_as_labels() {
     );
     fixture.drop_source();
     let _ = client.batch_execute(&format!(
-        "DROP TYPE IF EXISTS {mood}; DROP DOMAIN IF EXISTS {points};"
+        "DROP DOMAIN IF EXISTS {pace}; DROP TYPE IF EXISTS {mood}; DROP DOMAIN IF EXISTS {points};"
     ));
 }
 

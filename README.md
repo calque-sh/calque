@@ -73,8 +73,9 @@ schema:
   backend code runs on a write yet.
 - The source must be PostgreSQL 18. Under `calque serve`, Calque's role needs
   `REPLICATION`, read access to the tables and write access if pages write,
-  and owns none of them; `calque dev` creates its own publication, so its role
-  owns the tables it serves. Enums and domains are carried as their text or
+  and owns none of them; `calque dev` creates its own publication when its
+  role owns the tables, and otherwise names the statement for their owner to
+  run. Enums and domains are carried as their text or
   base type; arrays, ranges, extension types, published generated columns and
   partitioned tables are refused
   ([What Calque needs from PostgreSQL](docs/postgresql.md)).

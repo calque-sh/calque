@@ -16,7 +16,7 @@ use mutation_api::{
     AffectedKey, CommandContext, CommandFailure, CommandFootprint, CommandOperation,
     MutationCommand,
 };
-use postgres::{types::ToSql, Transaction};
+use postgres::{error::DbError, types::ToSql, GenericClient, Transaction};
 use prost::Message;
 use source_control::{quote_identifier, ColumnInspection, PostgresTypeCodec, RegisteredTable};
 use sync_protocol::{
@@ -144,6 +144,11 @@ pub struct CrudCommand {
     name: &'static str,
     table_id: TableId,
     qualified_table: String,
+    /// The table's schema and name as PostgreSQL reports them in an error.
+    schema: String,
+    table: String,
+    /// The constraint names a refusal may report.
+    disclosed_constraints: BTreeSet<String>,
     columns: Vec<CrudColumn>,
     by_column_id: BTreeMap<u32, usize>,
     /// Column ids in the table's key order.
@@ -205,16 +210,36 @@ impl CrudCommand {
             // price of that signature.
             name: Box::leak(Self::name_for(&table.table_id).into_boxed_str()),
             table_id: table.table_id.clone(),
-            qualified_table: format!(
-                "{}.{}",
-                quote_identifier(&table.inspection.table.schema),
-                quote_identifier(&table.inspection.table.table)
-            ),
+            qualified_table: relation(table),
+            schema: table.inspection.table.schema.clone(),
+            table: table.inspection.table.table.clone(),
+            disclosed_constraints: BTreeSet::new(),
             columns,
             by_column_id,
             key: key_ordinals.into_iter().map(|(_, id)| id).collect(),
             operations,
         })
+    }
+
+    /// This command, reporting the constraint names `disclosed` loaded for
+    /// its table and no other.
+    fn disclosing(mut self, disclosed: &DisclosedConstraints) -> Self {
+        if let Some(loaded) = disclosed.0.get(&self.table_id) {
+            self.disclosed_constraints.clone_from(loaded);
+        }
+        self
+    }
+
+    /// Whether a refusal may name the constraint `error` reports: one of this
+    /// table's own that [`DisclosedConstraints`] loaded, so the constraint of
+    /// a referencing table or of a table a trigger writes stays unnamed.
+    fn names_constraint(&self, error: &DbError) -> bool {
+        let Some(constraint) = error.constraint() else {
+            return false;
+        };
+        error.schema() == Some(self.schema.as_str())
+            && error.table() == Some(self.table.as_str())
+            && self.disclosed_constraints.contains(constraint)
     }
 
     /// Column names a patch may change, in catalog order.
@@ -553,7 +578,7 @@ impl MutationCommand for CrudCommand {
             .collect();
         let affected = transaction
             .execute(statement.sql.as_str(), &parameters)
-            .map_err(classify_postgres_error)?;
+            .map_err(|error| classify_postgres_error(error, |db| self.names_constraint(db)))?;
         if affected == 0 && parsed.kind != OperationKind::InsertFullRow {
             return Err(CommandFailure::Conflict {
                 kind: "row-missing".to_owned(),
@@ -607,12 +632,106 @@ pub fn register_crud_commands_per_table(
     registry: &mut mutation_api::CommandRegistry,
     tables: &[RegisteredTable],
     operations: &PerTableOperations,
+    disclosed: &DisclosedConstraints,
 ) -> Result<(), mutation_api::MutationBatchError> {
     for command in crud_commands_per_table(tables, operations) {
-        registry.register(command)?;
+        registry.register(command.disclosing(disclosed))?;
     }
     Ok(())
 }
+
+/// The constraint names a refused write may report on each table: those of
+/// the table's own constraints and indexes that read served columns alone, as
+/// the catalog holds them when the commands are registered. A constraint made
+/// later goes unnamed until the next start, and the default reports none, so a
+/// name that could spell out a column the client is never sent does not reach
+/// it.
+#[derive(Debug, Clone, Default)]
+pub struct DisclosedConstraints(BTreeMap<TableId, BTreeSet<String>>);
+
+impl DisclosedConstraints {
+    pub fn load(
+        client: &mut impl GenericClient,
+        tables: &[RegisteredTable],
+    ) -> Result<Self, postgres::Error> {
+        let relations: Vec<String> = tables.iter().map(relation).collect();
+        let (served_relations, served_columns): (Vec<&str>, Vec<&str>) = tables
+            .iter()
+            .zip(&relations)
+            .flat_map(|(table, relation)| {
+                table
+                    .inspection
+                    .columns
+                    .iter()
+                    .map(move |column| (relation.as_str(), column.name.as_str()))
+            })
+            .unzip();
+        let mut by_table = BTreeMap::new();
+        for (table, relation) in tables.iter().zip(&relations) {
+            let names = client
+                .query(
+                    DISCLOSED_CONSTRAINTS_SQL,
+                    &[relation, &served_relations, &served_columns],
+                )?
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            by_table.insert(table.table_id.clone(), names);
+        }
+        Ok(Self(by_table))
+    }
+}
+
+fn relation(table: &RegisteredTable) -> String {
+    format!(
+        "{}.{}",
+        quote_identifier(&table.inspection.table.schema),
+        quote_identifier(&table.inspection.table.table)
+    )
+}
+
+/// A constraint qualifies when every column it reads is served. `conkey`
+/// holds the columns of a key or a check, a whole-row reference or an
+/// expression counting as attribute 0, which no served column has. The index
+/// behind a key or an exclusion holds what `conkey` leaves out, its included
+/// columns and predicate, and its `indkey` counts an expression as 0 too. A
+/// foreign key also reads the referenced table's columns. A unique index
+/// qualifies on the same terms. The catalog's dependency rows are not used:
+/// they drop a column reference that sits beside a whole-row one.
+const DISCLOSED_CONSTRAINTS_SQL: &str = "
+    WITH served AS (
+           SELECT attribute.attrelid AS relation, attribute.attnum
+             FROM unnest($2::text[], $3::text[]) AS served_column(relation, name)
+             JOIN pg_catalog.pg_attribute AS attribute
+               ON attribute.attrelid = to_regclass(served_column.relation)
+              AND attribute.attname = served_column.name
+            WHERE attribute.attnum > 0
+              AND NOT attribute.attisdropped),
+         target AS (
+           SELECT to_regclass($1) AS oid,
+                  ARRAY(SELECT served.attnum FROM served
+                         WHERE served.relation = to_regclass($1)) AS listed)
+    SELECT constraint_row.conname::text
+      FROM pg_catalog.pg_constraint AS constraint_row
+      CROSS JOIN target
+     WHERE constraint_row.conrelid = target.oid
+       AND constraint_row.conkey <@ target.listed
+       AND (constraint_row.contype NOT IN ('p', 'u', 'x') OR EXISTS (
+             SELECT 1 FROM pg_catalog.pg_index AS index_row
+              WHERE index_row.indexrelid = constraint_row.conindid
+                AND index_row.indpred IS NULL
+                AND index_row.indkey::int2[] <@ target.listed))
+       AND (constraint_row.contype <> 'f' OR constraint_row.confkey <@ ARRAY(
+             SELECT served.attnum FROM served
+              WHERE served.relation = constraint_row.confrelid))
+    UNION
+    SELECT index_class.relname::text
+      FROM pg_catalog.pg_index AS index_row
+      JOIN pg_catalog.pg_class AS index_class ON index_class.oid = index_row.indexrelid
+      CROSS JOIN target
+     WHERE index_row.indrelid = target.oid
+       AND index_row.indpred IS NULL
+       AND index_row.indkey::int2[] <@ target.listed";
 
 fn crud_commands_per_table<'a>(
     tables: &'a [RegisteredTable],
@@ -841,7 +960,12 @@ fn timestamp_text(micros: i64) -> Result<String, CommandFailure> {
 /// SQLSTATE classes decide the outcome: integrity violations are conflicts
 /// the application can act on, data exceptions are the input's fault, a
 /// privilege refusal is authorization, and everything else is worth a retry.
-fn classify_postgres_error(error: postgres::Error) -> CommandFailure {
+/// A conflict carries the broken constraint's name when `names_constraint`
+/// allows it, and an empty payload otherwise.
+fn classify_postgres_error(
+    error: postgres::Error,
+    names_constraint: impl FnOnce(&DbError) -> bool,
+) -> CommandFailure {
     let Some(state) = error.code() else {
         return CommandFailure::Retryable;
     };
@@ -849,7 +973,8 @@ fn classify_postgres_error(error: postgres::Error) -> CommandFailure {
     if code.starts_with("23") {
         let constraint = error
             .as_db_error()
-            .and_then(|db| db.constraint())
+            .filter(|db| names_constraint(db))
+            .and_then(DbError::constraint)
             .unwrap_or_default();
         return CommandFailure::Conflict {
             kind: "constraint".to_owned(),
@@ -1527,5 +1652,117 @@ mod tests {
         assert_eq!(float_text(0.1), "0.1");
         assert_eq!(float_text(f64::INFINITY), "Infinity");
         assert_eq!(quote_identifier("we\"ird"), "\"we\"\"ird\"");
+    }
+
+    /// `public.<name>`, serving `columns`.
+    fn served(name: &str, columns: &[&str]) -> RegisteredTable {
+        let mut table = table();
+        table.table_id = TableId::new(format!("public.{name}")).unwrap();
+        table.inspection.table.table = name.to_owned();
+        table.inspection.columns = (1..)
+            .zip(columns)
+            .map(|(number, name)| column(number, name, "text", false, None, false))
+            .collect();
+        table.column_ids = (1..=u32::try_from(columns.len()).unwrap())
+            .map(ColumnId::new)
+            .collect();
+        table
+    }
+
+    /// Every shape whose name could spell out a column the client is never
+    /// sent stays out: a hidden column in a key, an included column, a check,
+    /// a predicate or an expression, a whole-row reference beside a served
+    /// column, and a foreign key to a column no collection serves.
+    #[test]
+    #[ignore = "requires TEST_DATABASE_URL"]
+    fn a_refusal_names_only_constraints_that_read_served_columns() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let tag = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .to_string();
+        let [t, w, v, payroll] =
+            ["t", "w", "v", "payroll"].map(|name| format!("disclosed_{name}_{tag}"));
+        let cleanup = format!("DROP TABLE IF EXISTS {t}, {w}, {v}, {payroll}");
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {payroll} (code text PRIMARY KEY);
+                 CREATE TABLE {v} (id text PRIMARY KEY, code text UNIQUE);
+                 CREATE TABLE {w} (id text PRIMARY KEY, code text
+                     CONSTRAINT w_code_names_payroll_{tag} REFERENCES {payroll} (code),
+                     CONSTRAINT w_code_set_{tag} CHECK (code <> ''));
+                 CREATE TABLE {t} (
+                     id text CONSTRAINT t_key_{tag} PRIMARY KEY,
+                     title text CONSTRAINT t_title_{tag} UNIQUE,
+                     status text,
+                     secret text);
+                 ALTER TABLE {t}
+                     ADD CONSTRAINT t_status_set_{tag} CHECK (status <> ''),
+                     ADD CONSTRAINT t_has_w_{tag} FOREIGN KEY (id) REFERENCES {w} (id),
+                     ADD CONSTRAINT t_parent_{tag} FOREIGN KEY (status) REFERENCES {t} (title),
+                     ADD CONSTRAINT t_status_secret_{tag} UNIQUE (status, secret),
+                     ADD CONSTRAINT t_status_with_secret_{tag} UNIQUE (status) INCLUDE (secret),
+                     ADD CONSTRAINT t_blocked_needs_secret_{tag}
+                         CHECK (status <> 'blocked' OR secret IS NOT NULL),
+                     ADD CONSTRAINT t_blocked_needs_row_{tag}
+                         CHECK (status <> 'stuck' OR row_to_json({t})->>'secret' IS NOT NULL),
+                     ADD CONSTRAINT t_one_title_while_secret_{tag}
+                         EXCLUDE USING btree (title WITH =) WHERE (secret IS NOT NULL),
+                     ADD CONSTRAINT t_status_and_secret_{tag}
+                         EXCLUDE USING btree (status WITH =, coalesce(secret, '') WITH =),
+                     ADD CONSTRAINT t_status_names_payroll_{tag}
+                         FOREIGN KEY (status) REFERENCES {payroll} (code),
+                     ADD CONSTRAINT t_status_names_hidden_code_{tag}
+                         FOREIGN KEY (status) REFERENCES {v} (code);
+                 CREATE UNIQUE INDEX t_title_status_{tag} ON {t} (title, status);
+                 CREATE UNIQUE INDEX t_status_unset_{tag} ON {t} (status) WHERE secret IS NULL;
+                 CREATE UNIQUE INDEX t_title_whole_{tag} ON {t} (title) WHERE {t} IS NOT NULL;
+                 CREATE UNIQUE INDEX t_lower_title_{tag} ON {t} (lower(title));"
+            ))
+            .unwrap();
+        let tables = [
+            served(&t, &["id", "title", "status"]),
+            served(&w, &["id", "code"]),
+            served(&v, &["id"]),
+        ];
+        let loaded = DisclosedConstraints::load(&mut client, &tables);
+        client.batch_execute(&cleanup).unwrap();
+        let loaded = loaded.unwrap();
+        let disclosed = |table: &RegisteredTable, name: &str| {
+            loaded.0[&table.table_id].contains(&format!("{name}_{tag}"))
+        };
+
+        for name in [
+            "t_key",
+            "t_title",
+            "t_status_set",
+            "t_has_w",
+            "t_parent",
+            "t_title_status",
+        ] {
+            assert!(disclosed(&tables[0], name), "{name} reads served columns");
+        }
+        for name in [
+            "t_status_secret",
+            "t_status_with_secret",
+            "t_blocked_needs_secret",
+            "t_blocked_needs_row",
+            "t_one_title_while_secret",
+            "t_status_and_secret",
+            "t_status_names_payroll",
+            "t_status_names_hidden_code",
+            "t_status_unset",
+            "t_title_whole",
+            "t_lower_title",
+        ] {
+            assert!(!disclosed(&tables[0], name), "{name} must stay unnamed");
+        }
+        assert!(disclosed(&tables[1], "w_code_set"));
+        assert!(
+            !disclosed(&tables[1], "w_code_names_payroll"),
+            "a table served whole names no foreign key to a table it is never sent"
+        );
     }
 }

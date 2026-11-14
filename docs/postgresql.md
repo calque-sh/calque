@@ -24,8 +24,13 @@ A supported column has one of these `pg_catalog` types: `bool`, `int2`,
 `timestamptz`. An enum travels as its label's text and a domain as the type
 under it, through any chain of domains, so either is supported when that type
 is. A write still goes through the column's own type, so PostgreSQL checks the
-label or the domain's constraints. The browser sorts an enum column by label,
-not in the order the enum declares. Any other type, an array, range, composite
+label or the domain's constraints. The browser orders an enum column as
+PostgreSQL does, in the order its type declares the labels, so every browser
+receives every label of the type, whatever rows its grant reaches. Calque
+serves an enum of at most 4,096 labels: it refuses to start on a larger one
+and stops when one grows past that. A page that
+loaded before a value was added orders that value after the labels it knows
+until it loads again. Any other type, an array, range, composite
 or extension type among them, is refused with `TYPE_CODEC_UNSUPPORTED`, and a
 generated column with `GENERATED_COLUMN_UNSUPPORTED`. A primary-key column
 must be `bool`, `int2`, `int4`, `int8`, `text`, `varchar`, `uuid` or `bytea`,
@@ -37,10 +42,27 @@ checks every published column of each table and fails with these codes before
 anything is enrolled.
 
 Renaming a value of an enum that an enrolled column uses changes the text of
-every row holding it, and PostgreSQL logs no row change for it. Calque watches
-those enums with the publication: adding or renaming a value stops change
-capture with the publication's error, and `calque destroy`, then a new start,
-prepares the working set again from a snapshot.
+every row holding it, and PostgreSQL logs no row change for it. Calque records
+which value holds each label it serves and reads those enums every second
+while it streams and at every start. Adding a value, with or without `BEFORE`
+or `AFTER`, keeps it serving. Renaming a value it enrolled or has served, or
+giving that value's label to another, stops change capture, and
+`calque destroy`, then a new start, prepares the working set again from a
+snapshot. Two cases stop it with nothing served wrong: PostgreSQL renumbering
+an enum after many values were added before one another, and a row taking a
+new value while another value of the same enum changed and Calque read
+neither change before the row, as with two values added while Calque was
+stopped, or within the second before a row takes one while it streams.
+Adding values while Calque runs, a few seconds before a row takes one,
+avoids the second case.
+
+Dropping or renaming a published column, or changing its type or type
+modifier, changes it for every row with no row change logged either. Calque
+reads the definition of every published column every second while it streams
+and at every start, and stops change capture the same way. One rewrite
+escapes that check: `ALTER COLUMN ... TYPE` to the column's own type and
+modifier with a `USING` expression changes every value and leaves the
+definition as it was. Run `calque destroy` and start again after one.
 
 Change capture gives up a replication stream that carries nothing for its
 walsender's `wal_sender_timeout`, at least 5 s and 60 s when it is 0, and
@@ -48,7 +70,8 @@ reconnects. A healthy walsender sends a keepalive within half that time.
 
 ## The role
 
-Create the role as a superuser, in the application's database. Use your own
+Create the role in the application's database, as a superuser or as a role
+that owns the database and has `CREATEROLE` and `REPLICATION`. Use your own
 password:
 
 ```sql
@@ -74,16 +97,22 @@ refuses with that `CREATE PUBLICATION` statement for the owner to run.
 `calque destroy` drops the publication only when Calque's role owns it, and
 says so when it keeps one.
 
-`calque dev` names and creates its own publication, so its role has to own
-the tables it serves. A table that `calque_sync` creates itself is its own;
-creating one in `public` needs the schema, granted as a superuser:
+`calque dev` names its own publication and creates it when its role owns the
+tables it serves. When it does not, it refuses with the `CREATE PUBLICATION`
+statement for the tables' owner to run once, then serves from that
+publication, and `calque destroy` keeps it. A table that `calque_sync` creates
+itself is its own; creating one in `public` needs this grant, from the
+database's owner or a superuser:
 
 ```sql
 GRANT CREATE, USAGE ON SCHEMA public TO calque_sync;
 ```
 
-For a table that exists, make `calque_sync` a member of its owner's role,
-which leaves the table with its owner and your migrations unchanged:
+For a table that exists, the owner runs that statement, or `calque_sync`
+becomes a member of the owner's role so that `calque dev` creates the
+publication itself. The grant comes from a superuser or from a role holding
+`ADMIN OPTION` on the owner's role, as the role that created it does. Either
+way the table stays with its owner and your migrations are unchanged:
 
 ```sql
 SELECT tablename, tableowner FROM pg_tables WHERE schemaname = 'public';
@@ -93,9 +122,10 @@ GRANT app_owner TO calque_sync;
 ## Publishing only some columns
 
 A column a collection leaves out of its `columns` in `calque.config.json`
-stays inside PostgreSQL. `calque serve` creates its publication with a column
-list naming each collection's columns, so pgoutput never sends the others,
-and no artifact, change, plan or command carries them, for any grant. To keep
+stays inside PostgreSQL. `calque serve`, and `calque dev` when it reads the
+file, create their publication with a column list naming each collection's
+columns, so pgoutput never sends the others, and no artifact, change, plan or
+command carries them, for any grant. To keep
 a password hash or an internal note out, delete the column from the
 collection's `columns` and from its command's `writableColumns`. When
 Calque's role does not own the tables, `serve` prints the statement for their
@@ -109,9 +139,13 @@ A publication that already exists must publish exactly each collection's
 columns, through a list or as the whole table. `serve` refuses one that
 publishes other columns and prints the statement that publishes the right
 ones; `calque destroy` drops a publication Calque's role owns, and the next
-start creates it anew.
+start creates it anew. `calque dev` refuses a `calque.config.json` that names
+other columns than the ones its state directory was prepared with, and names
+the `calque destroy` after which it prepares them.
 
-The columns must include the primary key
+The columns must include the primary key: `serve` and `dev` refuse a
+collection that leaves out a key column before they create the publication,
+and enrollment refuses a list without one
 (`PUBLICATION_COLUMN_LIST_OMITS_KEY`). PostgreSQL refuses every update and
 delete on a table with `REPLICA IDENTITY FULL` while a publication lists its
 columns, even all of them, so Calque refuses a list on such a table
@@ -126,11 +160,16 @@ to drop a column a publication lists: remove it from `columns` and
 column outside the list is `NOT NULL` with no default, an insert through
 Calque cannot give it a value, so the table takes updates and deletes but no
 insert: `calque init` offers none, and `serve` refuses a command that lists
-`insert` (`E_SERVE_COMMAND_OPERATION_UNADMITTED`). A row filter is still
+`insert` (`E_SERVE_COMMAND_OPERATION_UNADMITTED`). On every table, a write
+PostgreSQL refuses names the broken constraint to the browser only when the
+constraint is the table's own and reads served columns alone, a foreign key's
+referenced columns included, as the catalog held it when Calque started. Any
+other refusal reaches the browser as an unnamed conflict. A row filter is still
 refused with `PUBLICATION_ROW_FILTER_UNSUPPORTED`, because Calque serves
 complete tables. Changing the publication while Calque runs stops change
-capture, as any change to the publication does. `calque dev` creates its own
-publication without a list, so under it every column reaches the browser.
+capture, as any change to the publication does. Run with `--table` and no
+`calque.config.json`, `calque dev` creates its publication without a list, so
+every column of each table reaches the browser.
 
 ## Protecting the primary's disk
 

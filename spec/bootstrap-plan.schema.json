@@ -350,7 +350,15 @@
       "required": ["columnId", "name"],
       "properties": {
         "columnId": { "$ref": "#/$defs/positiveInteger" },
-        "name": { "type": "string", "minLength": 1 }
+        "name": { "type": "string", "minLength": 1 },
+        "enumLabels": {
+          "type": "array",
+          "description": "The labels of the enum this column carries, directly or through domains, in PostgreSQL's declaration order (pg_enum.enumsortorder). Absent for any other column. The server reads them when it starts and keeps them out of the immutable manifest, so adding a label changes no artifact. The client orders the column by them; a value outside them orders after every one, and those values among themselves by text.",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": { "type": "string", "maxLength": 63 },
+          "uniqueItems": true
+        }
       }
     },
     "artifactRuntimeTable": {

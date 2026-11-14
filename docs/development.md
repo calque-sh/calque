@@ -256,15 +256,14 @@ pnpm --filter @calque/client exec prettier --write \
 form the package's `lint` gate checks, and `calque init` reproduces the
 checked-in `calque.config.json` byte for byte this way.
 
-In a second terminal, start `calque dev` for the same relations:
+In a second terminal, start `calque dev` on the same manifest:
 
 ```sh
 export CALQUE_DATABASE_URL='postgresql://calque_sync:calque_sync@127.0.0.1:55432/calque_dev'
 
 cargo run -p calque -- dev \
   --state-dir .calque-dev \
-  --table public.projects \
-  --table public.tasks \
+  --config client/packages/client/tests/demo/calque.config.json \
   --allow-origin http://127.0.0.1:5173 \
   --public-base-url http://127.0.0.1:5173/_calque/ \
   --acknowledge-disposable-source
@@ -382,10 +381,13 @@ CREATE DATABASE calque_verify OWNER calque_test;
 SQL
 docker exec calque-pg-live psql -U postgres -d calque_verify \
   -c 'GRANT ALL ON SCHEMA public TO calque_test;'
+# Functions that create and drop a `FOR TABLES IN SCHEMA` publication, which
+# only a superuser may create, so no test connects as one.
+docker exec -i calque-pg-live psql -U postgres -d calque_verify \
+  -v ON_ERROR_STOP=1 -v role=calque_test <scripts/live-postgres-suite.sql
 
-# Seven names read by different tests, all wanting the same connection string,
-# and the superuser's URL for the one test that needs it; the script's header
-# says which are required and which are alternates.
+# Seven names read by different tests, all wanting the same connection string;
+# the script's header says which are required and which are alternates.
 eval "$(scripts/live-postgres-suite.sh env 55433)"
 
 # blob-store is excluded: its two S3 conformance tests run through

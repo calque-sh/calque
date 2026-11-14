@@ -1,6 +1,6 @@
 {
   "name": "@calque/grant",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Signs Calque dataset grants and tenant orders from a Node backend, and creates the signing key; calque-grant is its command line.",
   "license": "Apache-2.0",
   "repository": {
