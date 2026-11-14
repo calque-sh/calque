@@ -14,13 +14,6 @@ use sync_types::{ArtifactId, SourceEpoch};
 use thiserror::Error;
 
 const STATUS_FORMAT_VERSION: u32 = 4;
-/// Copy progress between table completions is persisted at most this often
-/// or after this many decoded bytes, whichever comes first, since the copy
-/// batch that reports it waits for its fsyncs. Nothing resumes a copy from
-/// these counters, so a skipped persist only leaves the status file up to a
-/// second behind.
-const COPY_PROGRESS_PERSIST_INTERVAL_MS: i64 = 1_000;
-const COPY_PROGRESS_PERSIST_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -115,19 +108,19 @@ pub struct SnapshotBuildProgress {
 
 /// Durable single-writer lifecycle journal for one private snapshot build.
 ///
-/// Every persisted update is written to a new file, synced and atomically
-/// renamed; the directory is synced only where `syncs_directory` says. Every
-/// stage boundary is persisted, copy progress only once
-/// `COPY_PROGRESS_PERSIST_INTERVAL_MS` or `COPY_PROGRESS_PERSIST_BYTES` has
-/// passed since the last persist, and the next persist carries whatever was
-/// held back. An uncertain journal write must cancel the build, because
-/// operators and cleanup recovery may otherwise lose its last safe boundary.
+/// The journal is written at admission, when cleanup begins, and when the
+/// build ends, each time to a new file that is synced, atomically renamed,
+/// and made durable with its directory. Recovery reads only what those writes
+/// hold: the identity admission records, whether cleanup began and with which
+/// failure, and whether the build ended. Every update between them, the stages
+/// before cleanup and the copy, barrier and pressure progress, stays in memory,
+/// so a build does not wait on a device flush for each. An uncertain journal
+/// write must cancel the build, because cleanup recovery may otherwise lose
+/// its last safe boundary.
 pub struct SnapshotBuildJournal {
     root: PathBuf,
     path: PathBuf,
     progress: SnapshotBuildProgress,
-    /// When, and at how many decoded bytes, copy progress was last persisted.
-    copy_persisted: Option<(i64, u64)>,
 }
 
 impl SnapshotBuildJournal {
@@ -152,7 +145,6 @@ impl SnapshotBuildJournal {
         let mut journal = Self {
             root,
             path,
-            copy_persisted: None,
             progress: SnapshotBuildProgress {
                 format_version: STATUS_FORMAT_VERSION,
                 build_id: build_id.as_str().to_owned(),
@@ -212,7 +204,6 @@ impl SnapshotBuildJournal {
             root,
             path,
             progress,
-            copy_persisted: None,
         })
     }
 
@@ -385,9 +376,6 @@ impl SnapshotBuildJournal {
         }
         self.progress.stage = next;
         self.progress.last_progress_at_unix_millis = now_ms;
-        if next == SnapshotBuildStage::Copying {
-            self.copy_persisted = Some((now_ms, self.progress.decoded_value_bytes));
-        }
         if next == SnapshotBuildStage::Published {
             self.progress.ended_at_unix_millis = Some(now_ms);
         }
@@ -422,10 +410,6 @@ impl SnapshotBuildJournal {
             return Err(SnapshotBuildProgressError::InvalidCopyProgress);
         }
         validate_timestamp_order(self.progress.last_progress_at_unix_millis, now_ms)?;
-        let due = self.copy_persisted.is_none_or(|(at, bytes)| {
-            now_ms.saturating_sub(at) >= COPY_PROGRESS_PERSIST_INTERVAL_MS
-                || decoded_value_bytes.saturating_sub(bytes) >= COPY_PROGRESS_PERSIST_BYTES
-        });
         self.progress.tables_completed = tables_completed;
         self.progress.rows_copied = rows_copied;
         self.progress.decoded_value_bytes = decoded_value_bytes;
@@ -435,10 +419,6 @@ impl SnapshotBuildJournal {
             self.progress.peak_active_copy_workers.max(active_workers);
         self.progress.queued_copy_tables = queued_tables;
         self.progress.last_progress_at_unix_millis = now_ms;
-        if !due {
-            return Ok(());
-        }
-        self.copy_persisted = Some((now_ms, decoded_value_bytes));
         self.bump_and_persist()
     }
 
@@ -542,11 +522,14 @@ impl SnapshotBuildJournal {
             .revision
             .checked_add(1)
             .ok_or(SnapshotBuildProgressError::RevisionExhausted)?;
-        self.persist()
+        if writes_to_disk(&self.progress) {
+            self.persist()
+        } else {
+            validate_progress(&self.progress)
+        }
     }
 
     fn persist(&mut self) -> Result<(), SnapshotBuildProgressError> {
-        let sync_directory = syncs_directory(&self.progress);
         validate_progress(&self.progress)?;
         let bytes = serde_json::to_vec(&self.progress)?;
         let temp = self.root.join(format!(
@@ -561,9 +544,7 @@ impl SnapshotBuildJournal {
             file.write_all(&bytes)?;
             file.sync_all()?;
             fs::rename(&temp, &self.path)?;
-            if sync_directory {
-                File::open(&self.root)?.sync_all()?;
-            }
+            File::open(&self.root)?.sync_all()?;
             Ok(())
         })() {
             let _ = fs::remove_file(&temp);
@@ -696,12 +677,11 @@ fn validate_timestamp_order(prior: i64, now_ms: i64) -> Result<(), SnapshotBuild
     }
 }
 
-/// Whether persisting `progress` also syncs the journal's directory: at the
-/// journal's creation, revision 0, and once it is cleaning up or terminal.
-/// Recovery handles every other stage alike, and a power loss that undoes a
-/// later rename leaves the complete earlier revision, since each file is
-/// synced before its rename. Skipping the sync saves a full flush per persist.
-const fn syncs_directory(progress: &SnapshotBuildProgress) -> bool {
+/// Whether `progress` is written to disk: at admission, revision 0, and once
+/// the build is cleaning up or terminal, the boundaries recovery reads.
+/// Recovery handles every other stage like admission, so a crash between
+/// them loses nothing it uses.
+const fn writes_to_disk(progress: &SnapshotBuildProgress) -> bool {
     progress.revision == 0
         || is_terminal(progress.stage)
         || matches!(progress.stage, SnapshotBuildStage::CleaningUp)
@@ -893,9 +873,9 @@ mod tests {
     }
 
     #[test]
-    fn a_published_build_syncs_the_journal_directory_only_at_creation_and_publication() {
-        let (_root, mut journal) = journal();
-        let mut synced = vec![syncs_directory(journal.progress())];
+    fn a_published_build_writes_its_journal_only_at_admission_and_publication() {
+        let (root, mut journal) = journal();
+        let mut on_disk = vec![persisted(root.path()).stage];
         for (stage, time) in [
             (SnapshotBuildStage::RetentionLeased, 1_001),
             (SnapshotBuildStage::Exported, 1_002),
@@ -903,18 +883,18 @@ mod tests {
             (SnapshotBuildStage::Copying, 1_004),
         ] {
             journal.transition(stage, time).unwrap();
-            synced.push(syncs_directory(journal.progress()));
+            on_disk.push(persisted(root.path()).stage);
         }
         journal
             .record_copy_progress(2, 20, 160, 2, 0, 0, 2_005)
             .unwrap();
-        synced.push(syncs_directory(journal.progress()));
+        on_disk.push(persisted(root.path()).stage);
         journal
             .transition(SnapshotBuildStage::WaitingForPersistentBarrier, 2_006)
             .unwrap();
-        synced.push(syncs_directory(journal.progress()));
+        on_disk.push(persisted(root.path()).stage);
         journal.record_barrier_progress(1, 2, 2, 2_007).unwrap();
-        synced.push(syncs_directory(journal.progress()));
+        on_disk.push(persisted(root.path()).stage);
         for (stage, time) in [
             (SnapshotBuildStage::Finalizing, 2_008),
             (SnapshotBuildStage::Uploading, 2_009),
@@ -922,21 +902,21 @@ mod tests {
             (SnapshotBuildStage::Published, 2_011),
         ] {
             journal.transition(stage, time).unwrap();
-            synced.push(syncs_directory(journal.progress()));
+            on_disk.push(persisted(root.path()).stage);
         }
-        assert_eq!(
-            synced,
-            [true, false, false, false, false, false, false, false, false, false, false, true]
-        );
+        let mut expected = vec![SnapshotBuildStage::Admitted; 11];
+        expected.push(SnapshotBuildStage::Published);
+        assert_eq!(on_disk, expected);
+        assert_eq!(&persisted(root.path()), journal.progress());
     }
 
     #[test]
-    fn a_failed_build_syncs_the_journal_directory_at_cleanup_and_failure() {
-        let (_root, mut journal) = journal();
+    fn a_failed_build_writes_its_journal_at_cleanup_and_failure() {
+        let (root, mut journal) = journal();
         journal
             .transition(SnapshotBuildStage::RetentionLeased, 1_001)
             .unwrap();
-        assert!(!syncs_directory(journal.progress()));
+        assert_eq!(persisted(root.path()).stage, SnapshotBuildStage::Admitted);
         journal
             .begin_cleanup(
                 SnapshotBuildFailureCode::CopyWorkerFailed,
@@ -944,10 +924,11 @@ mod tests {
                 1_002,
             )
             .unwrap();
-        assert!(syncs_directory(journal.progress()));
+        assert_eq!(&persisted(root.path()), journal.progress());
+        assert_eq!(persisted(root.path()).stage, SnapshotBuildStage::CleaningUp);
         journal.finish_cleanup(1_003).unwrap();
         assert_eq!(journal.progress().stage, SnapshotBuildStage::Failed);
-        assert!(syncs_directory(journal.progress()));
+        assert_eq!(&persisted(root.path()), journal.progress());
     }
 
     fn persisted(root: &Path) -> SnapshotBuildProgress {
@@ -973,78 +954,29 @@ mod tests {
     }
 
     #[test]
-    fn copy_progress_persists_only_by_interval_or_bytes() {
+    fn progress_before_cleanup_stays_in_memory() {
         let (root, mut journal) = journal();
         copying(&mut journal);
-        let mib = 1024 * 1024;
-        let revision = persisted(root.path()).revision;
-
-        // Held back: the transition into Copying, at 1_004, was persisted, and
-        // neither a first report nor a table completion is due by itself.
-        journal
-            .record_copy_progress(0, 10, mib, 1, 2, 0, 1_010)
-            .unwrap();
-        journal
-            .record_copy_progress(1, 20, 2 * mib, 2, 1, 0, 1_500)
-            .unwrap();
-        assert_eq!(journal.progress().tables_completed, 1);
-        let on_disk = persisted(root.path());
-        assert_eq!(on_disk.revision, revision);
-        assert_eq!(on_disk.stage, SnapshotBuildStage::Copying);
-        assert_eq!(on_disk.rows_copied, 0);
-        assert_eq!(on_disk.tables_completed, 0);
-        // 64 MiB since the copy began.
-        journal
-            .record_copy_progress(1, 30, 64 * mib, 3, 1, 0, 1_600)
-            .unwrap();
-        assert_eq!(persisted(root.path()).rows_copied, 30);
-        journal
-            .record_copy_progress(1, 40, 65 * mib, 4, 1, 0, 2_599)
-            .unwrap();
-        assert_eq!(persisted(root.path()).rows_copied, 30);
-        // A second since the last persist.
-        journal
-            .record_copy_progress(1, 50, 66 * mib, 5, 1, 0, 2_600)
-            .unwrap();
-        assert_eq!(persisted(root.path()).rows_copied, 50);
-        journal
-            .record_copy_progress(2, 60, 67 * mib, 6, 1, 0, 2_601)
-            .unwrap();
-        assert_eq!(persisted(root.path()).tables_completed, 1);
-        // The next stage boundary carries what was held back.
-        journal
-            .transition(SnapshotBuildStage::WaitingForPersistentBarrier, 2_602)
-            .unwrap();
-        let reopened = persisted(root.path());
-        assert_eq!(&reopened, journal.progress());
-        assert_eq!(reopened.tables_completed, 2);
-        assert_eq!(reopened.rows_copied, 60);
-        assert_eq!(reopened.committed_batches, 6);
-    }
-
-    #[test]
-    fn a_copy_under_a_second_persists_only_at_its_stage_boundaries() {
-        let (root, mut journal) = journal();
-        copying(&mut journal);
-        let revision = persisted(root.path()).revision;
         journal
             .record_copy_progress(1, 10, 80, 1, 1, 1, 1_010)
             .unwrap();
         journal
             .record_copy_progress(2, 20, 160, 2, 1, 0, 1_011)
             .unwrap();
-        assert_eq!(persisted(root.path()).revision, revision);
         journal
             .transition(SnapshotBuildStage::WaitingForPersistentBarrier, 1_012)
             .unwrap();
-        let reopened = persisted(root.path());
-        assert_eq!(reopened.revision, revision + 1);
-        assert_eq!(reopened.tables_completed, 2);
-        assert_eq!(reopened.rows_copied, 20);
+        journal.record_barrier_progress(1, 2, 2, 1_013).unwrap();
+        assert_eq!(journal.progress().rows_copied, 20);
+        assert_eq!(journal.progress().barrier_records_scanned, 2);
+        let on_disk = persisted(root.path());
+        assert_eq!(on_disk.revision, 0);
+        assert_eq!(on_disk.stage, SnapshotBuildStage::Admitted);
+        assert_eq!(on_disk.rows_copied, 0);
     }
 
     #[test]
-    fn a_build_interrupted_mid_copy_recovers_from_its_last_persisted_progress() {
+    fn a_build_interrupted_mid_copy_recovers_from_its_admission() {
         let (root, mut journal) = journal();
         copying(&mut journal);
         journal
@@ -1053,7 +985,7 @@ mod tests {
         journal
             .record_copy_progress(0, 20, 160, 2, 2, 0, 2_011)
             .unwrap();
-        // The process dies here: the held-back report never reaches the file.
+        // The process dies here: nothing since admission reached the file.
         drop(journal);
 
         let build = SnapshotBuildId::new("build-progress-1").unwrap();
@@ -1062,8 +994,8 @@ mod tests {
             vec![build.clone()]
         );
         let mut recovered = SnapshotBuildJournal::reopen(root.path(), &build).unwrap();
-        assert_eq!(recovered.progress().stage, SnapshotBuildStage::Copying);
-        assert_eq!(recovered.progress().rows_copied, 10);
+        assert_eq!(recovered.progress().stage, SnapshotBuildStage::Admitted);
+        assert_eq!(recovered.progress().rows_copied, 0);
         recovered.reconcile_interrupted_cleanup(2_020).unwrap();
         let terminal = persisted(root.path());
         assert_eq!(terminal.stage, SnapshotBuildStage::Failed);
@@ -1072,7 +1004,7 @@ mod tests {
             Some(SnapshotBuildFailureCode::ProcessInterrupted)
         );
         assert_eq!(terminal.disposition, Some(SnapshotBuildDisposition::Retry));
-        assert_eq!(terminal.rows_copied, 10);
+        assert_eq!(terminal.rows_copied, 0);
 
         // The same build identity is released for a fresh copy.
         SnapshotBuildJournal::remove_recovered_unpublished(
@@ -1083,7 +1015,7 @@ mod tests {
             &SourceEpoch::new("epoch-progress-1").unwrap(),
         )
         .unwrap();
-        let mut retried = SnapshotBuildJournal::create(
+        let retried = SnapshotBuildJournal::create(
             root.path(),
             &build,
             &SnapshotBuildOwnerId::new("worker-progress-1").unwrap(),
@@ -1095,13 +1027,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(retried.progress().rows_copied, 0);
-        retried
-            .transition(SnapshotBuildStage::RetentionLeased, 2_031)
-            .unwrap();
-        assert_eq!(
-            persisted(root.path()).stage,
-            SnapshotBuildStage::RetentionLeased
-        );
+        assert_eq!(persisted(root.path()).started_at_unix_millis, 2_030);
     }
 
     #[test]
@@ -1328,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn persists_sanitized_pressure_warning_facts() {
+    fn a_build_stopped_for_pressure_persists_its_sanitized_last_sample() {
         let (root, mut journal) = journal();
         journal
             .transition(SnapshotBuildStage::RetentionLeased, 1_001)
@@ -1351,6 +1277,14 @@ mod tests {
         };
         journal
             .record_pressure(&sample, &evaluation, 1_002)
+            .unwrap();
+        assert_eq!(persisted(root.path()).pressure_level, None);
+        journal
+            .begin_cleanup(
+                SnapshotBuildFailureCode::WalPressureLimit,
+                SnapshotBuildDisposition::Retry,
+                1_003,
+            )
             .unwrap();
 
         let reopened = SnapshotBuildJournal::reopen(

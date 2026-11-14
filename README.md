@@ -35,18 +35,20 @@ transfer, live updates, optimistic writes, recovery and access control.
 
 The name is French for a tracing: a copy made by drawing over the original.
 
+- A cold load of 100,000 rows takes little more than the time its bytes need
+  on the link. In the benchmark each load moved 7.7 MB, which takes 618 ms at
+  100 Mbit/s, and reached a complete, stable paint at a median of 747 ms (p95
+  760 ms). The request round trips and Calque's own work took the other 129 ms
+  at the median (p95 142 ms). Once the rows were loaded, filtering and sorting
+  them took 35 ms (p95), and a committed change reached the screen in 41 ms
+  (p95) while the database took 11,000 row changes a second. Every sample was
+  checked against PostgreSQL. The run was on a busy laptop, so these numbers
+  are directional ([the benchmark](#the-benchmark)).
 - A collection arrives complete, or not at all. There are no pages to fetch,
   no query runs over rows that are still loading, and a client without the
   memory for it gets a structured capacity error.
 - Everything on the page comes from one PostgreSQL transaction boundary. When
   one commit changes several live queries, they update on the same frame.
-- In the benchmark, 100,000 rows reached a complete, stable paint in 760 ms
-  (p95 of 30 cold loads) over an emulated 100 Mbit/s link. Once they were
-  loaded, filtering and sorting them took 35 ms (p95), and a committed change
-  reached the screen in 41 ms (p95) while the database took 11,000 row
-  changes a second. Every sample was checked against PostgreSQL. The run was
-  on a busy laptop, so these numbers are directional
-  ([the benchmark](#the-benchmark)).
 - A write shows at once and stays optimistic until its change comes back from
   PostgreSQL, so the page never marks a write saved before the database has
   it. A write is an idempotent mutation command, so a retry never applies it
@@ -60,25 +62,34 @@ The name is French for a tracing: a copy made by drawing over the original.
 Calque is pre-alpha, and its APIs will change. Before you point it at your own
 schema:
 
-- Every column of an enrolled table reaches the browser. A table that holds
-  secrets, such as password hashes or internal notes, needs a projection
-  table that leaves them out.
+- Every column a collection names reaches the browser. Leave a column that
+  holds secrets, such as a password hash or an internal note, out of the
+  collection's `columns`, and `calque serve` publishes the table without it,
+  so it stays in PostgreSQL.
 - A page receives whole tables, or one tenant's rows of them by a tenant
   column that leads the primary key. Visibility per user or per team needs a
   projection table your application maintains.
 - Writes are inserts, updates and deletes checked against the grant. No
   backend code runs on a write yet.
-- The source must be PostgreSQL 18, and Calque's role must own the tables it
-  serves. Enums, arrays, domains, extension types, generated columns and
+- The source must be PostgreSQL 18. Under `calque serve`, Calque's role needs
+  `REPLICATION`, read access to the tables and write access if pages write,
+  and owns none of them; `calque dev` creates its own publication, so its role
+  owns the tables it serves. Enums and domains are carried as their text or
+  base type; arrays, ranges, extension types, published generated columns and
   partitioned tables are refused
   ([What Calque needs from PostgreSQL](docs/postgresql.md)).
-- The client runs only in Chromium-based browsers, tested in Chrome and
-  Chromium, and refuses any other with `UNSUPPORTED_BROWSER`.
+- A collection takes its table's name, which must be lowercase ASCII letters
+  and digits, starting with a letter, with a single `.`, `_` or `-` between
+  them. A table named `User` needs a rename or a projection table.
+- The client checks for the browser APIs it calls and refuses a browser
+  missing one with `UNSUPPORTED_BROWSER`, naming the API. Its browser suites
+  pass in Chromium and Firefox, and passed in WebKit on 2026-11-14; only
+  Chrome has benchmark, memory and stable-paint measurements.
 - Nothing is kept between page loads. Every load, a reload included,
   downloads the whole working set again, and each open tab downloads and
   holds its own copy.
-- Performance has been measured at 100,000 rows. At 1,000,000 only
-  correctness has been checked.
+- Calque is built and measured for working sets of about 100,000 rows, and
+  makes no claim beyond that.
 
 Today it fits internal tools and operations consoles whose users work in
 Chrome, in one tenant's whole dataset, all day.
@@ -93,7 +104,8 @@ npm install -D @calque/config
 
 `@calque/client` is the browser client. `@calque/config` renders the typed
 schema the client is created with, for the client's Vite plugin and as the
-`calque-bindings` command. React applications add `@calque/react`.
+`calque-bindings` command. React applications add `@calque/react`. The Vite
+plugin needs Vite 8.1.4 or newer, and `@calque/react` needs React 19 or newer.
 
 The server is `calque`, one Rust binary, published as a container image:
 
@@ -102,18 +114,26 @@ docker pull ghcr.io/calque-sh/calque
 ```
 
 Its tags are the release version and `latest`. The commands in the next
-section run `calque` on your machine;
-`cargo install --locked --path server/apps/calque` installs it from a
-checkout, with Rust and libpq as
+section run `calque` on your machine. To install it from source, with Rust and
+libpq as
 [Building calque from source](docs/development.md#building-calque-from-source)
-lists. [Self-hosting](docs/self-host.md) runs it behind HTTPS with grants your
-backend signs.
+lists:
+
+```sh
+git clone https://github.com/calque-sh/calque
+cargo install --locked --path calque/server/apps/calque
+```
+
+[Self-hosting](docs/self-host.md) runs it behind HTTPS with grants your
+backend signs. A Node backend signs them with `@calque/grant`.
 
 ## Querying the working set
 
-`calque inspect` reads the tables of a PostgreSQL publication, and
-`calque init` turns them into `calque.config.json`, one collection per table
-([the `calque` command](docs/cli.md)):
+[Getting started](docs/getting-started.md) takes an existing PostgreSQL 18
+database and Vite app to a live page, including the role and the publication
+that the commands below read. `calque inspect` reads the tables of that
+publication, and `calque init` turns them into `calque.config.json`, one
+collection per table ([the `calque` command](docs/cli.md)):
 
 ```sh
 calque inspect --source primary --publication calque_app --table public.tasks > calque.inspection.json
@@ -166,17 +186,18 @@ configured commands allow:
 const tasks = client.db.tasks.query().orderBy("id").subscribe();
 tasks.subscribe(() => render(tasks.getSnapshot()));
 
-// A write. The promise resolves with the server's answer, and the page shows
-// the change optimistically until its echo arrives from PostgreSQL.
+// A write. It resolves once the server commits it and rejects with a
+// MutationSubmissionError when the server refuses it. The page shows the
+// change optimistically until its echo arrives from PostgreSQL.
 await client.db.tasks.update({ id: 1n }, { done: true });
 ```
 
 `createSyncClient` starts loading as soon as it is called.
 [`@calque/client`'s README](client/packages/client/README.md) has the rules a
-query follows: NULL in filters, integer types and result limits. It also shows
-how to start loading before the client library has loaded, or from the backend
-that renders the page, and how a page has to be bundled for the client's
-workers to load.
+query follows: NULL in filters, integer types and result limits, and every
+error a write can end with. It also shows how to start loading before the
+client library has loaded, or from the backend that renders the page, and how
+a page has to be bundled for the client's workers to load.
 
 For React, `@calque/react`'s `SyncProvider` puts a client in context,
 `useLiveQuery` subscribes a component to a live query, `useSuspenseLiveQuery`
@@ -247,7 +268,8 @@ both its encoded and its decoded bytes.
 A page reaches it over four HTTP routes:
 
 - `POST /v1/bootstrap` returns the plan the page's grant allows: which
-  artifacts to fetch and the cursor they activate at;
+  artifacts to fetch and the cursor they activate at. Before a plan expires,
+  the page renews it there with a fresh grant and keeps the rows it holds;
 - `/v1/artifact-objects/` serves those artifacts, each URL carrying a
   capability from the plan;
 - `/v1/changes` streams the catch-up from each artifact's cut to the plan's
@@ -295,10 +317,15 @@ What works today, each part covered by an end-to-end test:
 - Correctness, authorization and recovery hold under the failures the test
   suites inject: a server killed outright, a PostgreSQL restart, a restore
   after the server's state and bucket are destroyed, and a tampered artifact.
-- The incident-operations page passes its correctness checks over a
-  1,000,007-row fixture.
 
 ### The benchmark
+
+A cold load of 100,000 rows moved 7.7 MB. At 100 Mbit/s those bytes take 618 ms
+on the wire alone, and the page reached a complete, stable paint at a median of
+747 ms. Everything else (the request round trips, digest checks, decoding,
+indexing and painting) took a median 129 ms, with a p95 of 142 ms. Chrome's
+emulation serializes decode with the wire, while a real link keeps receiving
+during decode, so the emulated cold numbers err pessimistic.
 
 `pnpm bench` loads the incident-operations page at 100k rows in a fresh Chrome
 with an empty cache, over an emulated 100 Mbit/s link with 30 ms of latency,
@@ -323,6 +350,8 @@ one-minute load average above 4, so every number is directional.
 | Longest main-thread task                        | ≤ 50 ms     | none over 50 ms        |
 | Filter and sort after the load, p95 of 30       | none        | 35 ms (median 26 ms)   |
 | Bytes downloaded per cold load, median of 30    | none        | 7.7 MB                 |
+| Time those bytes need at 100 Mbit/s, median     | none        | 618 ms                 |
+| Above the wire, p95 of 30                       | none        | 142 ms (median 129 ms) |
 | Peak browser process-tree RSS, an empty page    | none        | 0.89 GiB               |
 
 ### Not built yet
@@ -338,8 +367,7 @@ These are part of the design:
 - A collection carries only the columns it selects. Today it carries every
   column of its table.
 - A write can run through a command in your backend. Today writes are
-  inserts, updates and deletes checked against the grant, and a failed write
-  is resent only when the application calls `retryMutation`.
+  inserts, updates and deletes checked against the grant.
 
 [Not built in the pre-alpha](docs/design/architecture-guidelines.md#not-built-in-the-pre-alpha)
 lists every gap, with the code that falls short.
@@ -377,6 +405,8 @@ lists every gap, with the code that falls short.
 
 ## Documentation
 
+- [Getting started](docs/getting-started.md): your PostgreSQL database and
+  Vite app to a live page, with `calque dev`.
 - [`llms.txt`](llms.txt): adding Calque to an application step by step, from
   the database to a live page and then production, written for a coding agent.
 - [Self-hosting](docs/self-host.md): `calque serve` behind HTTPS with signed
@@ -385,12 +415,14 @@ lists every gap, with the code that falls short.
   and restore, capacity, and what the self-hosted composition does not
   provide.
 - [The `calque` command](docs/cli.md): its subcommands, `inspect` and `init`,
-  and the container image.
+  `dev` and `serve`, and the container image.
 - [What Calque needs from PostgreSQL](docs/postgresql.md): settings, the role,
-  the tables and the supported column types.
+  the tables, the supported column types, and what each refusal means.
 - [`@calque/client`](client/packages/client/README.md): the query rules, the
   grant verification key, starting the load early, and bundling.
 - [`@calque/react`](client/packages/react/README.md): the hooks.
+- [`@calque/grant`](client/packages/grant/README.md): creating the signing
+  key, and signing grants and tenant orders from a Node backend.
 - [The benchmark](docs/benchmark.md): its method, and how to run it.
 - [Architecture guidelines](docs/design/architecture-guidelines.md): the state
   model and the invariants behind what Calque commits to.

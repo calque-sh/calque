@@ -6,6 +6,7 @@ import {
   startBootstrap,
   takeStartedBootstrap,
 } from "./bootstrap-start.js";
+import { stubBrowserFeatures } from "./browser.fixture.js";
 
 const INSTANCE_ID = "22222222-2222-4222-8222-222222222222";
 const ARTIFACT_URL =
@@ -59,12 +60,7 @@ function parts(head: string): { preloads: string[]; element: string } {
 
 describe("a bootstrap the backend renders into the page", () => {
   beforeEach(() => {
-    vi.stubGlobal("navigator", {
-      userAgentData: { brands: [{ brand: "Chromium" }] },
-    });
-    // A page that can run the decoder worker, so it names what the backend
-    // names for it.
-    vi.stubGlobal("Worker", vi.fn());
+    stubBrowserFeatures();
     vi.spyOn(globalThis.crypto, "randomUUID").mockReturnValue(INSTANCE_ID);
   });
 

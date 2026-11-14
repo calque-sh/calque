@@ -62,6 +62,8 @@ struct Fixture {
     suffix: String,
     directory: tempfile::TempDir,
     issuer: GrantIssuer,
+    /// The collection's columns as the manifest declares them.
+    columns: Value,
 }
 
 impl Fixture {
@@ -72,6 +74,11 @@ impl Fixture {
             issuer: GrantIssuer::generate("live-source-wide-key", GRANT_AUDIENCE)
                 .unwrap()
                 .0,
+            columns: serde_json::json!([
+                { "name": "id", "postgresType": "uuid", "nullable": false },
+                { "name": "title", "postgresType": "text", "nullable": false },
+                { "name": "status", "postgresType": "text", "nullable": false },
+            ]),
         }
     }
 
@@ -166,7 +173,7 @@ impl Fixture {
             "protocol": { "manifest": 1, "artifact": 1, "changeStream": 1, "mutation": 1 },
             "sources": [{
                 "id": self.source_id(),
-                "connectionEnv": DATABASE_ENV,
+                "databaseUrlEnv": DATABASE_ENV,
                 "publication": self.publication(),
                 "slot": self.slot(),
             }],
@@ -181,11 +188,7 @@ impl Fixture {
                 "source": self.source_id(),
                 "kind": "table",
                 "relation": { "schema": "public", "table": self.table() },
-                "columns": [
-                    { "name": "id", "postgresType": "uuid", "nullable": false },
-                    { "name": "title", "postgresType": "text", "nullable": false },
-                    { "name": "status", "postgresType": "text", "nullable": false },
-                ],
+                "columns": self.columns,
                 "primaryKey": ["id"],
                 "scope": "all",
                 "adapter": "direct-columnar",
@@ -566,6 +569,19 @@ fn serve_publishes_a_direct_columnar_artifact_the_public_client_accepts() {
 
     // The bytes the plan points at are the direct-columnar container, whose
     // magic is `CALQART1`.
+    assert_eq!(
+        &artifact_bytes(serving.port, artifact)[..8],
+        b"CALQART1",
+        "artifact is not a direct-columnar container"
+    );
+
+    assert!(serving.shutdown(), "serve must exit cleanly on SIGTERM");
+    fixture.drop_source();
+}
+
+/// The bytes of the identity representation a bootstrap plan selected for
+/// `artifact`.
+fn artifact_bytes(port: u16, artifact: &Value) -> Vec<u8> {
     let representation = &artifact["selectedRepresentation"];
     assert_eq!(representation["encoding"], "identity", "{representation}");
     let download = representation["downloadUrl"]
@@ -576,7 +592,7 @@ fn serve_publishes_a_direct_columnar_artifact_the_public_client_accepts() {
         .and_then(|(_, rest)| rest.split_once('/'))
         .map_or(download, |(_, path)| path);
     let bytes = http(
-        serving.port,
+        port,
         "GET",
         &format!("/{}", path.trim_start_matches('/')),
         &[("accept-encoding", "identity".to_owned())],
@@ -588,13 +604,372 @@ fn serve_publishes_a_direct_columnar_artifact_the_public_client_accepts() {
         "{}",
         String::from_utf8_lossy(&bytes.body)
     );
-    assert_eq!(
-        &bytes.body[..8],
-        b"CALQART1",
-        "artifact is not a direct-columnar container"
+    bytes.body
+}
+
+/// A publication's column list keeps the columns it leaves out inside
+/// PostgreSQL: neither the plan, the artifact nor the log holds a hidden
+/// value, while an enum column arrives as its label's text and a domain
+/// column as its base type. Renaming an enum value then stops CDC, since it
+/// changes every row holding the value without a row change.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn a_column_list_keeps_hidden_values_in_postgres_and_enums_arrive_as_labels() {
+    let _exclusive = exclusive();
+    let mut fixture = Fixture::new("listed");
+    let mood = format!("mood_{}", fixture.suffix);
+    let points = format!("points_{}", fixture.suffix);
+    let hidden = format!("hidden-{}", uuid::Uuid::new_v4().simple());
+    let mut client = Client::connect(&database_url(), NoTls).unwrap();
+    client
+        .batch_execute(&format!(
+            "CREATE TYPE {mood} AS ENUM ('calm', 'busy');
+             CREATE DOMAIN {points} AS int4 CHECK (VALUE >= 0);
+             CREATE TABLE {table} (
+                 id uuid NOT NULL PRIMARY KEY,
+                 title text NOT NULL,
+                 status text NOT NULL,
+                 mood {mood} NOT NULL,
+                 points {points} NOT NULL,
+                 secret text NOT NULL,
+                 elapsed interval
+             );
+             CREATE PUBLICATION {publication}
+                 FOR TABLE {table} (id, title, status, mood, points);
+             INSERT INTO {table} VALUES
+                 ('00000000-0000-0000-0000-000000000001', 'listed title 1', 'open', 'calm', 3,
+                  '{hidden}', '1 hour'),
+                 ('00000000-0000-0000-0000-000000000002', 'listed title 2', 'open', 'busy', 5,
+                  '{hidden}', '2 hours');",
+            table = fixture.table(),
+            publication = fixture.publication(),
+        ))
+        .unwrap();
+    fixture.columns = serde_json::json!([
+        { "name": "id", "postgresType": "uuid", "nullable": false },
+        { "name": "title", "postgresType": "text", "nullable": false },
+        { "name": "status", "postgresType": "text", "nullable": false },
+        { "name": "mood", "postgresType": "text", "nullable": false },
+        { "name": "points", "postgresType": "int4", "nullable": false },
+    ]);
+    let serving = serve(
+        &fixture,
+        serde_json::json!([{
+            "id": "edit-task",
+            "kind": "crud",
+            "collection": fixture.table(),
+            "operations": ["update"],
+            "writableColumns": ["title", "status", "mood", "points"],
+        }]),
     );
 
+    let response = bootstrap(
+        serving.port,
+        &fixture.grant(1, 600),
+        &format!("public.{}", fixture.table()),
+        "identity",
+    );
+    assert_eq!(
+        response.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let plan = response.json();
+    let artifact = &plan["artifacts"][0];
+    let names: Vec<&str> = artifact["runtime"]["schema"]["tables"][0]["columns"]
+        .as_array()
+        .unwrap_or_else(|| panic!("plan names no columns: {plan}"))
+        .iter()
+        .map(|column| column["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["id", "title", "status", "mood", "points"], "{plan}");
+    assert!(!plan.to_string().contains(&hidden), "{plan}");
+
+    let bytes = artifact_bytes(serving.port, artifact);
+    let holds = |needle: &str| {
+        bytes
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    };
+    // The artifact stores text verbatim, so a listed value is found as it is
+    // written and the hidden one would be too.
+    assert!(
+        holds("listed title 2"),
+        "the artifact holds no listed title"
+    );
+    assert!(holds("busy"), "the artifact holds no enum label");
+    assert!(
+        !holds(&hidden),
+        "the artifact holds a value its column list hides"
+    );
+
+    let mut control = Client::connect(&database_url(), NoTls).unwrap();
+    let source_id = fixture.source_id();
+    let mut transaction = client.transaction().unwrap();
+    transaction
+        .batch_execute(&format!(
+            "INSERT INTO {table} VALUES
+                 ('00000000-0000-0000-0000-000000000003', 'listed title 3', 'open', 'busy', 8,
+                  '{hidden}', '3 hours');
+             UPDATE {table} SET secret = '{hidden}-changed', title = 'listed title 1b'
+              WHERE id = '00000000-0000-0000-0000-000000000001';",
+            table = fixture.table(),
+        ))
+        .unwrap();
+    let xid: i64 = transaction
+        .query_one("SELECT pg_current_xact_id()::text::bigint", &[])
+        .unwrap()
+        .get(0);
+    transaction.commit().unwrap();
+    wait_until("the write is logged", &serving.stderr, || {
+        logged(&mut control, &source_id, xid)
+    });
+    let records = canonical_records(&mut control, &source_id);
+    let (_, entry) = records
+        .iter()
+        .find(|(_, entry)| entry.to_string().contains("listed title 3"))
+        .expect("the write's record");
+    let rendered =
+        serde_json::to_string(&records.iter().map(|(_, entry)| entry).collect::<Vec<_>>()).unwrap();
+    assert!(
+        !rendered.contains(&hidden),
+        "the log holds a hidden value: {rendered}"
+    );
+    let insert = entry["record"]["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|operation| operation["kind"] == "INSERT_FULL_ROW")
+        .unwrap_or_else(|| panic!("no insert in {entry}"));
+    let cells = cells(&insert["columns"]);
+    assert_eq!(cells.len(), 5, "{insert}");
+    assert_eq!(text(cells[&4]), "busy");
+    assert_eq!(cells[&5]["kind"], "INT64", "{insert}");
+    assert_eq!(cells[&5]["value"], 8, "{insert}");
+
+    client
+        .batch_execute(&format!(
+            "ALTER TYPE {mood} RENAME VALUE 'busy' TO 'swamped'"
+        ))
+        .unwrap();
+    wait_until(
+        "CDC stops on the renamed enum value",
+        &serving.stderr,
+        || {
+            serving
+                .stderr
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("CDC runtime stopped without reconnecting"))
+        },
+    );
+    assert!(
+        !serving.shutdown(),
+        "serve must exit failing once CDC stopped"
+    );
+    fixture.drop_source();
+    let _ = client.batch_execute(&format!(
+        "DROP TYPE IF EXISTS {mood}; DROP DOMAIN IF EXISTS {points};"
+    ));
+}
+
+/// A column the manifest leaves out is left out of the publication `serve`
+/// creates, so PostgreSQL never sends it: it reaches neither the artifact nor
+/// the canonical log, whose replay still matches the table. The column can
+/// have a type and a generation Calque refuses, and a column added while
+/// serving neither stops the process nor its restart.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn a_column_the_manifest_leaves_out_never_leaves_postgresql() {
+    const SECRET: &str = "calque-unlisted-secret-5d1c";
+    const VISIBLE: &str = "calque-listed-title-5d1c";
+    let _exclusive = exclusive();
+    let fixture = Fixture::new("listed");
+    let table = fixture.table();
+    let source_id = fixture.source_id();
+    let mut control = Client::connect(&database_url(), NoTls).unwrap();
+    control
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (
+                 id uuid NOT NULL PRIMARY KEY,
+                 title text NOT NULL,
+                 status text NOT NULL,
+                 secret text NOT NULL DEFAULT '',
+                 search tsvector GENERATED ALWAYS AS (to_tsvector('simple', title)) STORED
+             );
+             INSERT INTO {table} (id, title, status, secret)
+             SELECT gen_random_uuid(), 'task ' || n, 'open', '{SECRET}-' || n
+               FROM generate_series(1, 8) AS n;"
+        ))
+        .unwrap();
+    let snapshot = source_rows(&mut control, &table);
+
+    let no_recut = ["--recut-tail-ratio", "0"];
+    let serving = serve_with(&fixture, fixture.default_commands(), &no_recut);
+    let published: Vec<String> = control
+        .query_one(
+            "SELECT attnames::text[] FROM pg_catalog.pg_publication_tables WHERE pubname = $1",
+            &[&fixture.publication()],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(published, ["id", "title", "status"]);
+
+    let response = bootstrap(
+        serving.port,
+        &fixture.grant(1, 600),
+        &format!("public.{table}"),
+        "identity",
+    );
+    assert_eq!(
+        response.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let plan = response.json();
+    let artifact = &plan["artifacts"][0];
+    let runtime = &artifact["runtime"];
+    let names = |columns: &Value| -> Vec<String> {
+        columns
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|column| column["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        names(&runtime["schema"]["tables"][0]["columns"]),
+        ["id", "title", "status"],
+        "{runtime}"
+    );
+    assert_eq!(
+        names(&runtime["tables"][0]["columns"]),
+        ["id", "title", "status"],
+        "{runtime}"
+    );
+    let bytes = artifact_bytes(serving.port, artifact);
+    assert!(
+        !bytes
+            .windows(SECRET.len())
+            .any(|window| window == SECRET.as_bytes()),
+        "the artifact holds an unlisted column's value"
+    );
+
+    let committed_xid = |control: &mut Client, statements: &str| -> i64 {
+        let mut transaction = control.transaction().unwrap();
+        transaction.batch_execute(statements).unwrap();
+        let xid = transaction
+            .query_one("SELECT pg_current_xact_id()::text::bigint", &[])
+            .unwrap()
+            .get(0);
+        transaction.commit().unwrap();
+        xid
+    };
+    let kept = uuid::Uuid::new_v4();
+    let dropped = uuid::Uuid::new_v4();
+    committed_xid(
+        &mut control,
+        &format!(
+            "INSERT INTO {table} (id, title, status, secret)
+             VALUES ('{kept}', '{VISIBLE}', 'open', '{SECRET}-kept'),
+                    ('{dropped}', 'short-lived', 'open', '{SECRET}-dropped')"
+        ),
+    );
+    committed_xid(
+        &mut control,
+        &format!("UPDATE {table} SET secret = '{SECRET}-changed' WHERE id = '{kept}'"),
+    );
+    committed_xid(
+        &mut control,
+        &format!("UPDATE {table} SET title = '{VISIBLE}-renamed' WHERE id = '{kept}'"),
+    );
+    let last = committed_xid(
+        &mut control,
+        &format!("DELETE FROM {table} WHERE id = '{dropped}'"),
+    );
+    wait_until("serve logs the writes", &serving.stderr, || {
+        logged(&mut control, &source_id, last)
+    });
+
+    let records = canonical_records(&mut control, &source_id);
+    for (sequence, entry) in &records {
+        for operation in entry["record"]["operations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            for field in ["columns", "changed_columns"] {
+                if let Some(columns) = operation[field].as_array() {
+                    for column in columns {
+                        let id = column["columnId"].as_u64().unwrap();
+                        assert!(
+                            (1..=3).contains(&id),
+                            "record {sequence} carries column {id}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let holding = |control: &mut Client, needle: &str| -> i64 {
+        control
+            .query_one(
+                "SELECT count(*) FROM calque_control.canonical_log_record
+                  WHERE source_id = $1
+                    AND position(convert_to($2, 'UTF8') IN entry_bytes) > 0",
+                &[&source_id, &needle],
+            )
+            .unwrap()
+            .get(0)
+    };
+    assert!(
+        holding(&mut control, VISIBLE) > 0,
+        "the log holds no listed value, so a search for an unlisted one proves nothing"
+    );
+    assert_eq!(
+        holding(&mut control, SECRET),
+        0,
+        "the log holds an unlisted column's value"
+    );
+    assert_eq!(
+        replay(snapshot, &records),
+        source_rows(&mut control, &table)
+    );
+
+    control
+        .batch_execute(&format!("ALTER TABLE {table} ADD COLUMN later text"))
+        .unwrap();
+    let after_add = committed_xid(
+        &mut control,
+        &format!(
+            "INSERT INTO {table} (id, title, status, later)
+             VALUES (gen_random_uuid(), 'after the migration', 'open', 'later')"
+        ),
+    );
+    wait_until(
+        "serve logs a write after ADD COLUMN",
+        &serving.stderr,
+        || logged(&mut control, &source_id, after_add),
+    );
     assert!(serving.shutdown(), "serve must exit cleanly on SIGTERM");
+
+    let restarted = serve_with(&fixture, fixture.default_commands(), &no_recut);
+    let after_restart = committed_xid(
+        &mut control,
+        &format!(
+            "INSERT INTO {table} (id, title, status)
+             VALUES (gen_random_uuid(), 'after the restart', 'open')"
+        ),
+    );
+    wait_until(
+        "the restarted serve logs a write",
+        &restarted.stderr,
+        || logged(&mut control, &source_id, after_restart),
+    );
+    assert!(restarted.shutdown(), "serve must exit cleanly on SIGTERM");
     fixture.drop_source();
 }
 
@@ -610,6 +985,17 @@ fn serve_starts_reaches_readyz_serves_a_bootstrap_and_shuts_down_cleanly() {
     let serving = serve(&fixture, fixture.default_commands());
 
     assert_eq!(serving.line("commands"), Some("1"));
+    let state_dir = fixture
+        .directory
+        .path()
+        .join("state")
+        .canonicalize()
+        .unwrap();
+    assert_eq!(
+        serving.line("state_dir"),
+        Some(state_dir.to_str().unwrap()),
+        "startup names the absolute state directory"
+    );
     assert_eq!(
         serving.line("mutations"),
         Some("mounted-per-collection-command-grant"),
@@ -692,7 +1078,17 @@ fn serve_starts_reaches_readyz_serves_a_bootstrap_and_shuts_down_cleanly() {
     }
 
     let port = serving.port;
+    let stderr = Arc::clone(&serving.stderr);
     assert!(serving.shutdown(), "serve must exit cleanly on SIGTERM");
+    for line in ["stopping: received SIGTERM", "stopped"] {
+        wait_until(line, &stderr, || {
+            stderr
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|logged| logged.contains(line))
+        });
+    }
     // Readiness is gone with the process, and the port is free again.
     assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
     fixture.drop_source();
@@ -812,6 +1208,110 @@ fn serve_refuses_an_unadvertised_enrolled_table_before_binding() {
     fixture.drop_source();
 }
 
+/// `calque serve` on a state whose replication slot was dropped while it was
+/// stopped refuses at startup, names the slot and what happened to it, and
+/// prints a `calque destroy` command that, run as printed, lets the next
+/// `serve` prepare the working set anew.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn a_serve_whose_slot_was_dropped_while_stopped_names_it_and_a_remedy_that_works() {
+    let _exclusive = exclusive();
+    let fixture = Fixture::new("slot_dropped");
+    fixture.seed(4);
+    let mut control = Client::connect(&database_url(), NoTls).unwrap();
+    let serving = serve(&fixture, fixture.default_commands());
+    assert!(serving.shutdown(), "serve must exit cleanly on SIGTERM");
+    let slot = fixture.slot();
+    let dropped = control
+        .execute(
+            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
+              WHERE slot_name = $1",
+            &[&slot],
+        )
+        .unwrap();
+    assert_eq!(dropped, 1, "serve left no slot to drop");
+
+    let refusal = serve_expecting_failure(&fixture);
+    assert!(
+        refusal.contains(&format!(
+            "replication slot {slot} no longer exists on the source"
+        )) && refusal.contains("it was dropped"),
+        "{refusal}"
+    );
+    let state = fixture.directory.path().join("state");
+    let remedy = format!(
+        "calque destroy --state-dir {} --database-url-env {DATABASE_ENV} --yes",
+        state.display()
+    );
+    assert!(
+        refusal.contains(&format!("Run {remedy}, then rerun serve")),
+        "{refusal}"
+    );
+
+    let destroyed = Command::new(env!("CARGO_BIN_EXE_calque"))
+        .args(shlex::split(&remedy).unwrap().into_iter().skip(1))
+        .env(DATABASE_ENV, database_url())
+        .output()
+        .unwrap();
+    assert!(
+        destroyed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&destroyed.stderr)
+    );
+    let serving = serve(&fixture, fixture.default_commands());
+    assert_eq!(serving.line("ready"), Some("true"));
+    assert!(serving.shutdown(), "serve must exit cleanly on SIGTERM");
+    fixture.drop_source();
+}
+
+/// Runs `calque serve` on the fixture's state until it exits, which it has to
+/// do on its own with a failure, and returns what it wrote to stderr.
+fn serve_expecting_failure(fixture: &Fixture) -> String {
+    let key_environment = fixture.issuer.verification_key_environment().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_calque"))
+        .args([
+            "serve",
+            "--config",
+            fixture.config(fixture.default_commands()).to_str().unwrap(),
+            "--state-dir",
+            fixture.directory.path().join("state").to_str().unwrap(),
+            "--grant-audience",
+            GRANT_AUDIENCE,
+            "--grant-verification-key-env",
+            GRANT_KEY_ENV,
+            "--allow-origin",
+            "http://127.0.0.1:5173",
+            "--port",
+            &reserved_port().to_string(),
+        ])
+        .env(DATABASE_ENV, database_url())
+        .env(GRANT_KEY_ENV, key_environment)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > READY_TIMEOUT {
+            let _ = child.kill();
+            panic!("serve neither started nor refused within {READY_TIMEOUT:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!status.success(), "serve started: {stderr}");
+    stderr
+}
+
 /// How long a restarted `serve` gets to wait out the killed one's lease and
 /// catch up with what was committed while nothing was reading.
 const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(300);
@@ -907,8 +1407,9 @@ fn a_serve_killed_mid_stream_resumes_with_every_transaction_exactly_once() {
     assert!(serving.shutdown(), "serve must exit cleanly on SIGTERM");
 
     // The log trims only what lies behind the snapshot's cut: the retired
-    // sequences and the kept ones run from 1 together, and a writer's
-    // transaction that was retired is counted lost below.
+    // sequences and the kept ones run together from 1, or from just after the
+    // identities the log forgot because PostgreSQL cannot send them again, and
+    // a writer's transaction that was retired is counted lost below.
     let retired = control
         .query(
             "SELECT original_sequence FROM calque_control.canonical_log_retired_record
@@ -920,13 +1421,28 @@ fn a_serve_killed_mid_stream_resumes_with_every_transaction_exactly_once() {
         .map(|row| row.get::<_, i64>(0))
         .collect::<Vec<_>>();
     let records = canonical_records(&mut control, &source_id);
-    let sequences = retired
+    let mut sequences = retired
         .iter()
         .copied()
-        .chain(records.iter().map(|(sequence, _)| *sequence));
+        .chain(records.iter().map(|(sequence, _)| *sequence))
+        .peekable();
+    let first = sequences.peek().copied().unwrap_or(1);
+    let compacted: Option<String> = control
+        .query_opt(
+            "SELECT retired_compacted_through_lsn::text
+               FROM calque_control.canonical_log_retention WHERE source_id = $1",
+            &[&source_id],
+        )
+        .unwrap()
+        .and_then(|row| row.get(0));
     assert!(
-        sequences.eq(1..=i64::try_from(retired.len() + records.len()).unwrap()),
-        "the log's sequences are not contiguous from 1"
+        first == 1 || compacted.is_some(),
+        "the log lost sequences 1 to {} without compacting them",
+        first - 1
+    );
+    assert!(
+        sequences.eq(first..first + i64::try_from(retired.len() + records.len()).unwrap()),
+        "the log's sequences are not contiguous"
     );
     // Canonical order is commit order: each record ends later in the WAL than
     // the one before it.

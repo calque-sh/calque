@@ -1,0 +1,924 @@
+{
+  "description": "Manifests calque serve and compileConfig must both refuse before PostgreSQL is reached, and ones both must accept: each case applies a JSON Patch (RFC 6902; add, replace, remove and copy) to a base manifest, and both bases must be accepted.",
+  "bases": {
+    "source-wide": "serve-sourcewide-smoke.config.json",
+    "tenants": "serve-tenants.config.json"
+  },
+  "cases": [
+    {
+      "name": "an unknown top-level field",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/extra",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "connectionEnv, the earlier name of databaseUrlEnv",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/sources/0/databaseUrlEnv"
+        },
+        {
+          "op": "add",
+          "path": "/sources/0/connectionEnv",
+          "value": "SERVE_SMOKE_DATABASE_URL"
+        }
+      ]
+    },
+    {
+      "name": "a connection string in databaseUrlEnv",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/sources/0/databaseUrlEnv",
+          "value": "postgres://calque:secret@db/app"
+        }
+      ]
+    },
+    {
+      "name": "a lowercase databaseUrlEnv",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/sources/0/databaseUrlEnv",
+          "value": "pg_url"
+        }
+      ]
+    },
+    {
+      "name": "an empty databaseUrlEnv",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/sources/0/databaseUrlEnv",
+          "value": ""
+        }
+      ]
+    },
+    {
+      "name": "an unknown field in a source",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/sources/0/password",
+          "value": "secret"
+        }
+      ]
+    },
+    {
+      "name": "a second source",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/sources/-",
+          "value": {
+            "id": "other",
+            "databaseUrlEnv": "OTHER_DATABASE_URL",
+            "publication": "other",
+            "slot": "other"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a second scope",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/scopes/-",
+          "value": {
+            "id": "more",
+            "source": "serve-smoke",
+            "kind": "source-wide",
+            "dataVersion": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "protocol.manifest other than 1",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/protocol/manifest",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "name": "protocol.artifact other than 1",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/protocol/artifact",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "name": "protocol.changeStream other than 1",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/protocol/changeStream",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "name": "protocol.mutation other than 1",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/protocol/mutation",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "name": "an empty application id",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/application/id",
+          "value": ""
+        }
+      ]
+    },
+    {
+      "name": "an application id outside the grammar",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/application/id",
+          "value": "Serve Smoke"
+        }
+      ]
+    },
+    {
+      "name": "an empty application version",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/application/version",
+          "value": ""
+        }
+      ]
+    },
+    {
+      "name": "a source id outside the grammar",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/sources/0/id",
+          "value": "Serve_Smoke"
+        },
+        {
+          "op": "replace",
+          "path": "/scopes/0/source",
+          "value": "Serve_Smoke"
+        },
+        {
+          "op": "replace",
+          "path": "/collections/0/source",
+          "value": "Serve_Smoke"
+        },
+        {
+          "op": "replace",
+          "path": "/collections/1/source",
+          "value": "Serve_Smoke"
+        }
+      ]
+    },
+    {
+      "name": "a scope id outside the grammar",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/scopes/0/id",
+          "value": "All"
+        },
+        {
+          "op": "replace",
+          "path": "/collections/0/scope",
+          "value": "All"
+        },
+        {
+          "op": "replace",
+          "path": "/collections/1/scope",
+          "value": "All"
+        }
+      ]
+    },
+    {
+      "name": "a scope on an unknown source",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/scopes/0/source",
+          "value": "elsewhere"
+        }
+      ]
+    },
+    {
+      "name": "dataVersion 0",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/scopes/0/dataVersion",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "a scope kind serve does not run",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/scopes/0/kind",
+          "value": "per-user"
+        }
+      ]
+    },
+    {
+      "name": "a publication name over 63 bytes",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/sources/0/publication",
+          "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      ]
+    },
+    {
+      "name": "a slot name over 63 bytes",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/sources/0/slot",
+          "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      ]
+    },
+    {
+      "name": "no collections",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections",
+          "value": []
+        },
+        {
+          "op": "replace",
+          "path": "/commands",
+          "value": []
+        }
+      ]
+    },
+    {
+      "name": "a collection whose id is not its table",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/id",
+          "value": "project"
+        },
+        {
+          "op": "replace",
+          "path": "/commands/0/collection",
+          "value": "project"
+        }
+      ]
+    },
+    {
+      "name": "two collections on one relation",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "copy",
+          "from": "/collections/0",
+          "path": "/collections/-"
+        }
+      ]
+    },
+    {
+      "name": "a collection on an unknown source",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/source",
+          "value": "elsewhere"
+        }
+      ]
+    },
+    {
+      "name": "a collection in an unknown scope",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/scope",
+          "value": "elsewhere"
+        }
+      ]
+    },
+    {
+      "name": "a collection kind other than table",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/kind",
+          "value": "view"
+        }
+      ]
+    },
+    {
+      "name": "an adapter other than direct-columnar",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/adapter",
+          "value": "tanstack-db"
+        }
+      ]
+    },
+    {
+      "name": "an encoding other than calque-columnar",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/encoding",
+          "value": "json"
+        }
+      ]
+    },
+    {
+      "name": "an unknown field in a collection",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/collections/0/where",
+          "value": "status = 'open'"
+        }
+      ]
+    },
+    {
+      "name": "a collection with no columns",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/columns",
+          "value": []
+        }
+      ]
+    },
+    {
+      "name": "a column named twice",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/collections/0/columns/-",
+          "value": {
+            "name": "name",
+            "postgresType": "text",
+            "nullable": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "a column type serve does not enroll",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/columns/2/postgresType",
+          "value": "citext"
+        }
+      ]
+    },
+    {
+      "name": "an empty postgresType",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/columns/2/postgresType",
+          "value": ""
+        }
+      ]
+    },
+    {
+      "name": "a column name over 63 bytes",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/columns/2/name",
+          "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        {
+          "op": "replace",
+          "path": "/commands/0/writableColumns/1",
+          "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      ]
+    },
+    {
+      "name": "a nullable that is not a boolean",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/columns/2/nullable",
+          "value": "false"
+        }
+      ]
+    },
+    {
+      "name": "an empty primaryKey",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/primaryKey",
+          "value": []
+        }
+      ]
+    },
+    {
+      "name": "a primaryKey column the collection does not name",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/primaryKey",
+          "value": [
+            "missing"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "partitionColumn under a source-wide scope",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/collections/0/partitionColumn",
+          "value": "id"
+        }
+      ]
+    },
+    {
+      "name": "shared under a source-wide scope",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/collections/0/shared",
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "a partitioned-scope collection with neither partitionColumn nor shared",
+      "base": "tenants",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/collections/0/shared"
+        }
+      ]
+    },
+    {
+      "name": "a collection with both partitionColumn and shared",
+      "base": "tenants",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/collections/0/partitionColumn",
+          "value": "id"
+        }
+      ]
+    },
+    {
+      "name": "shared set to false",
+      "base": "tenants",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/shared",
+          "value": false
+        }
+      ]
+    },
+    {
+      "name": "a partition column that does not lead the primary key",
+      "base": "tenants",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/1/primaryKey",
+          "value": [
+            "id",
+            "tenant_id"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a partition column of type text",
+      "base": "tenants",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/1/columns/0/postgresType",
+          "value": "text"
+        },
+        {
+          "op": "replace",
+          "path": "/collections/2/columns/0/postgresType",
+          "value": "text"
+        }
+      ]
+    },
+    {
+      "name": "partition columns of two types",
+      "base": "tenants",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/1/columns/0/postgresType",
+          "value": "int4"
+        }
+      ]
+    },
+    {
+      "name": "a partitioned scope with no partitioned collection",
+      "base": "tenants",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/collections/1/partitionColumn"
+        },
+        {
+          "op": "add",
+          "path": "/collections/1/shared",
+          "value": true
+        },
+        {
+          "op": "remove",
+          "path": "/collections/2/partitionColumn"
+        },
+        {
+          "op": "add",
+          "path": "/collections/2/shared",
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "no commands",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands",
+          "value": []
+        }
+      ]
+    },
+    {
+      "name": "a command on an unknown collection",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands/0/collection",
+          "value": "nothing"
+        }
+      ]
+    },
+    {
+      "name": "two commands on one collection",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "copy",
+          "from": "/commands/0",
+          "path": "/commands/-"
+        },
+        {
+          "op": "replace",
+          "path": "/commands/2/id",
+          "value": "edit-project-again"
+        }
+      ]
+    },
+    {
+      "name": "a command id used twice",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands/1/id",
+          "value": "edit-project"
+        }
+      ]
+    },
+    {
+      "name": "a command id outside the grammar",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands/0/id",
+          "value": "Edit Project"
+        }
+      ]
+    },
+    {
+      "name": "an empty command id",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands/0/id",
+          "value": ""
+        }
+      ]
+    },
+    {
+      "name": "an operation other than insert, update and delete",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands/0/operations",
+          "value": [
+            "upsert"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "an operation named twice",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands/0/operations",
+          "value": [
+            "update",
+            "update"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "no operations",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands/0/operations",
+          "value": []
+        }
+      ]
+    },
+    {
+      "name": "a writable column named twice",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands/0/writableColumns",
+          "value": [
+            "name",
+            "name"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a writable column the collection does not name",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands/0/writableColumns",
+          "value": [
+            "name",
+            "missing"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a writable primary-key column",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands/0/writableColumns",
+          "value": [
+            "id",
+            "name",
+            "status"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "update with no writable column",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands/0/writableColumns",
+          "value": []
+        }
+      ]
+    },
+    {
+      "name": "an insert that leaves out a non-key column",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands/1/writableColumns",
+          "value": [
+            "project_id",
+            "title"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a backend command",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands/0/kind",
+          "value": "backend"
+        }
+      ]
+    },
+    {
+      "name": "a command kind other than crud",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commands/0/kind",
+          "value": "rpc"
+        }
+      ]
+    },
+    {
+      "name": "an unknown field in a command",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/commands/0/handler",
+          "value": "x"
+        }
+      ]
+    },
+    {
+      "name": "a collection named outside the grammar",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/id",
+          "value": "Projects"
+        },
+        {
+          "op": "replace",
+          "path": "/collections/0/relation/table",
+          "value": "Projects"
+        },
+        {
+          "op": "replace",
+          "path": "/commands/0/collection",
+          "value": "Projects"
+        }
+      ]
+    },
+    {
+      "name": "a relation schema over 63 bytes",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/relation/schema",
+          "value": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"
+        }
+      ]
+    },
+    {
+      "name": "an empty relation schema",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collections/0/relation/schema",
+          "value": ""
+        }
+      ]
+    }
+  ],
+  "accepted": [
+    {
+      "name": "a key-only collection whose command inserts and deletes with no writable column",
+      "base": "source-wide",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/collections/-",
+          "value": {
+            "id": "tags",
+            "source": "serve-smoke",
+            "kind": "table",
+            "relation": {
+              "schema": "public",
+              "table": "tags"
+            },
+            "columns": [
+              {
+                "name": "task_id",
+                "postgresType": "int8",
+                "nullable": false
+              },
+              {
+                "name": "label",
+                "postgresType": "text",
+                "nullable": false
+              }
+            ],
+            "primaryKey": [
+              "task_id",
+              "label"
+            ],
+            "scope": "all",
+            "adapter": "direct-columnar",
+            "encoding": "calque-columnar"
+          }
+        },
+        {
+          "op": "add",
+          "path": "/commands/-",
+          "value": {
+            "id": "edit-tags",
+            "kind": "crud",
+            "collection": "tags",
+            "operations": [
+              "insert",
+              "delete"
+            ],
+            "writableColumns": []
+          }
+        }
+      ]
+    }
+  ]
+}

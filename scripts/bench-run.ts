@@ -54,6 +54,7 @@ import { runSql } from "./bench-postgres.ts";
 import { realtimePasses, realtimeSession } from "./bench-realtime.ts";
 import { log, redactedUrl, writeRecord } from "./bench-record.ts";
 import {
+  aboveWireMs,
   artifactObjectLine,
   artifactObjectReasons,
   directionalReasons,
@@ -404,7 +405,7 @@ async function measure(run: Run) {
     realtimeVoided: realtime.voidReason !== null,
   };
   const rows = thresholdRows(measurements);
-  // Reported, not judged: no threshold reads any of the three.
+  // Reported, not judged: no threshold reads the query, byte or link readings.
   const queryMs = cold.map((sample) =>
     rankedValue({
       verdict: sample.query?.verdict ?? "DNC",
@@ -412,6 +413,19 @@ async function measure(run: Run) {
     }),
   );
   const wire = passedCold.map((sample) => wireByPurpose(sample.requests));
+  // The link's rate where the run set one, in Chrome's emulation or the
+  // kernel shaper; `above_wire_ms` is null where it did not.
+  const linkMegabitsPerSecond = run.options.network?.megabitsPerSecond ?? null;
+  const aboveWire = cold.map((sample) =>
+    aboveWireMs(
+      {
+        verdict: sample.verdict,
+        valueMs: sample.coldMs,
+        totalBytes: wireByPurpose(sample.requests).total,
+      },
+      linkMegabitsPerSecond,
+    ),
+  );
   const milestone = (name: string) =>
     distribution(
       passedCold.map((sample) => {
@@ -471,6 +485,10 @@ async function measure(run: Run) {
           },
     complete_stable_paint_ms: distribution(measurements.coldMs),
     commit_to_stable_paint_ms: distribution(measurements.commitMs),
+    // Each cold sample's paint minus the time its bytes need on the link;
+    // reported, not judged: no threshold reads it.
+    above_wire_ms:
+      linkMegabitsPerSecond === null ? null : distribution(aboveWire),
     milestones: {
       readyAt: milestone("readyAt"),
       firstWindowAt: milestone("firstWindowAt"),

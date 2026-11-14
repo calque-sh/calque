@@ -523,10 +523,13 @@ fn missing_enrolled_slot_is_a_reseed_boundary_not_auto_creation() {
         &activated,
     )
     .unwrap_err();
-    assert!(matches!(
-        error,
-        source_runtime::SourceRuntimeError::SlotMissingReseedRequired
-    ));
+    assert!(
+        matches!(
+            &error,
+            source_runtime::SourceRuntimeError::SlotMissing { slot_name } if *slot_name == slot
+        ),
+        "{error}"
+    );
     let slot_count: i64 = source
         .query_one(
             "SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
@@ -592,35 +595,7 @@ impl OpenTransactionFixture {
     /// `open_for`. Returns once the write has run, with the session's
     /// `pg_stat_activity` entry as slot creation reports it.
     fn hold_open_write(&self, open_for: Duration) -> (OpenTransaction, thread::JoinHandle<()>) {
-        let (opened, opened_rx) = std::sync::mpsc::channel();
-        let url = self.source_url.clone();
-        let insert = format!("INSERT INTO public.{} (id) VALUES (1)", self.table);
-        let holder = thread::spawn(move || {
-            let mut client = Client::connect(&url, NoTls).unwrap();
-            let mut transaction = client.transaction().unwrap();
-            transaction.batch_execute(&insert).unwrap();
-            let row = transaction
-                .query_one(
-                    "SELECT pid, usename::text, datname::text, xact_start::text
-                       FROM pg_catalog.pg_stat_activity WHERE pid = pg_catalog.pg_backend_pid()",
-                    &[],
-                )
-                .unwrap();
-            opened
-                .send(OpenTransaction::Session {
-                    pid: row.get(0),
-                    role: row.get(1),
-                    database: row.get(2),
-                    started: row.get(3),
-                })
-                .unwrap();
-            thread::sleep(open_for);
-            transaction.rollback().unwrap();
-        });
-        let open = opened_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the holder session wrote in its transaction");
-        (open, holder)
+        hold_open_write(&self.source_url, &self.table, open_for)
     }
 
     fn slot_exists(&mut self) -> bool {
@@ -706,8 +681,10 @@ fn slot_creation_names_the_open_transaction_it_stopped_waiting_for() {
             Duration::from_secs(10),
         ))
         .unwrap();
-    let bound = Duration::from_secs(2);
-    let (open, holder) = fixture.hold_open_write(Duration::from_secs(4));
+    // Past the reply bound of a controller connection whose statements run
+    // for 2 s, so slot creation's connection has to be bounded by its wait.
+    let bound = Duration::from_secs(6);
+    let (open, holder) = fixture.hold_open_write(Duration::from_secs(8));
     let started = Instant::now();
     let refused = provision_persistent_slot(
         &fixture.authority,
@@ -1021,5 +998,108 @@ fn closing_a_session_stops_a_watchdog_that_is_retrying_a_locked_lease_row() {
         closed_after < Duration::from_millis(2_500),
         "closing waited {closed_after:?} for the watchdog"
     );
+    fixture.remove();
+}
+
+/// Opens a transaction that writes to `table` and holds it for `open_for`,
+/// once it holds a transaction id.
+fn hold_open_write(
+    source_url: &str,
+    table: &str,
+    open_for: Duration,
+) -> (OpenTransaction, thread::JoinHandle<()>) {
+    let (opened, opened_rx) = std::sync::mpsc::channel();
+    let url = source_url.to_owned();
+    let insert = format!("INSERT INTO public.{table} (id) VALUES (1)");
+    let holder = thread::spawn(move || {
+        let mut client = Client::connect(&url, NoTls).unwrap();
+        let mut transaction = client.transaction().unwrap();
+        transaction.batch_execute(&insert).unwrap();
+        let row = transaction
+            .query_one(
+                "SELECT pid, usename::text, datname::text, xact_start::text
+                   FROM pg_catalog.pg_stat_activity WHERE pid = pg_catalog.pg_backend_pid()",
+                &[],
+            )
+            .unwrap();
+        opened
+            .send(OpenTransaction::Session {
+                pid: row.get(0),
+                role: row.get(1),
+                database: row.get(2),
+                started: row.get(3),
+            })
+            .unwrap();
+        thread::sleep(open_for);
+        transaction.rollback().unwrap();
+    });
+    let open = opened_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the holder session wrote in its transaction");
+    (open, holder)
+}
+
+/// PostgreSQL waits for the transactions open when slot creation begins, then
+/// for those open once they have ended, each on its own lock. The wait bound
+/// covers them all: a transaction opened during the first wait, and still open
+/// when the bound runs out, is named like one open from the start.
+#[test]
+#[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+fn slot_creation_bounds_its_wait_across_transactions_it_waits_for_in_turn() {
+    let mut fixture = OpenTransactionFixture::create("slot_in_turn");
+    let provisional = fixture
+        .authority
+        .acquire(acquire_request(
+            &fixture.source_id,
+            &fixture.epoch,
+            "provisioner",
+            Duration::from_secs(10),
+        ))
+        .unwrap();
+    let bound = Duration::from_secs(4);
+    let (_first, first_holder) = fixture.hold_open_write(Duration::from_secs(3));
+    let (url, table) = (fixture.source_url.clone(), fixture.table.clone());
+    let later = thread::spawn(move || {
+        thread::sleep(Duration::from_secs(1));
+        hold_open_write(&url, &table, Duration::from_secs(10))
+    });
+    let started = Instant::now();
+    let refused = provision_persistent_slot(
+        &fixture.authority,
+        &provisional,
+        &fixture.source_url,
+        &fixture.activated,
+        &SlotProvisioningConfig::new(&fixture.slot)
+            .unwrap()
+            .with_open_transaction_wait(bound),
+    );
+    let waited = started.elapsed();
+    let (opened_later, later_holder) = later.join().unwrap();
+    match refused {
+        Err(SourceRuntimeError::SlotCreationWaitedForOpenTransactions { open, .. }) => {
+            assert!(
+                open.contains(&opened_later),
+                "{opened_later} is missing from {open:?}"
+            );
+        }
+        other => panic!("slot creation ended with {other:?}, not at the wait bound"),
+    }
+    assert!(
+        waited >= bound && waited < bound + Duration::from_secs(2),
+        "slot creation gave up after {waited:?}, not at the {bound:?} bound"
+    );
+    assert!(!fixture.slot_exists(), "a slot outlived the refusal");
+    first_holder.join().unwrap();
+    later_holder.join().unwrap();
+
+    provision_persistent_slot(
+        &fixture.authority,
+        &provisional,
+        &fixture.source_url,
+        &fixture.activated,
+        &SlotProvisioningConfig::new(&fixture.slot).unwrap(),
+    )
+    .expect("enrollment succeeds once both transactions end");
+    fixture.authority.release(&provisional).unwrap();
     fixture.remove();
 }

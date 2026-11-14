@@ -20,7 +20,7 @@ use bootstrap_api::BootstrapPlan;
 use http_headers::has_media_type;
 pub use http_headers::BearerToken;
 use serde::{Deserialize, Serialize};
-use sync_types::{ArtifactId, TableId};
+use sync_types::{ArtifactId, OpaqueCursor, TableId};
 use tracing::{info_span, Instrument};
 
 const BOOTSTRAP_PATH: &str = "/v1/bootstrap";
@@ -39,6 +39,8 @@ pub struct BootstrapHttpRequest {
     pub required_tables: BTreeSet<TableId>,
     pub resident_state_proof: Option<String>,
     pub resident_tables: BTreeSet<TableId>,
+    /// Where the resident tables stand; named exactly when they are.
+    pub resident_cursor: Option<OpaqueCursor>,
     pub cached_artifact_hints: BTreeSet<ArtifactId>,
     pub accepted_encodings: Vec<RepresentationEncoding>,
     pub memory_budget_bytes: u64,
@@ -171,6 +173,7 @@ struct WireBootstrapRequest {
     resident_state_proof: Option<String>,
     #[serde(default)]
     resident_tables: Vec<String>,
+    resident_cursor: Option<String>,
     #[serde(default)]
     cached_artifact_hints: Vec<String>,
     accepted_encodings: Vec<RepresentationEncoding>,
@@ -228,11 +231,17 @@ impl TryFrom<WireBootstrapRequest> for BootstrapHttpRequest {
             .map(TableId::new)
             .collect::<Result<BTreeSet<_>, _>>()
             .map_err(|_| BootstrapHttpError::InvalidRequest)?;
+        let resident_cursor = wire
+            .resident_cursor
+            .map(OpaqueCursor::parse)
+            .transpose()
+            .map_err(|_| BootstrapHttpError::InvalidRequest)?;
         let accepted_encodings = wire.accepted_encodings;
         if required_tables.len() != required_table_count
             || cached_artifact_hints.len() != cache_hint_count
             || resident_tables.len() != resident_table_count
             || (wire.resident_state_proof.is_none() && !resident_tables.is_empty())
+            || resident_cursor.is_some() == resident_tables.is_empty()
             || accepted_encodings
                 .iter()
                 .enumerate()
@@ -244,6 +253,7 @@ impl TryFrom<WireBootstrapRequest> for BootstrapHttpRequest {
             required_tables,
             resident_state_proof: wire.resident_state_proof,
             resident_tables,
+            resident_cursor,
             cached_artifact_hints,
             accepted_encodings,
             memory_budget_bytes: wire.memory_budget_bytes,
@@ -717,6 +727,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A renewal names the cursor its resident tables stand at, and a request
+    /// that names no resident tables names no cursor.
+    #[tokio::test]
+    async fn a_resident_cursor_comes_exactly_with_resident_tables() {
+        let body = |tables: &[&str], cursor: Option<&str>| {
+            let mut body: serde_json::Value = serde_json::from_str(&valid_body()).unwrap();
+            if !tables.is_empty() {
+                body["residentStateProof"] = serde_json::json!("proof");
+                body["residentTables"] = serde_json::json!(tables);
+            }
+            if let Some(cursor) = cursor {
+                body["residentCursor"] = serde_json::json!(cursor);
+            }
+            body.to_string()
+        };
+        for (tables, cursor, status) in [
+            (&["table/tasks"][..], None, StatusCode::BAD_REQUEST),
+            (&[][..], Some("cursor-7"), StatusCode::BAD_REQUEST),
+            (&["table/tasks"][..], Some(""), StatusCode::BAD_REQUEST),
+            (
+                &["table/tasks"][..],
+                Some("cursor-7"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (&[][..], None, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let response = router(RefusingBackend(BootstrapHttpError::Unavailable))
+                .oneshot(request(body(tables, cursor)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{tables:?} {cursor:?}");
+        }
     }
 
     /// A backend that answers every request with one refusal, so the response

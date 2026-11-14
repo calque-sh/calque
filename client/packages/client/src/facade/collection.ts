@@ -1,6 +1,6 @@
 import { sealOptionalAbortSignal } from "../abort-signal.js";
 import type { GeneratedClientCollectionDescriptor } from "../generated-schema.js";
-import type { MutationResult } from "../mutation.js";
+import type { MutationAccepted } from "../mutation.js";
 import { cellReader, type FacadePort, type QueryRow } from "./port.js";
 import { createQueryBuilder } from "./query-builder.js";
 import { registerFacade } from "./registry.js";
@@ -131,7 +131,7 @@ export function createCollectionFacade(
       .filter((column) => !keyColumns.has(column) && !writable.has(column))
       .sort();
     const allowed = new Set([...keyColumns, ...writable]);
-    facade.insert = async (row: unknown): Promise<MutationResult> => {
+    facade.insert = async (row: unknown): Promise<MutationAccepted> => {
       if (omitted.length > 0)
         throw new TypeError(
           `${descriptor.id} cannot insert: its writableColumns omit ${omitted.join(", ")}, and an insert writes every non-key column`,
@@ -150,7 +150,7 @@ export function createCollectionFacade(
     facade.update = async (
       key: unknown,
       patch: unknown,
-    ): Promise<MutationResult> => {
+    ): Promise<MutationAccepted> => {
       const captured = captureKey(key, "update key");
       const values = captureRecord(patch, writable, "update patch");
       if (Object.keys(values).length === 0)
@@ -158,7 +158,7 @@ export function createCollectionFacade(
       return port.mutate(descriptor.id, "update", captured, values);
     };
   if (operations.has("delete"))
-    facade.delete = async (key: unknown): Promise<MutationResult> =>
+    facade.delete = async (key: unknown): Promise<MutationAccepted> =>
       port.mutate(
         descriptor.id,
         "delete",

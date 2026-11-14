@@ -8,6 +8,7 @@ import {
 import { DECODER_INPUT_WINDOW_BYTES } from "@calque/worker/columnar";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { stubWebAssemblyPolicy } from "../browser.fixture.js";
 import {
   byteStream,
   until,
@@ -111,18 +112,18 @@ describe("a brotli-large-window artifact", () => {
     await client.close();
   });
 
-  it.each([
+  it.each<readonly [string, () => void, readonly string[]]>([
     [
-      "names the two brotli encodings first in the bootstrap request where the decoder worker can run",
-      () => vi.stubGlobal("Worker", vi.fn()),
+      "names the two brotli encodings first in the bootstrap request where WebAssembly compiles",
+      () => undefined,
       ["packed-brotli-large-window", "brotli-large-window", "zstd", "identity"],
     ],
     [
-      "names only zstd and identity where it cannot",
-      () => vi.stubGlobal("Worker", undefined),
+      "names only zstd and identity where a policy forbids compiling it",
+      stubWebAssemblyPolicy,
       ["zstd", "identity"],
     ],
-  ] as const)("%s", async (_case, stub, encodings) => {
+  ])("%s", async (_case, stub, encodings) => {
     stub();
     const { client, fetcher } = makeDecodingClient(serveBody(ENCODED));
     expect(await settled(client)).toEqual({ state: "ready" });

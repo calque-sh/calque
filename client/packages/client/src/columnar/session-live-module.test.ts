@@ -14,6 +14,7 @@ import {
   validatedFetch,
 } from "./session.fixture.js";
 import type { ColumnarEngineWorker } from "./worker.js";
+import { stubBrowserFeatures } from "../browser.fixture.js";
 
 // The change stream's module loads while the artifact downloads. Holding it
 // back lets a reset land after the artifact opened and before any change
@@ -27,9 +28,7 @@ vi.mock("@calque/worker/columnar-live", async (importOriginal) => {
 });
 
 beforeEach(() => {
-  vi.stubGlobal("navigator", {
-    userAgentData: { brands: [{ brand: "Chromium" }] },
-  });
+  stubBrowserFeatures();
   performance.clearMarks();
 });
 

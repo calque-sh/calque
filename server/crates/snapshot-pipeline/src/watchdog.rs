@@ -91,10 +91,13 @@ impl SnapshotPressureSampler for PostgresSnapshotPressureSampler {
     }
 }
 
-/// Optional periodic pressure monitor attached to a watchdog.
+/// Optional periodic pressure monitor attached to a watchdog. A sample that
+/// times out is taken again until `blind_limit` has passed without one; any
+/// other sampling failure stops the build at once.
 pub(crate) struct SnapshotPressureMonitor {
     interval: Duration,
     sample_timeout: Duration,
+    blind_limit: Duration,
     policy: SnapshotPressurePolicy,
     sampler: Box<dyn SnapshotPressureSampler>,
 }
@@ -103,15 +106,17 @@ impl SnapshotPressureMonitor {
     pub fn new(
         interval: Duration,
         sample_timeout: Duration,
+        blind_limit: Duration,
         policy: SnapshotPressurePolicy,
         sampler: impl SnapshotPressureSampler,
     ) -> Result<Self, SnapshotWatchdogError> {
-        if interval.is_zero() || sample_timeout.is_zero() {
+        if interval.is_zero() || sample_timeout.is_zero() || blind_limit.is_zero() {
             return Err(SnapshotWatchdogError::InvalidConfiguration);
         }
         Ok(Self {
             interval,
             sample_timeout,
+            blind_limit,
             policy,
             sampler: Box::new(sampler),
         })
@@ -120,6 +125,7 @@ impl SnapshotPressureMonitor {
     pub fn postgres(
         interval: Duration,
         sample_timeout: Duration,
+        blind_limit: Duration,
         client: Client,
         target: SnapshotPressureTarget,
         policy: SnapshotPressurePolicy,
@@ -127,6 +133,7 @@ impl SnapshotPressureMonitor {
         Self::new(
             interval,
             sample_timeout,
+            blind_limit,
             policy,
             PostgresSnapshotPressureSampler::new(client, target),
         )
@@ -600,6 +607,7 @@ async fn run_pressure_sampler(
 ) {
     let mut interval = time::interval(monitor.interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_sample = Instant::now();
     loop {
         tokio::select! {
             biased;
@@ -616,6 +624,15 @@ async fn run_pressure_sampler(
                 result.unwrap_or(Err(SnapshotPressureSamplingFailure::SampleTimeout))
             }
         };
+        match result {
+            Ok(_) => last_sample = Instant::now(),
+            Err(SnapshotPressureSamplingFailure::SampleTimeout)
+                if last_sample.elapsed() < monitor.blind_limit =>
+            {
+                continue;
+            }
+            Err(_) => {}
+        }
         let terminal = result.is_err();
         let sent = tokio::select! {
             biased;
@@ -737,6 +754,30 @@ mod tests {
         }
     }
 
+    /// Answers its script in order, where `None` never answers, then healthy
+    /// samples.
+    struct ScriptedSampler {
+        steps: VecDeque<Option<Result<SnapshotPressureSample, SnapshotPressureSamplingFailure>>>,
+    }
+
+    impl SnapshotPressureSampler for ScriptedSampler {
+        fn sample(
+            &mut self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<SnapshotPressureSample, SnapshotPressureSamplingFailure>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            match self.steps.pop_front() {
+                Some(None) => Box::pin(pending()),
+                Some(Some(result)) => Box::pin(async move { result }),
+                None => Box::pin(async { Ok(healthy_sample()) }),
+            }
+        }
+    }
+
     struct PendingSampler;
 
     impl SnapshotPressureSampler for PendingSampler {
@@ -788,6 +829,7 @@ mod tests {
         SnapshotPressureMonitor::new(
             Duration::from_secs(1),
             Duration::from_millis(500),
+            Duration::from_secs(5),
             pressure_policy(),
             sampler,
         )
@@ -1001,14 +1043,17 @@ mod tests {
         let pressure = SnapshotPressureMonitor::new(
             Duration::from_secs(1),
             Duration::from_millis(500),
+            Duration::from_secs(5),
             pressure_policy(),
             PendingSampler,
         )
         .unwrap();
+        let started = Instant::now();
         let mut watchdog =
             SnapshotLifecycleWatchdog::spawn(config(60, 10), child.clone(), Some(pressure));
 
         let state = watchdog.join_task().await.unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(5));
         assert!(child.is_cancelled());
         assert_eq!(
             state.failure_reason,
@@ -1016,5 +1061,43 @@ mod tests {
                 failure: SnapshotPressureSamplingFailure::SampleTimeout,
             })
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_samples_are_taken_again_until_the_blind_limit_since_the_last_sample() {
+        let child = CancellationToken::new();
+        let stall = || None;
+        let answer = || Some(Ok(healthy_sample()));
+        let steps = [
+            stall(),
+            stall(),
+            stall(),
+            answer(),
+            answer(),
+            answer(),
+            answer(),
+            stall(),
+            stall(),
+            stall(),
+        ];
+        let pressure = SnapshotPressureMonitor::new(
+            Duration::from_secs(1),
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+            pressure_policy(),
+            ScriptedSampler {
+                steps: steps.into_iter().collect(),
+            },
+        )
+        .unwrap();
+        let watchdog = SnapshotLifecycleWatchdog::spawn(config(60, 30), child.clone(), None);
+        watchdog.attach_pressure(pressure).await.unwrap();
+
+        time::sleep(Duration::from_secs(15)).await;
+        assert!(!child.is_cancelled());
+        let stopped = watchdog.stop().await.unwrap();
+        assert_eq!(stopped.status, SnapshotWatchdogStatus::Stopped);
+        assert_eq!(stopped.failure_reason, None);
+        assert!(stopped.latest_pressure.is_some());
     }
 }

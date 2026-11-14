@@ -99,7 +99,8 @@ and a table without that column is shared. Every tenant column has one type,
 type. The bindings do not change: `TasksKey`
 still includes `tenant_id`, and a page sees only its own tenant's rows, so
 it writes its own tenant's value there. The backend mints each grant with the
-user's tenant, for instance `calque-dev-grant --attribute tenant_id=int8:42`.
+user's tenant, for instance `calque-grant mint --attribute tenant_id=int8:42` from
+`@calque/grant`.
 
 ## Column types
 

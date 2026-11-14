@@ -12,7 +12,7 @@
   "sources": [
     {
       "id": "primary",
-      "connectionEnv": "CALQUE_DATABASE_URL",
+      "databaseUrlEnv": "CALQUE_DATABASE_URL",
       "publication": "calque_app",
       "slot": "calque_quickstart_slot"
     }

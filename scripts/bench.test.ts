@@ -47,7 +47,12 @@ import {
   engagementLine,
 } from "./bench-page.ts";
 import { bootstrapElement } from "./bench-page-server.ts";
-import { awaitQuietPublications, backgroundProblem } from "./bench-realtime.ts";
+import {
+  awaitQuietPublications,
+  backgroundProblem,
+  publicationsBetween,
+} from "./bench-realtime.ts";
+import { DriftAtChanges, type Session } from "./bench-session.ts";
 import {
   checkoutPath,
   redactedUrl,
@@ -243,7 +248,6 @@ test("bench arguments take --smoke, --calque, --diagnostic, --hold-until-logged,
     ["--", "--"],
     ["--browser", "bundled"],
     ["--compare-browser", "bundled"],
-    ["--diagnose", "1m", "--samples", "40"],
     ["--tier", "100k"],
   ])
     assert.throws(() => parseBenchArguments(bad), /usage: pnpm bench/u);
@@ -2038,7 +2042,7 @@ test("only a dropped-frame signal or a failed clock check is the instrument's al
       { reason: "the probe's frame clock check failed", instrument: true },
       {
         reason:
-          "Chrome's wall clock moved -5.5 ms against its monotonic clock during the probe",
+          "Chrome's wall clock moved -5.5 ms against its monotonic clock before the probe's match",
         instrument: true,
       },
       {
@@ -2702,6 +2706,83 @@ test("a frame stamped after Chrome's wall clock moved maps through the offset mo
       0.01,
   );
   assert.equal(ledger.monotonicMinusEpochSeconds, 100 - 1_700_000_000);
+});
+
+test("a publication the page stamped maps through the document request's offset, whatever Chrome's wall clock did since", async () => {
+  const cdp = new EventEmitter();
+  const url = "http://127.0.0.1:9/";
+  const network = new NetworkLedger(
+    cdp as unknown as ConstructorParameters<typeof NetworkLedger>[0],
+    url,
+  );
+  cdp.emit("Network.requestWillBeSent", {
+    requestId: "1",
+    request: { url, method: "GET" },
+    type: "Document",
+    initiator: { type: "other" },
+    timestamp: 100,
+    wallTime: 1_700_000_000,
+  });
+  // A probe 60 s on read the wall clock 12 ms ahead and moved the frames'
+  // offset; the page's own stamps run on its monotonic clock and do not move.
+  network.wallShiftMs = 12;
+  const page = {
+    evaluate: () =>
+      Promise.resolve({
+        timeOrigin: 1_700_000_000_000,
+        log: [
+          {
+            at: 60_000,
+            commitTimeUnixMicros: null,
+            changedCollections: ["events"],
+          },
+        ],
+      }),
+  };
+  assert.deepEqual(
+    await publicationsBetween(
+      { network, page } as unknown as Session,
+      159_000,
+      161_000,
+    ),
+    [
+      {
+        atMs: 160_000,
+        commitTimeUnixMicros: null,
+        changedCollections: ["events"],
+      },
+    ],
+  );
+});
+
+test("a probe's wall drift is read just after its match arrived, not after the hold window", async () => {
+  let now = 0;
+  let drift = 0;
+  const readAt: number[] = [];
+  const before = [frame(0, 0, A)];
+  const tracker = new DriftAtChanges(
+    () => {
+      readAt.push(now);
+      return Promise.resolve(drift);
+    },
+    before,
+    () => now,
+  );
+  now = 30;
+  const repeat = frame(1, 25, A);
+  await tracker.observe([...before, repeat]);
+  assert.deepEqual(readAt, [], "a frame that repeats the grid is no change");
+  const match = { ...frame(2, 38, B), receivedMs: 45 };
+  now = 50;
+  drift = 0.2;
+  await tracker.observe([...before, repeat, match]);
+  // The hold window: macOS slews the wall clock 6 ms more, and the grid holds.
+  now = 2_300;
+  drift = 6.2;
+  await tracker.observe([...before, repeat, match, frame(3, 2_290, B)]);
+  assert.deepEqual(readAt, [50]);
+  assert.equal(tracker.after(match.receivedMs), 0.2);
+  assert.equal(tracker.after(51), null);
 });
 
 test("the network ledger counts each request's wire bytes once, by the route its end leaves", () => {

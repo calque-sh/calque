@@ -22,9 +22,8 @@ exists to remove that work.
 
 Calque is for data-rich applications whose users work in a large dataset all
 day: incident and operations consoles, internal tools, support, planning and
-reporting. The design target is a working set of 500,000 to 1,000,000 mixed
-rows behind large grids, charts, relationship views and collaborative
-workflows.
+reporting. The design target is a working set of about 100,000 mixed rows
+behind large grids, charts, relationship views and collaborative workflows.
 
 ## Pagination is the wrong default for a working set
 

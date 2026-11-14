@@ -31,11 +31,11 @@ __pycache__/
 # `target/` above does not match it.
 .cargo-target/
 
-# What the README quickstart writes to the repository root. `grant-key.pk8` is
+# What the README quickstart writes to the repository root. `grant-key.pem` is
 # the grant signing key: committed, it lets anyone mint grants the server
 # accepts. The leading slash keeps the committed files of the same names under
 # client/ tracked.
-/grant-key.pk8
+/grant-key.pem
 /grant.json
 /caddy-root.crt
 /calque.inspection.json

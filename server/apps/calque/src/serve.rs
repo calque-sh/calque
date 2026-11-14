@@ -16,22 +16,22 @@ use blob_store::{
 };
 use calque_engine::{
     check_replication_capacity, inspect_local_identity, local_router, metrics_router,
-    prepare_local_source, start_local_source_runtime, AllowedOrigin, ArtifactBuilder,
+    prepare_selected_local_source, start_local_source_runtime, AllowedOrigin, ArtifactBuilder,
     AuthorizationFenceStore, CanonicalHeadSignal, CommandOperation, DatabaseUrl,
     GenerationArtifactPublisher, GuardError, HttpBinding, LocalArtifactResolver, LocalBackend,
     LocalBackendConfig, LocalCredentialPolicy, LocalMemoryPolicy, LocalMutationBackend,
     LocalMutationError, LocalMutationSupport, LocalNames, LocalRevocationConfig,
     LocalSnapshotOutcome, LocalSourceRuntimeConfig, LocalState, MountedCommands,
     MutationCommandPolicy, OperationsMetrics, PreparedLocalSource, RecompileAuthorization,
-    RecutConfig, RecutPolicy, ReencodeConfig, StateStore, TenantSettings, Tenants, TenantsConfig,
-    LOCAL_ACTIVE_ARTIFACT_CAPACITY_BYTES, MAX_LOCAL_ARTIFACT_BYTES,
+    RecutConfig, RecutPolicy, ReencodeConfig, SelectedColumns, StateStore, TenantSettings, Tenants,
+    TenantsConfig, LOCAL_ACTIVE_ARTIFACT_CAPACITY_BYTES, MAX_LOCAL_ARTIFACT_BYTES,
 };
 use dataset_grant::{GrantVerificationKey, GrantVerifier};
 use mutation_crud::{
     crud_command_summaries, CrudOperationName, CrudOperations, PerTableOperations,
 };
 use serde::Deserialize;
-use source_control::{QualifiedTable, SchemaRegistry};
+use source_control::{PostgresTypeCodec, QualifiedTable, SchemaRegistry};
 use sync_types::{ColumnId, ObjectId, SourceEpoch, SourceId, TableId};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -39,6 +39,9 @@ use uuid::Uuid;
 
 use crate::cli::{ServeCommand, TenantArguments};
 use crate::dev::describe_source_identity;
+use crate::init::{
+    is_environment_variable_name, is_identifier, postgres_identifier, IDENTIFIER_GRAMMAR,
+};
 use crate::lifecycle::{
     bounded_stop, shutdown_after, shutdown_runtime, shutdown_signal, with_state_remedy,
     CommandError,
@@ -70,17 +73,21 @@ struct ServeManifest {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind")]
 enum CommandManifest {
-    #[serde(rename = "crud", rename_all = "camelCase")]
-    Crud {
-        id: String,
-        collection: String,
-        operations: Vec<CrudOperationManifest>,
-        writable_columns: Vec<String>,
-    },
+    #[serde(rename = "crud")]
+    Crud(CrudCommandManifest),
     /// Backend commands are not supported. The kind parses only so the refusal
     /// can name the command, as `compileConfig`'s does.
     #[serde(rename = "backend")]
     Backend { id: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CrudCommandManifest {
+    id: String,
+    collection: String,
+    operations: Vec<CrudOperationManifest>,
+    writable_columns: Vec<String>,
 }
 
 /// The three operations `mutation-crud` admits, in the manifest's spelling.
@@ -146,7 +153,7 @@ struct ProtocolManifest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SourceManifest {
     id: String,
-    connection_env: String,
+    database_url_env: String,
     publication: String,
     slot: String,
 }
@@ -249,10 +256,10 @@ pub async fn run(command: ServeCommand) -> Result<(), ServeError> {
     // PostgreSQL, start CDC, bind, or report readiness.
     let config = load_and_validate_config(&command.config)?;
     let state_dir = command.state_dir.clone();
-    let connection_env = config.source.connection_env.clone();
+    let database_url_env = config.source.database_url_env.clone();
     serve_configured(command, config)
         .await
-        .map_err(|error| with_state_remedy(error, &state_dir, &connection_env))
+        .map_err(|error| with_state_remedy(error, &state_dir, &database_url_env))
 }
 
 async fn serve_configured(
@@ -261,8 +268,8 @@ async fn serve_configured(
 ) -> Result<(), ServeError> {
     let verifier =
         load_grant_verifier(&command.grant_audience, &command.grant_verification_key_env)?;
-    let raw_database_url = env::var(&config.source.connection_env)
-        .map_err(|_| ServeError::MissingDatabaseUrl(config.source.connection_env.clone()))?;
+    let raw_database_url = env::var(&config.source.database_url_env)
+        .map_err(|_| ServeError::MissingDatabaseUrl(config.source.database_url_env.clone()))?;
     let database_url = DatabaseUrl::parse(&raw_database_url)?;
     // Selected before anything creates state, but opened and probed after
     // `StateStore::open`, because both stores keep private files under the
@@ -307,6 +314,7 @@ async fn serve_configured(
         .transpose()?;
 
     let state_store = StateStore::open(&command.state_dir)?;
+    tracing::info!(state_dir = %state_store.root().display(), "using state directory");
     let state = load_or_initialize_state(&state_store, &database_url, &config).await?;
     // The fence is read before any policy is compiled. The manifest's
     // generation is a floor: a generation fenced on this source stays fenced
@@ -328,12 +336,14 @@ async fn serve_configured(
     let prepare_database_url = database_url.clone();
     let prepare_state = state.clone();
     let prepare_secrets = secrets.clone();
+    let selected = selected_columns(&config);
     let prepared = run_blocking(move || {
-        prepare_local_source(
+        prepare_selected_local_source(
             &prepare_database_url,
             &prepare_state,
             &prepare_secrets,
             persisted_registry,
+            &selected,
         )
     })
     .await?;
@@ -390,6 +400,7 @@ async fn serve_configured(
     let runtime_head_signal = head_signal.clone();
     let runtime_metrics = metrics.clone();
     let runtime_state_dir = state_store.root().to_path_buf();
+    let runtime_database_url_env = config.source.database_url_env.clone();
     let runtime = run_blocking(move || {
         start_local_source_runtime(
             runtime_prepared,
@@ -399,7 +410,8 @@ async fn serve_configured(
                 &runtime_state_dir,
                 owner,
             )
-            .with_metrics(runtime_metrics),
+            .with_metrics(runtime_metrics)
+            .with_database_url_env(runtime_database_url_env),
             runtime_head_signal,
         )
     })
@@ -452,7 +464,7 @@ async fn serve_configured(
     if !runtime.is_healthy() {
         let error = ServeError::RuntimeUnhealthy {
             state_dir: state_store.root().to_path_buf(),
-            connection_env: config.source.connection_env.clone(),
+            database_url_env: config.source.database_url_env.clone(),
             failure: runtime
                 .failure()
                 .unwrap_or_else(|| "persistent CDC stopped".to_owned()),
@@ -608,6 +620,7 @@ async fn serve_configured(
             ));
         }
     }
+    print_line(format_args!("state_dir={}", state_store.root().display()));
     print_line(format_args!("object_store={}", object_store_kind.as_str()));
     print_line(format_args!("commands={}", commands.len()));
     // The mounted collections and operations: the ceiling a signed grant is
@@ -640,6 +653,7 @@ async fn serve_configured(
     // startup builds it, because it compiles at the fenced generation.
     cancellation.cancel();
     let shutdown_result = shutdown_runtime::<ServeError>(runtime).await;
+    tracing::info!("stopped");
     serve_result?;
     metrics_result?;
     shutdown_result?;
@@ -801,6 +815,20 @@ fn optional_environment(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+/// The first variable that selects or configures an S3 store, for a command
+/// that has no S3 store to configure.
+pub(crate) fn object_store_variable_set(
+    value: impl Fn(&str) -> Option<String>,
+) -> Option<&'static str> {
+    if value(OBJECT_STORE_ENV).is_some_and(|kind| kind != "filesystem") {
+        return Some(OBJECT_STORE_ENV);
+    }
+    S3_ENVIRONMENT
+        .iter()
+        .copied()
+        .find(|name| value(name).is_some())
+}
+
 /// Reads `CALQUE_OBJECT_STORE`, refusing an unknown name and any S3 variable
 /// set without selecting `s3`. The recovery commands call it too, so `backup`
 /// and `serve` agree on the store.
@@ -844,6 +872,7 @@ pub fn open_object_store(
                     return Err(ServeError::InvalidObjectStoreValue(
                         "CALQUE_S3_FORCE_PATH_STYLE",
                         value,
+                        "set it to 1 for path-style bucket addressing or 0 for virtual-host style, or unset it to use path style exactly when CALQUE_S3_ENDPOINT is set",
                     ))
                 }
                 None => endpoint.is_some(),
@@ -938,12 +967,35 @@ fn load_and_validate_config(path: &Path) -> Result<ValidatedServeConfig, ServeEr
         return Err(ServeError::InvalidConfig("configuration is too large"));
     }
     let bytes = fs::read(path).map_err(unreadable)?;
-    let manifest: ServeManifest =
-        serde_json::from_slice(&bytes).map_err(|source| ServeError::ParseConfig {
-            path: path.to_owned(),
-            source,
-        })?;
+    let manifest: ServeManifest = serde_json::from_slice(&bytes).map_err(|source| {
+        if names_renamed_connection_env(&bytes) {
+            ServeError::RenamedConnectionEnv {
+                path: path.to_owned(),
+            }
+        } else {
+            ServeError::ParseConfig {
+                path: path.to_owned(),
+                source,
+            }
+        }
+    })?;
     validate_manifest(manifest)
+}
+
+/// Whether a source in the manifest carries `connectionEnv`, the earlier name
+/// of `databaseUrlEnv`.
+fn names_renamed_connection_env(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|manifest| {
+            let sources = manifest.get("sources")?.as_array()?;
+            Some(
+                sources
+                    .iter()
+                    .any(|source| source.get("connectionEnv").is_some()),
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn validate_manifest(manifest: ServeManifest) -> Result<ValidatedServeConfig, ServeError> {
@@ -966,7 +1018,36 @@ fn validate_manifest(manifest: ServeManifest) -> Result<ValidatedServeConfig, Se
             "serve requires exactly one source and one scope",
         ));
     }
+    if !is_identifier(&manifest.application.id) {
+        return Err(ServeError::InvalidConfigField {
+            field: "application.id".to_owned(),
+            reason: format!("must match {IDENTIFIER_GRAMMAR}"),
+        });
+    }
     let source = manifest.sources.into_iter().next().expect("length checked");
+    if !is_identifier(&source.id) {
+        return Err(ServeError::InvalidConfigField {
+            field: "sources[0].id".to_owned(),
+            reason: format!("must match {IDENTIFIER_GRAMMAR}"),
+        });
+    }
+    // The value is not echoed: one that is no variable name is often the
+    // connection string itself.
+    if !is_environment_variable_name(&source.database_url_env) {
+        return Err(ServeError::InvalidConfigField {
+            field: "sources[0].databaseUrlEnv".to_owned(),
+            reason: "must name an environment variable matching ^[A-Z_][A-Z0-9_]*$, not contain a connection string".to_owned(),
+        });
+    }
+    for (field, value) in [
+        ("sources[0].publication", &source.publication),
+        ("sources[0].slot", &source.slot),
+    ] {
+        postgres_identifier(field, value).map_err(|error| ServeError::InvalidConfigField {
+            field: field.to_owned(),
+            reason: error.to_string(),
+        })?;
+    }
     let (scope_id, scope_source, data_version, partition_attribute) =
         match manifest.scopes.into_iter().next().expect("length checked") {
             ScopeManifest::SourceWide {
@@ -981,6 +1062,12 @@ fn validate_manifest(manifest: ServeManifest) -> Result<ValidatedServeConfig, Se
                 attribute,
             } => (id, source, data_version, Some(attribute)),
         };
+    if !is_identifier(&scope_id) {
+        return Err(ServeError::InvalidConfigField {
+            field: "scopes[0].id".to_owned(),
+            reason: format!("must match {IDENTIFIER_GRAMMAR}"),
+        });
+    }
     if scope_source != source.id {
         return Err(ServeError::InvalidConfig(
             "scopes[0].source must be sources[0].id",
@@ -1051,6 +1138,15 @@ fn validate_manifest(manifest: ServeManifest) -> Result<ValidatedServeConfig, Se
         if let Some((_, reason)) = contract.iter().find(|(broken, _)| *broken) {
             return Err(refuse((*reason).to_owned()));
         }
+        if !is_identifier(&collection.id) {
+            return Err(refuse(format!("its id must match {IDENTIFIER_GRAMMAR}")));
+        }
+        for (subject, value) in [
+            ("relation.schema", &collection.relation.schema),
+            ("relation.table", &collection.relation.table),
+        ] {
+            postgres_identifier(subject, value).map_err(|error| refuse(error.to_string()))?;
+        }
         // The artifact names each table after its source relation, and the
         // client binds a collection only to the artifact table of the same
         // name, so a collection under any other id would serve and never bind.
@@ -1066,10 +1162,12 @@ fn validate_manifest(manifest: ServeManifest) -> Result<ValidatedServeConfig, Se
             if !selected.insert(column.name.as_str()) {
                 return Err(refuse(format!("column {} is named twice", column.name)));
             }
-            if column.postgres_type.is_empty() {
+            postgres_identifier(&format!("column name {:?}", column.name), &column.name)
+                .map_err(|error| refuse(error.to_string()))?;
+            if PostgresTypeCodec::from_catalog("pg_catalog", &column.postgres_type).is_none() {
                 return Err(refuse(format!(
-                    "column {} has an empty postgresType",
-                    column.name
+                    "column {} has postgresType {:?}, which is not a type calque serve enrolls",
+                    column.name, column.postgres_type
                 )));
             }
         }
@@ -1174,12 +1272,12 @@ fn validate_commands(
     let mut crud_commands = Vec::new();
     for command in commands {
         match command {
-            CommandManifest::Crud {
+            CommandManifest::Crud(CrudCommandManifest {
                 id,
                 collection,
                 operations,
                 writable_columns,
-            } => {
+            }) => {
                 require_command_id(&mut ids, id)?;
                 let target = collections
                     .iter()
@@ -1232,6 +1330,21 @@ fn validate_commands(
                         )));
                     }
                 }
+                // An insert carries every non-key column.
+                if operations.contains(&CrudOperationManifest::Insert) {
+                    let omitted = target
+                        .columns
+                        .iter()
+                        .map(|column| column.name.as_str())
+                        .filter(|name| !immutable.contains(name) && !unique.contains(name))
+                        .collect::<Vec<_>>();
+                    if !omitted.is_empty() {
+                        return Err(ServeError::InvalidCommands(format!(
+                            "E_SERVE_COMMAND_INVALID command={id} declares insert, but its writableColumns omit {}; an insert writes every non-key column",
+                            omitted.join(",")
+                        )));
+                    }
+                }
                 // An update that can write nothing advertises a capability the
                 // route would refuse on every request.
                 if operations.contains(&CrudOperationManifest::Update)
@@ -1273,6 +1386,11 @@ fn require_command_id<'a>(ids: &mut BTreeSet<&'a str>, id: &'a str) -> Result<()
         return Err(ServeError::InvalidCommands(
             "E_SERVE_COMMAND_INVALID a command id is empty".to_owned(),
         ));
+    }
+    if !is_identifier(id) {
+        return Err(ServeError::InvalidCommands(format!(
+            "E_SERVE_COMMAND_INVALID command={id} must match {IDENTIFIER_GRAMMAR}"
+        )));
     }
     if !ids.insert(id) {
         return Err(ServeError::InvalidCommands(format!(
@@ -1432,6 +1550,28 @@ fn load_grant_verifier(
     Ok(GrantVerifier::new(audience, keys)?)
 }
 
+/// The columns each collection names, which are all the source publishes of
+/// its table.
+fn selected_columns(config: &ValidatedServeConfig) -> SelectedColumns {
+    config
+        .collections
+        .iter()
+        .map(|collection| {
+            (
+                QualifiedTable {
+                    schema: collection.relation.schema.clone(),
+                    table: collection.relation.table.clone(),
+                },
+                collection
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
 async fn load_or_initialize_state(
     store: &StateStore,
     database_url: &DatabaseUrl,
@@ -1449,7 +1589,7 @@ async fn load_or_initialize_state(
                 state_dir: store.root().to_path_buf(),
                 persisted: describe_enrollment(&state.names, &state.tables),
                 configured: describe_enrollment(&names, &config.tables),
-                connection_env: config.source.connection_env.clone(),
+                database_url_env: config.source.database_url_env.clone(),
             });
         }
         // Compared before the fence is established, which writes to the
@@ -1461,7 +1601,7 @@ async fn load_or_initialize_state(
         if connected != state.source_identity {
             return Err(ServeError::SourceIdentityMismatch {
                 state_dir: store.root().to_path_buf(),
-                connection_env: config.source.connection_env.clone(),
+                database_url_env: config.source.database_url_env.clone(),
                 persisted: describe_source_identity(&state.source_identity),
                 connected: describe_source_identity(&connected),
             });
@@ -1545,12 +1685,14 @@ fn compile_collection_permits(
                     column: configured.name.clone(),
                 })?;
             let live = &table.inspection.columns[index];
-            if live.type_name != configured.postgres_type || live.nullable != configured.nullable {
+            if live.carried_type_name() != configured.postgres_type
+                || live.nullable != configured.nullable
+            {
                 return Err(ServeError::ConfiguredColumnMismatch {
                     collection: collection.id.clone(),
                     column: configured.name.clone(),
                     configured: describe_column(&configured.postgres_type, configured.nullable),
-                    actual: describe_column(&live.type_name, live.nullable),
+                    actual: describe_column(live.carried_type_name(), live.nullable),
                 });
             }
             columns.push(table.column_ids[index]);
@@ -1680,9 +1822,19 @@ where
 /// The remedy for a manifest that no longer matches its tables.
 const REGENERATE_MANIFEST: &str = "Regenerate the manifest with calque inspect and calque init --force, and the client's bindings from it with calque-bindings, or change the table back";
 
+/// What to do about a manifest that is not there: write one, or name the one
+/// that exists.
+fn missing_config_hint(source: &std::io::Error) -> &'static str {
+    if source.kind() == std::io::ErrorKind::NotFound {
+        ". Run calque init to write calque.config.json, or pass --config with the path of an existing manifest"
+    } else {
+        ""
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ServeError {
-    #[error("cannot read serve configuration {}: {source}", path.display())]
+    #[error("cannot read serve configuration {}: {source}{}", path.display(), missing_config_hint(source))]
     ReadConfig {
         path: PathBuf,
         source: std::io::Error,
@@ -1692,8 +1844,12 @@ pub enum ServeError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    #[error("serve configuration {} names sources[].connectionEnv, which is now sources[].databaseUrlEnv; rename the field", path.display())]
+    RenamedConnectionEnv { path: PathBuf },
     #[error("invalid serve configuration: {0}")]
     InvalidConfig(&'static str),
+    #[error("invalid serve configuration: {field} {reason}")]
+    InvalidConfigField { field: String, reason: String },
     #[error("invalid serve configuration: collection {collection}: {reason}")]
     InvalidCollection { collection: String, reason: String },
     #[error("invalid serve configuration: relations {first} and {second} would both be served as collection {collection}, which is named by the table alone")]
@@ -1712,7 +1868,7 @@ pub enum ServeError {
     InvalidCommands(String),
     #[error("mutation support could not be opened: {0}")]
     Mutation(#[from] LocalMutationError),
-    #[error("environment variable {0} is not set or not valid UTF-8; set it to the source's PostgreSQL connection string, or change sources[].connectionEnv in the manifest")]
+    #[error("environment variable {0} is not set or not valid UTF-8; set it to the source's PostgreSQL connection string, or change sources[].databaseUrlEnv in the manifest")]
     MissingDatabaseUrl(String),
     #[error(
         "E_SERVE_OBJECT_STORE_UNKNOWN {OBJECT_STORE_ENV}={0} is not an object store this build implements; it is `filesystem` or `s3`"
@@ -1724,20 +1880,20 @@ pub enum ServeError {
     ObjectStoreNotSelected(String),
     #[error("E_SERVE_OBJECT_STORE_INCOMPLETE {0} is required when {OBJECT_STORE_ENV}=s3")]
     MissingObjectStoreValue(String),
-    #[error("E_SERVE_OBJECT_STORE_INVALID {0}={1} is not a value this build accepts")]
-    InvalidObjectStoreValue(&'static str, String),
+    #[error("E_SERVE_OBJECT_STORE_INVALID {0}={1} is not accepted; {2}")]
+    InvalidObjectStoreValue(&'static str, String, &'static str),
     #[error("E_SERVE_OBJECT_STORE_PROBE {0}")]
     ObjectStoreProbeFailed(&'static str),
     #[error("environment variable {0}, which --grant-verification-key-env names, is not set or not valid UTF-8")]
     MissingGrantKey(String),
     #[error("environment variable {0} does not hold a grant verification key: a JSON object {{\"keyId\": ..., \"publicKey\": ...}} whose publicKey is a 32-byte Ed25519 key in unpadded base64url")]
     InvalidGrantKey(String),
-    #[error("{state_dir} is enrolled for {persisted}, but the manifest configures {configured}. Calque will not change an existing enrollment in place. Restore the manifest's source and tables, or run {destroy} and then rerun serve to enroll again.", destroy = Destroy::reading(state_dir, connection_env))]
+    #[error("{state_dir} is enrolled for {persisted}, but the manifest configures {configured}. Calque will not change an existing enrollment in place. Restore the manifest's source and tables, or run {destroy} and then rerun serve to enroll again.", destroy = Destroy::reading(state_dir, database_url_env))]
     PersistedStateMismatch {
         state_dir: PathBuf,
         persisted: String,
         configured: String,
-        connection_env: String,
+        database_url_env: String,
     },
     #[error("collection {collection} reads {relation}, which this source did not enroll")]
     CollectionNotEnrolled {
@@ -1766,10 +1922,10 @@ pub enum ServeError {
     },
     /// `remedy` is the health slot's: what gets past the error the CDC loop
     /// stopped on.
-    #[error("persistent CDC stopped before the source-wide artifact became ready: {failure}. No incomplete browser state was served. {remedy}", failure = failure.strip_suffix('.').unwrap_or(failure.as_str()), remedy = after_stopped_runtime(Destroy::reading(state_dir, connection_env), "serve", *remedy))]
+    #[error("persistent CDC stopped before the source-wide artifact became ready: {failure}. No incomplete browser state was served. {remedy}", failure = failure.strip_suffix('.').unwrap_or(failure.as_str()), remedy = after_stopped_runtime(Destroy::reading(state_dir, database_url_env), "serve", *remedy))]
     RuntimeUnhealthy {
         state_dir: PathBuf,
-        connection_env: String,
+        database_url_env: String,
         failure: String,
         remedy: calque_engine::CdcStopRemedy,
     },
@@ -1780,33 +1936,37 @@ pub enum ServeError {
     },
     /// A refusal only `calque destroy` gets past, which the library that
     /// raised it leaves this command to name. See `with_state_remedy`.
-    #[error("{refusal} {remedy}", remedy = Destroy::reading(state_dir, connection_env).then_rerun("serve"))]
+    #[error("{refusal} {remedy}", remedy = Destroy::reading(state_dir, database_url_env).then_rerun("serve"))]
     StateMustBeDestroyed {
         refusal: Box<ServeError>,
         state_dir: PathBuf,
-        connection_env: String,
+        database_url_env: String,
     },
-    #[error("connected {connected}, but {state_dir} belongs to {persisted}. Calque cannot reuse state from another PostgreSQL source. {remedy}", remedy = reconnect_or_forget(state_dir, connection_env, "serve"))]
+    #[error("connected {connected}, but {state_dir} belongs to {persisted}. Calque cannot reuse state from another PostgreSQL source. {remedy}", remedy = reconnect_or_forget(state_dir, database_url_env, "serve"))]
     SourceIdentityMismatch {
         state_dir: PathBuf,
-        connection_env: String,
+        database_url_env: String,
         persisted: String,
         connected: String,
     },
     /// The engine's refusal of a source that changed after
     /// `load_or_initialize_state` compared identities, with the remedy
     /// `SourceIdentityMismatch` names.
-    #[error("{refusal} {remedy}", remedy = reconnect_or_forget(state_dir, connection_env, "serve"))]
+    #[error("{refusal} {remedy}", remedy = reconnect_or_forget(state_dir, database_url_env, "serve"))]
     SourceChanged {
         refusal: Box<ServeError>,
         state_dir: PathBuf,
-        connection_env: String,
+        database_url_env: String,
     },
     /// The engine's refusal of a publication that no longer has its enrolled
     /// definition, which enrollment and a CDC reconnect raise alike. See
     /// `remedy::restore_publication`.
-    #[error("{refusal} {remedy}", remedy = restore_publication("serve"))]
-    PublicationDrifted { refusal: Box<ServeError> },
+    #[error("{refusal} {remedy}", remedy = restore_publication(Destroy::reading(state_dir, database_url_env), "serve"))]
+    PublicationDrifted {
+        refusal: Box<ServeError>,
+        state_dir: PathBuf,
+        database_url_env: String,
+    },
     #[error("a blocking startup task did not complete: {0}")]
     BlockingTask(String),
     #[error(transparent)]
@@ -1907,25 +2067,27 @@ impl CommandError for ServeError {
         }
     }
 
-    fn state_must_be_destroyed(refusal: Self, state_dir: &Path, connection_env: &str) -> Self {
+    fn state_must_be_destroyed(refusal: Self, state_dir: &Path, database_url_env: &str) -> Self {
         Self::StateMustBeDestroyed {
             refusal: Box::new(refusal),
             state_dir: state_dir.to_path_buf(),
-            connection_env: connection_env.to_owned(),
+            database_url_env: database_url_env.to_owned(),
         }
     }
 
-    fn source_changed(refusal: Self, state_dir: &Path, connection_env: &str) -> Self {
+    fn source_changed(refusal: Self, state_dir: &Path, database_url_env: &str) -> Self {
         Self::SourceChanged {
             refusal: Box::new(refusal),
             state_dir: state_dir.to_path_buf(),
-            connection_env: connection_env.to_owned(),
+            database_url_env: database_url_env.to_owned(),
         }
     }
 
-    fn publication_drifted(refusal: Self) -> Self {
+    fn publication_drifted(refusal: Self, state_dir: &Path, database_url_env: &str) -> Self {
         Self::PublicationDrifted {
             refusal: Box::new(refusal),
+            state_dir: state_dir.to_path_buf(),
+            database_url_env: database_url_env.to_owned(),
         }
     }
 }
@@ -1988,6 +2150,7 @@ mod tests {
             primary_key_ordinal,
             generated: false,
             nondeterministic_collation: false,
+            carried_as: None,
         }
     }
 
@@ -2010,6 +2173,7 @@ mod tests {
             is_partition: false,
             has_publication_row_filter: false,
             has_publication_column_list: false,
+            unlisted_columns: Vec::new(),
             columns,
         }
     }
@@ -2051,6 +2215,118 @@ mod tests {
         validate_manifest(manifest).expect("source-wide validates")
     }
 
+    /// The manifests `compileConfig` must refuse too, from the fixture both
+    /// test suites read: `serve` refuses each before PostgreSQL is reached.
+    #[test]
+    fn every_shared_configuration_refusal_is_refused_here() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/config/refusals.json"
+        ))
+        .unwrap();
+        let bases = BTreeMap::from([
+            ("serve-sourcewide-smoke.config.json", SOURCE_WIDE_MANIFEST),
+            ("serve-tenants.config.json", TENANT_MANIFEST),
+        ]);
+        let base = |name: &str| -> serde_json::Value {
+            let file = fixture["bases"][name].as_str().unwrap();
+            serde_json::from_str(bases[file]).unwrap()
+        };
+        let verdict = |manifest: serde_json::Value| -> Result<(), String> {
+            let manifest: ServeManifest =
+                serde_json::from_value(manifest).map_err(|error| error.to_string())?;
+            validate_manifest(manifest)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        };
+        for name in ["source-wide", "tenants"] {
+            verdict(base(name)).unwrap_or_else(|error| panic!("base {name} is refused: {error}"));
+        }
+        let accepted = fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|case| {
+                let mut manifest = base(case["base"].as_str().unwrap());
+                apply_json_patch(&mut manifest, case["patch"].as_array().unwrap());
+                verdict(manifest).is_ok()
+            })
+            .map(|case| case["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(accepted.is_empty(), "serve accepts {accepted:#?}");
+        for case in fixture["accepted"].as_array().unwrap() {
+            let mut manifest = base(case["base"].as_str().unwrap());
+            apply_json_patch(&mut manifest, case["patch"].as_array().unwrap());
+            verdict(manifest)
+                .unwrap_or_else(|error| panic!("{} is refused: {error}", case["name"]));
+        }
+    }
+
+    /// Applies the `add`, `replace`, `remove` and `copy` operations of an
+    /// RFC 6902 JSON Patch whose paths need no escaping.
+    fn apply_json_patch(document: &mut serde_json::Value, patch: &[serde_json::Value]) {
+        for operation in patch {
+            let op = operation["op"].as_str().unwrap();
+            let path = operation["path"].as_str().unwrap();
+            let value = match op {
+                "add" | "replace" => Some(operation["value"].clone()),
+                "copy" => Some(
+                    document
+                        .pointer(operation["from"].as_str().unwrap())
+                        .unwrap_or_else(|| panic!("no value at {}", operation["from"]))
+                        .clone(),
+                ),
+                "remove" => None,
+                other => panic!("unsupported JSON Patch operation {other}"),
+            };
+            let (parent, last) = path.rsplit_once('/').unwrap();
+            let target = document
+                .pointer_mut(parent)
+                .unwrap_or_else(|| panic!("no value at {parent}"));
+            match (target, value) {
+                (serde_json::Value::Object(map), Some(value)) => {
+                    map.insert(last.to_owned(), value);
+                }
+                (serde_json::Value::Object(map), None) => {
+                    map.remove(last)
+                        .unwrap_or_else(|| panic!("no value at {path}"));
+                }
+                (serde_json::Value::Array(items), Some(value)) if last == "-" => items.push(value),
+                (serde_json::Value::Array(items), Some(value)) => {
+                    let index: usize = last.parse().unwrap();
+                    if op == "replace" {
+                        items[index] = value;
+                    } else {
+                        items.insert(index, value);
+                    }
+                }
+                (serde_json::Value::Array(items), None) => {
+                    items.remove(last.parse::<usize>().unwrap());
+                }
+                (other, _) => panic!("{parent} holds {other}, not an object or array"),
+            }
+        }
+    }
+
+    /// A manifest written before `sources[].connectionEnv` became
+    /// `databaseUrlEnv` is refused with the field's current name.
+    #[test]
+    fn the_earlier_source_field_name_is_refused_with_the_current_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("calque.config.json");
+        let mut manifest: serde_json::Value = serde_json::from_str(SOURCE_WIDE_MANIFEST).unwrap();
+        let source = manifest["sources"][0].as_object_mut().unwrap();
+        let name = source.remove("databaseUrlEnv").unwrap();
+        source.insert("connectionEnv".to_owned(), name);
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            load_and_validate_config(&path).err().unwrap().to_string(),
+            format!(
+                "serve configuration {} names sources[].connectionEnv, which is now sources[].databaseUrlEnv; rename the field",
+                path.display()
+            )
+        );
+    }
+
     /// A configuration that cannot be read or parsed is named, because the
     /// default `--config` is a relative path the operator may not have meant.
     #[test]
@@ -2065,6 +2341,12 @@ mod tests {
                 "cannot read serve configuration {}: ",
                 path.display()
             )),
+            "{missing}"
+        );
+        assert!(
+            missing.ends_with(
+                ". Run calque init to write calque.config.json, or pass --config with the path of an existing manifest"
+            ),
             "{missing}"
         );
         fs::write(&path, "{").unwrap();
@@ -2273,7 +2555,7 @@ mod tests {
         let options = crate::init::InitOptions {
             application_id: "serve-tenants".to_owned(),
             application_version: "0.1.0".to_owned(),
-            connection_env: "SERVE_TENANTS_DATABASE_URL".to_owned(),
+            database_url_env: "SERVE_TENANTS_DATABASE_URL".to_owned(),
             slot: None,
             scope_id: "tenant".to_owned(),
             tenants: Some(crate::init::Tenants {
@@ -2675,11 +2957,11 @@ mod tests {
 
     #[test]
     fn a_manifest_that_is_not_the_catalogs_writable_column_set_is_refused() {
-        // Narrower than the catalog: the manifest stops naming `project_id`,
-        // which the catalog still counts writable.
+        // Narrower than the catalog: the update-only command stops naming
+        // `status`, which the catalog still counts writable.
         let narrowed = SOURCE_WIDE_MANIFEST.replace(
-            r#""writableColumns": ["project_id", "title", "done"]"#,
-            r#""writableColumns": ["title", "done"]"#,
+            r#""writableColumns": ["name", "status"]"#,
+            r#""writableColumns": ["name"]"#,
         );
         assert_ne!(
             narrowed, SOURCE_WIDE_MANIFEST,
@@ -2694,12 +2976,9 @@ mod tests {
             rendered.starts_with("E_SERVE_COMMAND_COLUMNS_MISMATCH"),
             "{rendered}"
         );
-        assert!(rendered.contains("command=edit-task"), "{rendered}");
-        assert!(rendered.contains("advertised=done,title"), "{rendered}");
-        assert!(
-            rendered.contains("catalog=done,project_id,title"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("command=edit-project"), "{rendered}");
+        assert!(rendered.contains("advertised=name"), "{rendered}");
+        assert!(rendered.contains("catalog=name,status"), "{rendered}");
 
         // Wider than the catalog: the enrolled table has no `done` column.
         let manifest: ServeManifest =
@@ -2868,7 +3147,7 @@ mod tests {
         let error = ServeError::RuntimeCleanup {
             startup: Box::new(ServeError::RuntimeUnhealthy {
                 state_dir: PathBuf::from("/srv/calque/source-a"),
-                connection_env: "CALQUE_DATABASE_URL".to_owned(),
+                database_url_env: "CALQUE_DATABASE_URL".to_owned(),
                 failure: "persistent CDC stopped".to_owned(),
                 remedy: calque_engine::CdcStopRemedy::Rerun,
             }),
@@ -2885,7 +3164,7 @@ mod tests {
     fn stopped_runtime(failure: &str) -> ServeError {
         ServeError::RuntimeUnhealthy {
             state_dir: PathBuf::from("/srv/calque/source-a"),
-            connection_env: "CALQUE_DATABASE_URL".to_owned(),
+            database_url_env: "CALQUE_DATABASE_URL".to_owned(),
             failure: failure.to_owned(),
             remedy: calque_engine::CdcStopRemedy::Rerun,
         }
@@ -2977,6 +3256,7 @@ mod tests {
     const EARLIER_LOG: &str = "/srv/calque/source-a serves a canonical log an earlier release of calque wrote, and calque does not migrate it.";
     const FOREIGN_BUILD: &str = "/srv/calque/source-a holds an interrupted build of local-artifact-earlier-release, an artifact this build of calque does not make, and calque does not migrate it.";
     const DESTROY_THEN_SERVE: &str = "Run calque destroy --state-dir /srv/calque/source-a --database-url-env CALQUE_DATABASE_URL --yes, then rerun serve to prepare the working set anew.";
+    const RESTORE_THEN_SERVE: &str = "Restore the publication's definition if it was altered, then run calque destroy --state-dir /srv/calque/source-a --database-url-env CALQUE_DATABASE_URL --yes and rerun serve to prepare the working set anew, since the one it holds may no longer match PostgreSQL.";
 
     /// The refusal of a canonical log an earlier release wrote, as the CDC
     /// loop stops on it and the stop that joins the loop returns it.
@@ -2993,7 +3273,7 @@ mod tests {
         })
     }
 
-    const DRIFT: &str = "the PostgreSQL publication calque_incident no longer publishes exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root, and without row filters or column lists.";
+    const DRIFT: &str = "the PostgreSQL publication calque_incident was altered, or an enum its columns use gained or renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists and enum values it had at enrollment.";
 
     fn drift() -> calque_engine::LocalSourceError {
         calque_engine::LocalSourceError::PublicationDrift {
@@ -3068,13 +3348,13 @@ mod tests {
                     publication: "calque_incident".to_owned(),
                 }
             )),
-            "the PostgreSQL publication calque_incident no longer publishes exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root, and without row filters or column lists. Restore that definition, then rerun serve."
+            "the PostgreSQL publication calque_incident was altered, or an enum its columns use gained or renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists and enum values it had at enrollment. Restore the publication's definition if it was altered, then run calque destroy --state-dir /srv/calque/source-a --database-url-env CALQUE_DATABASE_URL --yes and rerun serve to prepare the working set anew, since the one it holds may no longer match PostgreSQL."
         );
         assert_eq!(
             printed(ServeError::Source(
                 calque_engine::LocalSourceError::SessionCleanupFailedAfter(Box::new(drift()))
             )),
-            format!("persistent CDC session cleanup failed after persistent CDC failed: {DRIFT} Restore that definition, then rerun serve.")
+            format!("persistent CDC session cleanup failed after persistent CDC failed: {DRIFT} {RESTORE_THEN_SERVE}")
         );
     }
 
@@ -3098,7 +3378,7 @@ mod tests {
     async fn a_runtime_stopped_on_a_refusal_names_destroy_once() {
         let stopped = |failure: String| ServeError::RuntimeUnhealthy {
             state_dir: PathBuf::from("/srv/calque/source-a"),
-            connection_env: "CALQUE_DATABASE_URL".to_owned(),
+            database_url_env: "CALQUE_DATABASE_URL".to_owned(),
             failure,
             remedy: calque_engine::CdcStopRemedy::DestroyState,
         };
@@ -3165,15 +3445,15 @@ mod tests {
         );
     }
 
-    /// The remedy is restoring the publication, not destroy, which refuses a
-    /// publication it cannot verify.
+    /// The remedy is restoring the publication, which destroy refuses to drop
+    /// otherwise, then destroy, since the working set may miss changes.
     #[tokio::test]
     async fn a_runtime_stopped_on_a_drifted_publication_names_restoring_it_once() {
         let error = stop_after(
             || Err(drift()),
             ServeError::RuntimeUnhealthy {
                 state_dir: PathBuf::from("/srv/calque/source-a"),
-                connection_env: "CALQUE_DATABASE_URL".to_owned(),
+                database_url_env: "CALQUE_DATABASE_URL".to_owned(),
                 failure: format!("persistent CDC failed: {DRIFT}"),
                 remedy: calque_engine::CdcStopRemedy::RestorePublication,
             },
@@ -3182,9 +3462,14 @@ mod tests {
         let printed = printed(error);
         assert_eq!(
             printed,
-            format!("persistent CDC stopped before the source-wide artifact became ready: persistent CDC failed: {DRIFT} No incomplete browser state was served. Restore that definition, then rerun serve.")
+            format!("persistent CDC stopped before the source-wide artifact became ready: persistent CDC failed: {DRIFT} No incomplete browser state was served. {RESTORE_THEN_SERVE}")
         );
-        assert_eq!(printed.matches("Restore that definition").count(), 1);
+        assert_eq!(
+            printed
+                .matches("Restore the publication's definition")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -3196,7 +3481,7 @@ mod tests {
         .await;
         assert_eq!(
             printed(error),
-            format!("local snapshot PostgreSQL connection failed\nStopping the source runtime afterwards also failed: {DRIFT} Restore that definition, then rerun serve.")
+            format!("local snapshot PostgreSQL connection failed\nStopping the source runtime afterwards also failed: {DRIFT} {RESTORE_THEN_SERVE}")
         );
     }
 

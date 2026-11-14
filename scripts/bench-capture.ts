@@ -238,6 +238,11 @@ function headerValue(
 /** The document request, its clock mapping, and the bytes the page received. */
 export class NetworkLedger {
   documentTimestampMs: number | null = null;
+  /**
+   * Chrome's monotonic clock less its wall clock at the document request. A
+   * page's own stamps, `performance.timeOrigin` plus `performance.now()`, run
+   * on the monotonic clock from there and map through this unchanged.
+   */
   monotonicMinusEpochSeconds: number | null = null;
   /**
    * How far Chrome's wall clock has moved against its monotonic clock since

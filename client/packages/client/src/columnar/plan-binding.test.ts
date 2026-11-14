@@ -5,7 +5,11 @@ import type { GeneratedClientSchemaDescriptor } from "../generated-schema.js";
 import { parseBootstrapPlan } from "../plan.js";
 import { resolveClientSchema } from "../schema-registry.js";
 import type { ClientSchema } from "../schema.js";
-import { bindColumnarPlan } from "./plan-binding.js";
+import {
+  bindColumnarPlan,
+  checkRenewal,
+  renewablePlan,
+} from "./plan-binding.js";
 
 /** What a session checks of a bootstrap plan before it mounts. */
 function verifyColumnarBootstrapPlan(schema: ClientSchema, plan: unknown) {
@@ -353,5 +357,108 @@ describe("verifyColumnarBootstrapPlan", () => {
     expect(() =>
       verifyColumnarBootstrapPlan({ collections: [] } as never, plan()),
     ).toThrow(/schema is invalid/u);
+  });
+});
+
+describe("a renewal plan", () => {
+  /** The fixture plan renewed from `cursor`: it installs nothing. */
+  function renewal(cursor: string): Record<string, unknown> {
+    const value = plan();
+    value.planId = "plan-2";
+    value.residentTables = ["public.events"];
+    value.residentCursor = cursor;
+    value.activationCursor = cursor;
+    value.artifacts = [];
+    Object.assign(value.changeStream as Record<string, unknown>, {
+      fromCursorExclusive: cursor,
+      throughCursorInclusive: cursor,
+    });
+    return value;
+  }
+
+  const held = renewablePlan(parseBootstrapPlan(plan()));
+
+  it("continues the plan it renews from the cursor the client presented", () => {
+    expect(() =>
+      checkRenewal(held, parseBootstrapPlan(renewal("cursor-q")), "cursor-q"),
+    ).not.toThrow();
+  });
+
+  it.each<[string, (value: Record<string, unknown>) => void, RegExp]>([
+    [
+      "installs an artifact",
+      (value) => {
+        value.artifacts = plan().artifacts;
+        value.residentTables = [];
+      },
+      /install no artifact/u,
+    ],
+    [
+      "moves to another source",
+      (value) => {
+        (value.source as Record<string, unknown>).sourceEpoch = "epoch-2";
+      },
+      /keep the source and scope/u,
+    ],
+    [
+      "moves to another schema generation",
+      (value) => {
+        (value.source as Record<string, unknown>).schemaGeneration = 2;
+      },
+      /keep the source and scope/u,
+    ],
+    [
+      "moves to another authorization generation",
+      (value) => {
+        (value.source as Record<string, unknown>).authorizationGeneration = 2;
+      },
+      /keep the source and scope/u,
+    ],
+    [
+      "moves to another scope",
+      (value) => {
+        (value.authorization as Record<string, unknown>).scopeHash =
+          `sha256:${"b".repeat(64)}`;
+      },
+      /keep the source and scope/u,
+    ],
+    [
+      "requires other tables",
+      (value) => {
+        value.requiredTables = ["public.issues"];
+        value.residentTables = ["public.issues"];
+      },
+      /keep the tables/u,
+    ],
+    [
+      "continues from another cursor",
+      (value) => {
+        value.residentCursor = "cursor-r";
+      },
+      /continue from the cursor/u,
+    ],
+    [
+      "activates at another cursor",
+      (value) => {
+        value.activationCursor = "cursor-r";
+        (value.changeStream as Record<string, unknown>).throughCursorInclusive =
+          "cursor-r";
+      },
+      /continue from the cursor/u,
+    ],
+    [
+      "streams from another cursor",
+      (value) => {
+        (value.changeStream as Record<string, unknown>).fromCursorExclusive =
+          "cursor-r";
+      },
+      /continue from the cursor/u,
+    ],
+  ])("is refused when it %s", (_name, change, refusal) => {
+    const value = renewal("cursor-q");
+    change(value);
+    expect(() =>
+      checkRenewal(held, parseBootstrapPlan(value), "cursor-q"),
+    ).toThrow(refusal);
   });
 });

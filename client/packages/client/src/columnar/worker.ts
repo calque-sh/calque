@@ -14,9 +14,7 @@ export type ColumnarDecoderWorker = ColumnarEngineWorker;
 function workerConstructor(): typeof globalThis.Worker {
   const WorkerConstructor = globalThis.Worker;
   if (typeof WorkerConstructor !== "function")
-    throw new TypeError(
-      "this runtime has no Worker constructor; Calque runs only in Chromium-based browsers",
-    );
+    throw new TypeError("this runtime has no Worker constructor");
   return WorkerConstructor;
 }
 

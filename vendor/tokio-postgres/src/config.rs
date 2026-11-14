@@ -228,6 +228,7 @@ pub struct Config {
     pub(crate) hostaddr: Vec<IpAddr>,
     pub(crate) port: Vec<u16>,
     pub(crate) connect_timeout: Option<Duration>,
+    pub(crate) reply_timeout: Option<Duration>,
     pub(crate) tcp_user_timeout: Option<Duration>,
     pub(crate) keepalives: bool,
     #[cfg(not(target_arch = "wasm32"))]
@@ -258,6 +259,7 @@ impl Config {
             hostaddr: vec![],
             port: vec![],
             connect_timeout: None,
+            reply_timeout: None,
             tcp_user_timeout: None,
             keepalives: true,
             #[cfg(not(target_arch = "wasm32"))]
@@ -443,6 +445,27 @@ impl Config {
     /// `connect_timeout` method.
     pub fn get_connect_timeout(&self) -> Option<&Duration> {
         self.connect_timeout.as_ref()
+    }
+
+    /// Sets how long the connection waits for the server's next message while
+    /// a request awaits its reply. A connection that hears nothing for that
+    /// long fails with an `io::ErrorKind::TimedOut` error, which every
+    /// request on it then returns. Defaults to no limit.
+    ///
+    /// The wait restarts at each message the server sends, so a reply that
+    /// arrives in parts is not bounded as a whole, and it is paused while the
+    /// connection holds messages its client has not taken. A `COPY ... FROM
+    /// STDIN` awaits its reply while the client sends its rows. This is a
+    /// Calque patch; libpq has no equivalent.
+    pub fn reply_timeout(&mut self, reply_timeout: Duration) -> &mut Config {
+        self.reply_timeout = Some(reply_timeout);
+        self
+    }
+
+    /// Gets the reply timeout, if one has been set with the `reply_timeout`
+    /// method.
+    pub fn get_reply_timeout(&self) -> Option<&Duration> {
+        self.reply_timeout.as_ref()
     }
 
     /// Sets the TCP user timeout.
@@ -782,6 +805,7 @@ impl fmt::Debug for Config {
             .field("hostaddr", &self.hostaddr)
             .field("port", &self.port)
             .field("connect_timeout", &self.connect_timeout)
+            .field("reply_timeout", &self.reply_timeout)
             .field("tcp_user_timeout", &self.tcp_user_timeout)
             .field("keepalives", &self.keepalives);
 

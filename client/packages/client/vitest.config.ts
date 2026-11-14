@@ -1,6 +1,18 @@
 import { playwright } from "@vitest/browser-playwright";
 import { defineConfig } from "vitest/config";
 
+// `CALQUE_BROWSER` runs the browser suite in one engine; unset, it runs in
+// Chromium and Firefox.
+const engines = ["chromium", "firefox", "webkit"] as const;
+const requested = process.env["CALQUE_BROWSER"];
+const instances = (
+  requested === undefined
+    ? (["chromium", "firefox"] as const)
+    : engines.filter((name) => name === requested)
+).map((browser) => ({ browser }));
+if (instances.length === 0)
+  throw new Error(`CALQUE_BROWSER must be one of ${engines.join(", ")}`);
+
 export default defineConfig({
   optimizeDeps: {
     include: [
@@ -18,18 +30,16 @@ export default defineConfig({
           include: ["src/**/*.test.ts"],
         },
       },
-      // Firefox: this project proves only that a browser outside the
-      // supported profile is refused before any request or allocation.
-      // `scripts/verify-client-browser-consumer.ts` drives the packaged client
-      // in Chromium against a real artifact.
+      // `scripts/verify-client-browser-consumer.ts` drives the packaged
+      // client in Chromium against a real artifact.
       {
         test: {
-          name: "unsupported-browser",
-          include: ["tests/unsupported-browser.browser.test.ts"],
+          name: "browser",
+          include: ["tests/**/*.browser.test.ts"],
           browser: {
             enabled: true,
             headless: true,
-            instances: [{ browser: "firefox" }],
+            instances,
             provider: playwright(),
           },
         },

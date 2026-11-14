@@ -14,6 +14,8 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
+#[cfg(feature = "runtime")]
+use std::{io, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
 
@@ -54,6 +56,12 @@ pub struct Connection<S, T> {
     pending_responses: VecDeque<BackendMessage>,
     responses: VecDeque<Response>,
     state: State,
+    #[cfg(feature = "runtime")]
+    reply_timeout: Option<Duration>,
+    #[cfg(feature = "runtime")]
+    reply_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    #[cfg(feature = "runtime")]
+    heard: bool,
 }
 
 impl<S, T> Connection<S, T>
@@ -75,7 +83,46 @@ where
             pending_responses,
             responses: VecDeque::new(),
             state: State::Active,
+            #[cfg(feature = "runtime")]
+            reply_timeout: None,
+            #[cfg(feature = "runtime")]
+            reply_deadline: None,
+            #[cfg(feature = "runtime")]
+            heard: false,
         }
+    }
+
+    #[cfg(feature = "runtime")]
+    pub(crate) fn set_reply_timeout(&mut self, reply_timeout: Option<Duration>) {
+        self.reply_timeout = reply_timeout;
+    }
+
+    /// Fails the connection once a request has awaited its reply for the
+    /// reply timeout without the server sending anything.
+    #[cfg(feature = "runtime")]
+    fn poll_reply_deadline(&mut self, cx: &mut Context<'_>) -> Result<(), Error> {
+        let Some(reply_timeout) = self.reply_timeout else {
+            return Ok(());
+        };
+        // Nothing is owed while no request awaits a reply, or while the
+        // client has not taken what the server already sent.
+        let awaiting = !self.responses.is_empty() && self.pending_responses.is_empty();
+        if std::mem::take(&mut self.heard) || !awaiting {
+            self.reply_deadline = None;
+        }
+        if !awaiting {
+            return Ok(());
+        }
+        let deadline = self
+            .reply_deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(reply_timeout)));
+        if deadline.as_mut().poll(cx).is_ready() {
+            return Err(Error::io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the server sent nothing while a reply was awaited",
+            )));
+        }
+        Ok(())
     }
 
     fn poll_response(
@@ -87,9 +134,14 @@ where
             return Poll::Ready(Some(Ok(message)));
         }
 
-        Pin::new(&mut self.stream)
+        let message = Pin::new(&mut self.stream)
             .poll_next(cx)
-            .map(|o| o.map(|r| r.map_err(Error::io)))
+            .map(|o| o.map(|r| r.map_err(Error::io)));
+        #[cfg(feature = "runtime")]
+        if let Poll::Ready(Some(Ok(_))) = message {
+            self.heard = true;
+        }
+        message
     }
 
     fn poll_read(&mut self, cx: &mut Context<'_>) -> Result<Option<AsyncMessage>, Error> {
@@ -306,6 +358,10 @@ where
         let want_flush = self.poll_write(cx)?;
         if want_flush {
             self.poll_flush(cx)?;
+        }
+        #[cfg(feature = "runtime")]
+        if message.is_none() {
+            self.poll_reply_deadline(cx)?;
         }
         match message {
             Some(message) => Poll::Ready(Some(Ok(message))),

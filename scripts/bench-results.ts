@@ -813,6 +813,33 @@ export function wireByPurpose(
   };
 }
 
+/**
+ * What a cold sample took beyond its bytes: its complete stable paint minus
+ * the time `totalBytes` need on a link of `megabitsPerSecond`. What remains is
+ * the request round trips, the digest checks, the decode, the index build and
+ * the paint. `null` where the sample did not pass, where no link rate applies,
+ * or where the sample has no bytes on the wire.
+ */
+export function aboveWireMs(
+  sample: {
+    readonly verdict: Verdict;
+    readonly valueMs: number | null;
+    readonly totalBytes: number;
+  },
+  megabitsPerSecond: number | null,
+): number | null {
+  const paintMs = rankedValue(sample);
+  if (
+    paintMs === null ||
+    megabitsPerSecond === null ||
+    !(megabitsPerSecond > 0) ||
+    !(sample.totalBytes > 0)
+  )
+    return null;
+  // 1 Mbit/s moves 1,000 bits each millisecond.
+  return paintMs - (sample.totalBytes * 8) / (megabitsPerSecond * 1_000);
+}
+
 /** The read-out's line for the artifact object witness. */
 export function artifactObjectLine(witness: ArtifactObjectWitness): string {
   if (witness.one === null)

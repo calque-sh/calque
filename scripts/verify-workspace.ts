@@ -308,15 +308,14 @@ run("Stale path references", "node", [
   "scripts/verify-no-stale-path-references.ts",
 ]);
 run("Rust formatting", "cargo", ["fmt", "--all", "--", "--check"]);
-// `scripts/**` and the grant issuer example have no package.json, so
-// `pnpm -r` never formats them; `format:harness` covers the same globs.
+// `scripts/**` has no package.json, so `pnpm -r` never formats it;
+// `format:harness` covers the same globs.
 run("Harness formatting", "pnpm", [
   "exec",
   "prettier",
   "--check",
   "scripts/**/*.ts",
   "scripts/**/*.mjs",
-  "client/examples/grant-issuer/*.mts",
 ]);
 run("TypeScript generated-binding drift", "pnpm", [
   "--filter",
@@ -363,6 +362,11 @@ run("Rust warnings/clippy", "cargo", [
   "-D",
   "warnings",
 ]);
+
+// Production code returns an error instead of unwrapping or panicking; an
+// `.expect` that names the invariant it relies on stays allowed. Tests,
+// examples and benches are left out.
+run("Rust production panics", "pnpm", ["run", "lint:rust-production"]);
 
 for (const package_ of typescriptPackages) {
   if (

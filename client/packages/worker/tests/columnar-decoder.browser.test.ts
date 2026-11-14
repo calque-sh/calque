@@ -1,5 +1,5 @@
 /**
- * A `brotli-large-window` body decoded in Chromium by the real decoder
+ * A `brotli-large-window` body decoded in the browser by the real decoder
  * worker, and a `packed-brotli-large-window` one decoded and unpacked by it:
  * `columnar-decoder-entry.ts`, which fetches the committed module from
  * beside itself and compiles it as it streams.
@@ -7,7 +7,7 @@
  * The page's part is `ArtifactDecoder`, as the session drives it: it writes
  * the body as it would arrive, takes the chunks in order and returns a credit
  * for each. The session's own use of it is unit-tested in Node; this suite
- * shows that the worker and its module load and decode in Chromium.
+ * shows that the worker and its module load and decode in the browser.
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { commands } from "vitest/browser";
@@ -96,7 +96,7 @@ async function write(
   }
 }
 
-describe("the decoder worker in Chromium", () => {
+describe("the decoder worker in the browser", () => {
   it("decodes a large-window body into the plan's chunks with the module it fetched", async () => {
     const body = bytesOf(await commands.readBrotliFixture());
     const expected = fixtureBytes(FIXTURE_BYTES);

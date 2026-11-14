@@ -9,6 +9,10 @@ import {
 } from "./bootstrap-start.js";
 import type { InternalSyncClientOptions, SyncClientOptions } from "./client.js";
 import {
+  AUTOMATIC_MUTATION_RESENDS,
+  MUTATION_RESEND_DELAY_MS,
+} from "./columnar/mutation-tracking.js";
+import {
   CLIENT_METADATA_RESERVE_BYTES,
   CONTROL_CHARACTER,
   utf8ByteLengthAtMost,
@@ -90,6 +94,11 @@ export interface SealedSyncClientOptions {
   readonly deviceIdChosen: boolean;
   readonly fetch: typeof globalThis.fetch;
   readonly grantVerificationKey?: RevocationBarrierVerificationKey;
+  /** How often, and after what first wait, an undecided write is resent. */
+  readonly mutationResends: {
+    readonly count: number;
+    readonly delayMs: number;
+  };
 }
 
 const PUBLIC_KEYS = Object.freeze([
@@ -111,6 +120,8 @@ const PUBLIC_REQUIRED_KEYS = Object.freeze([
 const INTERNAL_KEYS = Object.freeze([
   ...PUBLIC_KEYS,
   "clientHeapReserveBytes",
+  "automaticMutationResends",
+  "mutationResendDelayMs",
 ] as const);
 
 const INTERNAL_REQUIRED_KEYS = Object.freeze([
@@ -176,10 +187,20 @@ export function sealInternalSyncClientOptions(
     throw new TypeError(
       "InternalSyncClientOptions clientHeapReserveBytes must not exceed memoryBudgetBytes",
     );
+  const count = captured.automaticMutationResends ?? AUTOMATIC_MUTATION_RESENDS;
+  if (!Number.isSafeInteger(count) || (count as number) < 0)
+    throw new TypeError(
+      "InternalSyncClientOptions automaticMutationResends must be a non-negative safe integer",
+    );
+  const delayMs = positiveSafeInteger(
+    captured.mutationResendDelayMs ?? MUTATION_RESEND_DELAY_MS,
+    "InternalSyncClientOptions mutationResendDelayMs must be a positive safe integer",
+  );
   return sealCapturedOptions(
     captured,
     memoryBudgetBytes,
     clientHeapReserveBytes,
+    { count: count as number, delayMs },
   );
 }
 
@@ -220,6 +241,10 @@ function sealCapturedOptions(
   captured: Readonly<Record<string, unknown>>,
   memoryBudgetBytes: number,
   clientHeapReserveBytes: number,
+  mutationResends: SealedSyncClientOptions["mutationResends"] = {
+    count: AUTOMATIC_MUTATION_RESENDS,
+    delayMs: MUTATION_RESEND_DELAY_MS,
+  },
 ): SealedSyncClientOptions {
   if (clientHeapReserveBytes < MINIMUM_CLIENT_HEAP_RESERVE_BYTES)
     throw new TypeError(
@@ -258,6 +283,7 @@ function sealCapturedOptions(
     deviceIdChosen: captured.deviceId !== undefined,
     fetch: fetcher as typeof globalThis.fetch,
     ...(grantVerificationKey ? { grantVerificationKey } : {}),
+    mutationResends: Object.freeze({ ...mutationResends }),
   } satisfies SealedSyncClientOptions;
   return Object.freeze(sealed);
 }

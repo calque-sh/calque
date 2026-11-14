@@ -347,4 +347,38 @@ describe("the engine worker routes mutate and drop through the mount", () => {
     expect((await userRow("user-0"))?.[1]).toBe("User 0, streamed");
     expect((await userRow("user-2"))?.[1]).toBe("User 2, streamed");
   });
+
+  test("a batch must name the plan its request named, which a renewal replaces", async () => {
+    const operations = [renameOperation("user-1", "User 1, renewed")];
+    const renewed = await changeBatch(
+      { ...CONTRACT, planId: "plan-renewed" },
+      "cursor-3",
+      "cursor-4",
+      operations,
+      [],
+    );
+    // Under the plan the mount opened with, the renewed plan's batch is not
+    // an answer; nor is the old plan's batch an answer to a renewed request.
+    await expect(
+      ask<"change">({ type: "change", batches: [renewed] }),
+    ).rejects.toThrow(/batchStart\.planId/u);
+    await expect(
+      ask<"change">({
+        type: "change",
+        batches: [
+          await changeBatch(CONTRACT, "cursor-3", "cursor-4", operations, []),
+        ],
+        planId: "plan-renewed",
+      }),
+    ).rejects.toThrow(/batchStart\.planId/u);
+    const applied = await ask<"change">({
+      type: "change",
+      batches: [renewed],
+      planId: "plan-renewed",
+    });
+    expect(utf8.decode(applied.state.cursor ?? new Uint8Array())).toBe(
+      "cursor-4",
+    );
+    expect((await userRow("user-1"))?.[1]).toBe("User 1, renewed");
+  });
 });

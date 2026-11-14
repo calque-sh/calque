@@ -149,9 +149,9 @@ function composeQuiet(...args: readonly string[]): void {
   });
 }
 
-function psql(sql: string): string {
+function psqlAs(user: string, password: string, sql: string): string {
   return composeWithSecrets(
-    { PGPASSWORD: environment.CALQUE_SELFHOST_DB_PASSWORD ?? "" },
+    { PGPASSWORD: password },
     "exec",
     "-T",
     "-e",
@@ -163,10 +163,28 @@ function psql(sql: string): string {
     "-h",
     "127.0.0.1",
     "-U",
-    environment.CALQUE_SELFHOST_DB_ROLE ?? "calque_sync",
+    user,
     "-d",
     environment.CALQUE_SELFHOST_DATABASE ?? "calque",
     "-c",
+    sql,
+  );
+}
+
+/** As the role `calque serve` connects as, which owns no table. */
+function psql(sql: string): string {
+  return psqlAs(
+    environment.CALQUE_SELFHOST_DB_ROLE ?? "calque_sync",
+    environment.CALQUE_SELFHOST_DB_PASSWORD ?? "",
+    sql,
+  );
+}
+
+/** As the superuser, standing in for the application's own role. */
+function ownerPsql(sql: string): string {
+  return psqlAs(
+    "calque_admin",
+    environment.CALQUE_SELFHOST_POSTGRES_SUPERUSER_PASSWORD ?? "",
     sql,
   );
 }
@@ -366,6 +384,7 @@ ALTER TABLE projects REPLICA IDENTITY FULL;
 ALTER TABLE tasks REPLICA IDENTITY FULL;
 DROP PUBLICATION IF EXISTS calque_demo;
 CREATE PUBLICATION calque_demo FOR TABLE projects, tasks;
+GRANT SELECT, INSERT, UPDATE, DELETE ON projects, tasks TO calque_sync;
 `;
 
 const CHANGED_PROJECT_NAME = `Atlas launch ${runId}`;
@@ -618,10 +637,10 @@ async function main(): Promise<RunOutcome> {
       join(root, "client/packages/client/tests/demo/calque.config.json"),
       "utf8",
     ),
-  ) as { sources: { connectionEnv: string }[] };
+  ) as { sources: { databaseUrlEnv: string }[] };
   const [source] = manifest.sources;
   if (!source) throw new Error("the binding fixture declares no source");
-  source.connectionEnv = "CALQUE_DATABASE_URL";
+  source.databaseUrlEnv = "CALQUE_DATABASE_URL";
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
   // Run-scoped credentials. Hexadecimal so they survive being interpolated
@@ -704,7 +723,7 @@ async function main(): Promise<RunOutcome> {
     psql("SELECT 1");
     return true;
   });
-  psql(SEED_SQL);
+  ownerPsql(SEED_SQL);
 
   // The edge's local CA exists once Caddy has provisioned the site. Its root
   // is the only certificate every TLS client in this run trusts.

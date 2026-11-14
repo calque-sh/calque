@@ -59,6 +59,7 @@ export const SERVER_FLAGS: readonly (readonly [string, string])[] = [
   ["wal_level", "logical"],
   ["max_replication_slots", "10"],
   ["max_wal_senders", "10"],
+  ["max_slot_wal_keep_size", "10GB"],
   ["timezone", "UTC"],
 ];
 

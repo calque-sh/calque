@@ -74,12 +74,12 @@ test("only the exact fixture version and profile count as seeded", () => {
 /**
  * A source that answers the probe and fails like PostgreSQL on any other
  * statement naming `metadata` while the table does not exist. `marker` is the
- * schema's comment.
+ * schema's comment, by default the one v1's cut carries.
  */
 function sourceWith(
   metadata: string | undefined,
   rekeyed = false,
-  marker = "",
+  marker = cutSchemaMarker("v1"),
 ) {
   const statements: string[] = [];
   const sql = (statement: string) => {
@@ -120,13 +120,13 @@ test("a source an earlier run re-keyed is reseeded", () => {
   assert.equal(rekeyed.statements.at(-1), issueTagsRekeyedSql);
 });
 
-test("the schema's comment tells v1 from a finished content seed", () => {
+test("the schema's comment tells v1's cut from a finished content seed", () => {
   const seeded = `${DATASET_VERSION} ${CORRECTED_PROFILE_SHA256}`;
   const v1 = sourceWith(seeded);
   assert.equal(holdsSeededDataset(v1.sql, "v1"), true);
   assert.equal(holdsSeededDataset(v1.sql, "content-v1"), false);
   assert.equal(v1.statements.at(-1), schemaMarkerSql);
-  const content = sourceWith(seeded, false, CONTENT_DATASET_VERSION);
+  const content = sourceWith(seeded, false, cutSchemaMarker("content-v1"));
   assert.equal(holdsSeededDataset(content.sql), false);
   assert.equal(holdsSeededDataset(content.sql, "content-v1"), true);
   // A content seed that stopped before its checks passed is neither.
@@ -135,19 +135,12 @@ test("the schema's comment tells v1 from a finished content seed", () => {
   assert.equal(holdsSeededDataset(partial.sql, "content-v1"), false);
 });
 
-test("the 100k cut and the whole fixture are told apart by the schema's comment", () => {
+test("a source that holds the whole fixture is reseeded as the 100k cut", () => {
   const seeded = `${DATASET_VERSION} ${CORRECTED_PROFILE_SHA256}`;
-  const whole = sourceWith(seeded);
-  assert.equal(holdsSeededDataset(whole.sql, "v1", "1m"), true);
-  assert.equal(holdsSeededDataset(whole.sql, "v1", "100k"), false);
-  const cut = sourceWith(seeded, false, cutSchemaMarker("v1"));
-  assert.equal(holdsSeededDataset(cut.sql, "v1", "100k"), true);
-  assert.equal(holdsSeededDataset(cut.sql, "v1", "1m"), false);
-  assert.equal(holdsSeededDataset(cut.sql, "content-v1", "100k"), false);
-  const contentCut = sourceWith(seeded, false, cutSchemaMarker("content-v1"));
-  assert.equal(holdsSeededDataset(contentCut.sql, "content-v1", "100k"), true);
-  assert.equal(holdsSeededDataset(contentCut.sql, "content-v1", "1m"), false);
-  assert.equal(holdsSeededDataset(contentCut.sql, "v1", "100k"), false);
+  const whole = sourceWith(seeded, false, "");
+  assert.equal(holdsSeededDataset(whole.sql, "v1"), false);
+  const wholeContent = sourceWith(seeded, false, CONTENT_DATASET_VERSION);
+  assert.equal(holdsSeededDataset(wholeContent.sql, "content-v1"), false);
 });
 
 test("state from a recreated source is removed locally, and otherwise with its slot", () => {
@@ -180,44 +173,27 @@ test("state from a recreated source is removed locally, and otherwise with its s
   );
 });
 
-test("the launcher takes --no-open, --fresh, --dataset and --rows and refuses anything else", () => {
+test("the launcher takes --no-open, --fresh and --dataset and refuses anything else", () => {
   assert.deepEqual(parseIncidentsArguments([]), {
     open: true,
     fresh: false,
     dataset: "v1",
-    rows: "1m",
   });
   assert.deepEqual(parseIncidentsArguments(["--", "--no-open", "--fresh"]), {
     open: false,
     fresh: true,
     dataset: "v1",
-    rows: "1m",
   });
   assert.deepEqual(
     parseIncidentsArguments(["--", "--dataset", "content-v1", "--no-open"]),
-    { open: false, fresh: false, dataset: "content-v1", rows: "1m" },
+    { open: false, fresh: false, dataset: "content-v1" },
   );
   assert.deepEqual(parseIncidentsArguments(["--dataset", "v1"]), {
     open: true,
     fresh: false,
     dataset: "v1",
-    rows: "1m",
   });
-  assert.deepEqual(parseIncidentsArguments(["--rows", "100k"]), {
-    open: true,
-    fresh: false,
-    dataset: "v1",
-    rows: "100k",
-  });
-  assert.deepEqual(
-    parseIncidentsArguments(["--rows", "100k", "--dataset", "content-v1"]),
-    { open: true, fresh: false, dataset: "content-v1", rows: "100k" },
-  );
-  for (const refused of [
-    ["--rows"],
-    ["--rows", "10m"],
-    ["--rows", "100k", "--rows", "1m"],
-  ])
+  for (const refused of [["--rows", "100k"], ["--rows", "1m"], ["--rows"]])
     assert.throws(
       () => parseIncidentsArguments(refused),
       /usage/u,
@@ -254,6 +230,8 @@ test("the e2e passes --dataset through and refuses anything else", () => {
     ["--dataset", "v2"],
     ["--fresh"],
     ["--dataset", "v1", "--no-open"],
+    ["--after-packed"],
+    ["--dataset", "v1", "--dataset", "content-v1"],
   ])
     assert.throws(() => parseIncidentsE2eArguments(arguments_), /usage/u);
 });

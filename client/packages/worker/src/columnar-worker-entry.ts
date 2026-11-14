@@ -487,7 +487,9 @@ async function handle(request: LiveRequest): Promise<WorkerResponse> {
     // accepted one is one publication.
     const decoded = await changeState.decode(
       request.batches,
-      changeState.binding,
+      request.planId === undefined
+        ? changeState.binding
+        : { ...changeState.binding, planId: request.planId },
       changeState.cursor,
       request.fence,
     );

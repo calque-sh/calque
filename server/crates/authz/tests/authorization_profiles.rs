@@ -3,7 +3,9 @@ use authz::{
     TablePermitDefinition,
 };
 use canonical_log::{CanonicalOperation, CanonicalOperationKind, CellValue, ColumnValue};
-use source_control::{ColumnInspection, QualifiedTable, RegisteredTable, TableInspection};
+use source_control::{
+    ColumnInspection, QualifiedTable, RegisteredTable, TableInspection, UnlistedColumn,
+};
 use sync_types::{ColumnId, TableId};
 
 fn value(column_id: u32, value: CellValue) -> ColumnValue {
@@ -38,6 +40,7 @@ fn column(
         primary_key_ordinal,
         generated: false,
         nondeterministic_collation: false,
+        carried_as: None,
     }
 }
 
@@ -58,6 +61,7 @@ fn table() -> RegisteredTable {
             is_partition: false,
             has_publication_row_filter: false,
             has_publication_column_list: false,
+            unlisted_columns: Vec::new(),
             columns: vec![
                 column(1, "tenant\"id", "uuid", Some(1)),
                 column(2, "region_id", "int4", Some(2)),
@@ -134,7 +138,7 @@ fn replica_identity_and_primary_key_follow_the_enrollment_rule() {
 }
 
 #[test]
-fn publication_filters_and_column_lists_are_never_authorization_inputs() {
+fn row_filters_are_refused_and_column_lists_leave_unlisted_columns_unnameable() {
     let mut filtered = table();
     filtered.inspection.has_publication_row_filter = true;
     assert!(matches!(
@@ -142,11 +146,22 @@ fn publication_filters_and_column_lists_are_never_authorization_inputs() {
         Err(PolicyError::PublicationRowFilter)
     ));
 
+    // A column the publication's column list leaves out is never registered,
+    // so a policy compiles over the listed columns and can name no other.
     let mut projected = table();
     projected.inspection.has_publication_column_list = true;
+    projected.inspection.unlisted_columns.push(UnlistedColumn {
+        name: "secret".to_owned(),
+        primary_key: false,
+        required_on_insert: false,
+    });
+    assert!(AuthorizationPolicy::compile(source_wide(all_columns()), &[projected.clone()]).is_ok());
+    let unlisted = ColumnId::new(u32::try_from(all_columns().len()).unwrap() + 1);
+    let mut beyond = all_columns();
+    beyond.push(unlisted);
     assert!(matches!(
-        AuthorizationPolicy::compile(source_wide(all_columns()), &[projected]),
-        Err(PolicyError::PublicationColumnList)
+        AuthorizationPolicy::compile(source_wide(beyond), &[projected]),
+        Err(PolicyError::UnknownColumn)
     ));
 }
 

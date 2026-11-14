@@ -6,8 +6,9 @@ use source_control::{
     PgoutputLaunchProfile, QualifiedTable, SchemaRegistry,
 };
 use source_runtime::{
-    establish_persistent_source, provision_persistent_slot, AcquireRequest, FenceAuthority,
-    FenceStore, OwnerId, PostgresFenceStore, SlotProvisioningConfig, SourceRuntimeError,
+    establish_persistent_source, inspect_owned_publication, provision_persistent_slot,
+    AcquireRequest, FenceAuthority, FenceStore, OwnedPublication, OwnerId, PostgresFenceStore,
+    SlotProvisioningConfig, SourceRuntimeError,
 };
 use sync_types::{CursorCodec, SourceEpoch, SourceId};
 
@@ -146,11 +147,82 @@ fn pg18_least_privilege_enrollment_binds_slot_identity_and_epoch() {
             &replication_url(&source_url),
             &activated,
         ),
-        Err(SourceRuntimeError::SlotMissingReseedRequired)
+        Err(SourceRuntimeError::SlotMissing { .. })
     ));
     admin
         .batch_execute(&format!(
             "DROP PUBLICATION {publication}; DROP TABLE public.{table_name};"
+        ))
+        .unwrap();
+}
+
+/// Renaming or adding an enum value changes no row, so the publication's
+/// fingerprint has to change instead, whether the publication lists the table
+/// or reaches it through its schema. An enum only an unlisted column uses
+/// leaves it as it was, since no published value changes.
+///
+/// Only a superuser may create a `FOR TABLES IN SCHEMA` publication, so this
+/// test connects as one.
+#[test]
+#[ignore = "requires a disposable PostgreSQL 18 superuser URL"]
+fn the_publication_fingerprint_follows_the_enums_its_published_columns_use() {
+    let admin_url = required("CALQUE_SUPERUSER_DATABASE_URL");
+    let suffix = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos()
+    );
+    let schema = format!("rm_enum_{suffix}");
+    let listed = format!("rm_enum_listed_{suffix}");
+    let in_schema = format!("rm_enum_schema_{suffix}");
+    let hidden = format!("rm_enum_hidden_{suffix}");
+    let mut admin = Client::connect(&admin_url, NoTls).unwrap();
+    admin
+        .batch_execute(&format!(
+            "CREATE SCHEMA {schema};
+             CREATE TYPE {schema}.mood AS ENUM ('calm', 'busy');
+             CREATE DOMAIN {schema}.mood_label AS {schema}.mood;
+             CREATE TABLE {schema}.items (id bigint PRIMARY KEY, mood {schema}.mood_label NOT NULL);
+             CREATE PUBLICATION {listed} FOR TABLE {schema}.items;
+             CREATE PUBLICATION {in_schema} FOR TABLES IN SCHEMA {schema};
+             CREATE PUBLICATION {hidden} FOR TABLE {schema}.items (id);"
+        ))
+        .unwrap();
+    let tables = BTreeSet::from([QualifiedTable {
+        schema: schema.clone(),
+        table: "items".to_owned(),
+    }]);
+    let publications = [listed.as_str(), in_schema.as_str(), hidden.as_str()];
+    let fingerprints = |admin: &mut Client| {
+        publications.map(|publication| {
+            match inspect_owned_publication(admin, publication, &tables).unwrap() {
+                OwnedPublication::Matches { fingerprint, .. } => fingerprint,
+                other => panic!("{publication}: {other:?}"),
+            }
+        })
+    };
+
+    let before = fingerprints(&mut admin);
+    admin
+        .batch_execute(&format!(
+            "ALTER TYPE {schema}.mood RENAME VALUE 'busy' TO 'swamped'"
+        ))
+        .unwrap();
+    let renamed = fingerprints(&mut admin);
+    admin
+        .batch_execute(&format!("ALTER TYPE {schema}.mood ADD VALUE 'away'"))
+        .unwrap();
+    let added = fingerprints(&mut admin);
+
+    for index in 0..2 {
+        assert_ne!(before[index], renamed[index], "{}", publications[index]);
+        assert_ne!(renamed[index], added[index], "{}", publications[index]);
+    }
+    assert_eq!(before[2], renamed[2]);
+    assert_eq!(renamed[2], added[2]);
+    admin
+        .batch_execute(&format!(
+            "DROP PUBLICATION {listed}, {in_schema}, {hidden}; DROP SCHEMA {schema} CASCADE;"
         ))
         .unwrap();
 }

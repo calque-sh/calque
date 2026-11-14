@@ -10,7 +10,10 @@ Caddy, over HTTPS.
 
 You need what [Try it locally](../README.md#try-it-locally) lists, plus
 `openssl` and `curl`, and on Linux NSS's `certutil` (`libnss3-tools` on Debian
-and Ubuntu). Run everything from the repository root.
+and Ubuntu). `calque inspect` and `calque init` below build with Rust, so you also need the
+Rust toolchain through rustup, a C compiler, and libpq with `pg_config` on
+`PATH` ([Building calque from source](development.md#building-calque-from-source)).
+Run everything from the repository root.
 
 The composition publishes PostgreSQL on port 55452, MinIO on 59001, the
 server's plaintext port on 8787, its metrics port on 8788 and the HTTPS edge on
@@ -22,17 +25,19 @@ it first.
 
 `calque serve` verifies signed dataset grants and mints none: your
 application's backend issues them, following
-[`spec/dataset-grant-v1.md`](../spec/dataset-grant-v1.md). A Node backend can
-start from [`client/examples/grant-issuer/`](../client/examples/grant-issuer/),
-which uses `node:crypto` alone. `calque-dev-grant` stands in for that backend
-here. It creates the signing key on first use, prints a grant, and prints the
-verification key the server needs:
+[`spec/dataset-grant-v1.md`](../spec/dataset-grant-v1.md). A Node backend runs
+`npm install @calque/grant`, which creates the signing key and signs grants
+([`client/packages/grant`](../client/packages/grant/README.md)). Here the
+workspace builds the package, and its `calque-grant` command stands in for the
+backend. `keygen` creates the signing key and prints the verification key the
+server needs, and `mint` prints a grant and that same verification key:
 
 ```sh
-cargo run -q -p dataset-grant-issuer --bin calque-dev-grant -- \
-  --key-file grant-key.pk8 --key-id quickstart --audience quickstart.example \
-  --generation 1 --subject me --lifetime-seconds 900 --command tasks=update \
-  > grant.json
+pnpm install && pnpm --filter @calque/grant build
+pnpm exec calque-grant keygen --key-file grant-key.pem --key-id quickstart
+pnpm exec calque-grant mint --key-file grant-key.pem --key-id quickstart \
+  --audience quickstart.example --generation 1 --subject me \
+  --lifetime-seconds 900 --command tasks=update > grant.json
 ```
 
 ## Settings
@@ -55,15 +60,18 @@ export CALQUE_SELFHOST_POSTGRES_SUPERUSER_PASSWORD="$(openssl rand -hex 16)" \
 ## The database
 
 Start the database and the object store, then create your tables and their
-publication as the least-privilege role the composition creates:
+publication. The composition's superuser, `calque_admin`, stands in here for
+your application's own role. Calque connects as `calque_sync`, a
+least-privilege role the composition creates, which owns no table and gets
+the rows by grant:
 
 ```sh
 docker compose -f docker-compose.selfhost.yml up -d --wait postgres
 docker compose -f docker-compose.selfhost.yml up -d objectstore objectstore-init
 
-PGPASSWORD="$CALQUE_SELFHOST_DB_PASSWORD" \
+PGPASSWORD="$CALQUE_SELFHOST_POSTGRES_SUPERUSER_PASSWORD" \
 docker compose -f docker-compose.selfhost.yml exec -T -e PGPASSWORD postgres \
-  psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U calque_sync -d calque <<'SQL'
+  psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U calque_admin -d calque <<'SQL'
 CREATE TABLE projects (id bigint PRIMARY KEY, name text NOT NULL, status text NOT NULL);
 CREATE TABLE tasks (
   id bigint PRIMARY KEY,
@@ -74,6 +82,7 @@ CREATE TABLE tasks (
 INSERT INTO projects VALUES (1, 'Quickstart', 'active');
 INSERT INTO tasks VALUES (1, 1, 'Open the page', false);
 CREATE PUBLICATION calque_app FOR TABLE projects, tasks;
+GRANT SELECT, INSERT, UPDATE, DELETE ON projects, tasks TO calque_sync;
 SQL
 ```
 
@@ -152,14 +161,13 @@ byte-identical to them; for other tables,
 
 A grant lasts at most 15 minutes, so the one minted at the start may have
 expired by now. Mint a fresh one before the page loads. The command reuses
-`grant-key.pk8`, so the verification key the server was started with still
+`grant-key.pem`, so the verification key the server was started with still
 verifies it:
 
 ```sh
-cargo run -q -p dataset-grant-issuer --bin calque-dev-grant -- \
-  --key-file grant-key.pk8 --key-id quickstart --audience quickstart.example \
-  --generation 1 --subject me --lifetime-seconds 900 --command tasks=update \
-  > grant.json
+pnpm exec calque-grant mint --key-file grant-key.pem --key-id quickstart \
+  --audience quickstart.example --generation 1 --subject me \
+  --lifetime-seconds 900 --command tasks=update > grant.json
 ```
 
 Start the page. Its dev server serves the repository root's `grant.json` at
@@ -184,7 +192,7 @@ import { schema } from "./calque.generated.js";
 
 const client = createSyncClient({
   endpoint: "https://localhost:8443/",
-  // The dev server serves the grant `calque-dev-grant` wrote. In production,
+  // The dev server serves the grant `calque-grant mint` wrote. In production,
   // your backend issues it.
   auth: async () => {
     const response = await fetch("/grant.json", { cache: "no-store" });

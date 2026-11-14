@@ -7,7 +7,7 @@
     "./bootstrap-render",
     "./vite"
   ],
-  "reachableDeclarationGraphSha256": "3130b45e67008504c85d4ed3dde0f2ef8094f6e3bc135c3cabb929c75ba8a5a6",
+  "reachableDeclarationGraphSha256": "4d7b986807ab9d1e6ed3f4be5810fdfdf11ee4f714a57dd6113fe4527136b80d",
   "rootValues": [
     "MutationSubmissionError",
     "SyncError",
@@ -36,9 +36,12 @@
     "JoinedColumns",
     "LiveQueryResource",
     "LiveQuerySnapshot",
+    "MutationAccepted",
+    "MutationConflict",
     "MutationResult",
     "MutationState",
     "MutationStatus",
+    "MutationSubmissionErrorCode",
     "ProjectedName",
     "ProjectedRow",
     "QueryBuilder",
@@ -164,10 +167,11 @@
       "optional": []
     }
   },
-  "mutationSubmissionErrorMembers": ["code", "mutationId"],
+  "mutationSubmissionErrorMembers": ["code", "mutationId", "conflict"],
   "mutationSubmissionErrorCodes": [
     "AUTH_FAILED",
     "MUTATION_AMBIGUOUS",
+    "MUTATION_CONFLICT",
     "MUTATION_REJECTED"
   ],
   "mutationSubmissionErrorRuntimeOwnKeys": [
@@ -222,7 +226,7 @@
     "BootstrapStart",
     "RenderedConnection"
   ],
-  "bootstrapStartDeclarationGraphSha256": "544284d642b1a9e5fcb298f48881ce71e55b19d9b35538695a150a2cd8f6445a",
+  "bootstrapStartDeclarationGraphSha256": "17148ec365c08aac3b5e18f9589397c3bcf25ff1e2492a5e1f5b45a8280d177a",
   "bootstrapRenderValues": ["renderBootstrap"],
   "bootstrapRenderTypes": [
     "BootstrapRequest",

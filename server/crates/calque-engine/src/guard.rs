@@ -78,6 +78,19 @@ impl DatabaseUrl {
     /// verifies the server against `sslrootcert`. The result is one canonical
     /// URL every connection family and both drivers read the same way.
     pub fn parse(value: &str) -> Result<Self, GuardError> {
+        Self::parse_with(value, PlaintextRemote::Refused)
+    }
+
+    /// What `calque dev` accepts: everything [`DatabaseUrl::parse`] does, and
+    /// an explicit `sslmode=disable` on any other host. A container's
+    /// `127.0.0.1` is the container, so a database on the developer's machine
+    /// is reached by a host name or an address that is not loopback. A host
+    /// without that parameter still needs verified TLS.
+    pub fn parse_for_dev(value: &str) -> Result<Self, GuardError> {
+        Self::parse_with(value, PlaintextRemote::Allowed)
+    }
+
+    fn parse_with(value: &str, plaintext_remote: PlaintextRemote) -> Result<Self, GuardError> {
         let mut url = Url::parse(value).map_err(|_| GuardError::DatabaseUrlMalformed)?;
         if !matches!(url.scheme(), "postgres" | "postgresql") {
             return Err(GuardError::DatabaseScheme);
@@ -140,16 +153,23 @@ impl DatabaseUrl {
                     return Err(GuardError::DatabaseRoutingQuery);
                 }
             }
-            Transport::Tls => {
-                if routing.sslrootcert.is_none()
-                    || routing
-                        .sslmode
-                        .as_deref()
-                        .is_some_and(|mode| mode != "verify-full")
-                {
-                    return Err(GuardError::DatabaseTlsRequired);
+            Transport::Tls => match routing.sslmode.as_deref() {
+                Some("disable") if plaintext_remote == PlaintextRemote::Allowed => {
+                    if routing.sslrootcert.is_some() {
+                        return Err(GuardError::DatabaseRoutingQuery);
+                    }
                 }
-            }
+                Some(mode @ ("require" | "verify-ca" | "prefer" | "allow")) => {
+                    return Err(GuardError::DatabaseSslModeUnchecked(mode.to_owned()));
+                }
+                Some("verify-full") | None if routing.sslrootcert.is_some() => {}
+                _ => {
+                    return Err(match plaintext_remote {
+                        PlaintextRemote::Refused => GuardError::DatabaseTlsRequired,
+                        PlaintextRemote::Allowed => GuardError::DatabaseTlsRequiredForDev,
+                    })
+                }
+            },
         }
         // Rebuild the only allowed query fields into one canonical endpoint.
         // Unix socket directories and the root certificate file are resolved
@@ -250,6 +270,20 @@ impl DatabaseUrl {
             .any(|(key, value)| key == "sslmode" && value == "verify-full")
     }
 
+    /// The host a `calque dev` connection reaches in plaintext without it
+    /// being a loopback address, for the warning dev prints.
+    pub fn plaintext_remote_host(&self) -> Option<&str> {
+        let loopback = match self.0.host() {
+            None => true,
+            Some(Host::Ipv4(address)) => address.is_loopback(),
+            Some(Host::Ipv6(address)) => address.is_loopback(),
+            Some(Host::Domain(host)) => IpAddr::from_str(host).is_ok_and(|ip| ip.is_loopback()),
+        };
+        (!self.uses_tls() && !loopback)
+            .then(|| self.0.host_str())
+            .flatten()
+    }
+
     pub(crate) fn tcp_address(&self) -> Option<IpAddr> {
         self.0
             .host_str()
@@ -282,6 +316,8 @@ impl fmt::Debug for DatabaseUrl {
                     "unix"
                 } else if self.uses_tls() {
                     "tls"
+                } else if self.plaintext_remote_host().is_some() {
+                    "plaintext"
                 } else {
                     "loopback"
                 },
@@ -289,6 +325,14 @@ impl fmt::Debug for DatabaseUrl {
             .field("redacted", &true)
             .finish()
     }
+}
+
+/// Whether a host that is not loopback may be reached without TLS: only
+/// `calque dev` says so, and only when the URL writes `sslmode=disable`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlaintextRemote {
+    Refused,
+    Allowed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -539,7 +583,9 @@ impl AllowedOrigin {
     pub fn parse(value: &str) -> Result<Self, GuardError> {
         let url = origin_url(value)?;
         if !is_loopback_host(&url) {
-            return Err(GuardError::OriginNotLoopback);
+            return Err(GuardError::OriginNotLoopback(
+                url.origin().ascii_serialization(),
+            ));
         }
         Ok(Self(url.origin().ascii_serialization()))
     }
@@ -554,7 +600,9 @@ impl AllowedOrigin {
     pub fn parse_https_or_loopback(value: &str) -> Result<Self, GuardError> {
         let url = origin_url(value)?;
         if url.scheme() != "https" && !is_loopback_host(&url) {
-            return Err(GuardError::OriginNotHttpsOrLoopback);
+            return Err(GuardError::OriginNotHttpsOrLoopback(
+                url.origin().ascii_serialization(),
+            ));
         }
         Ok(Self(url.origin().ascii_serialization()))
     }
@@ -625,6 +673,14 @@ pub enum GuardError {
         "a database host other than a numeric loopback address (127.0.0.1 or [::1]) or a Unix socket directory is reached only over verified TLS: add sslmode=verify-full&sslrootcert=<absolute path of a PEM file of trusted CA certificates>. Host names, localhost included, count as remote; for a database on this machine, write 127.0.0.1"
     )]
     DatabaseTlsRequired,
+    #[error(
+        "a database host other than a numeric loopback address (127.0.0.1 or [::1]) or a Unix socket directory is reached over verified TLS: add sslmode=verify-full&sslrootcert=<absolute path of a PEM file of trusted CA certificates>. For a disposable database, calque dev, inspect and destroy also accept sslmode=disable, which sends the password and every row in plaintext. Host names, localhost included, count as remote; for a database on this machine, write 127.0.0.1"
+    )]
+    DatabaseTlsRequiredForDev,
+    #[error(
+        "sslmode={0} does not check the server's name, so calque refuses it: use sslmode=verify-full with sslrootcert=<absolute path of a PEM file of trusted CA certificates>"
+    )]
+    DatabaseSslModeUnchecked(String),
     #[error("database URL host must be one host name or IP address")]
     DatabaseHostMalformed,
     #[error("database URL host is missing; a Unix socket host query parameter is required")]
@@ -641,18 +697,18 @@ pub enum GuardError {
     HttpPortZero,
     #[error("Host header does not exactly match the configured listener host")]
     HttpHostMismatch,
-    #[error("a wildcard bind address requires an explicit expected Host value")]
+    #[error("a wildcard bind address requires an explicit expected Host value: pass --expected-host <host[:port]>, the exact Host header browsers send (--metrics-expected-host for the metrics listener)")]
     HttpExpectedHostRequired,
     #[error("expected Host must be a bare host or host:port, never a URL or a wildcard address")]
     HttpExpectedHostMalformed,
     #[error(
-        "allowed origin must be an HTTP(S) origin without credentials, path, query, or fragment"
+        "--allow-origin must be an HTTP(S) origin without credentials, path, query, or fragment"
     )]
     OriginMalformed,
-    #[error("allowed origin must use localhost or a loopback IP literal")]
-    OriginNotLoopback,
-    #[error("allowed origin must use HTTPS, or localhost or a loopback IP literal")]
-    OriginNotHttpsOrLoopback,
+    #[error("--allow-origin {0} is not loopback: calque dev admits only localhost or a loopback IP literal")]
+    OriginNotLoopback(String),
+    #[error("--allow-origin {0} must use HTTPS, or localhost or a loopback IP literal")]
+    OriginNotHttpsOrLoopback(String),
 }
 
 #[cfg(test)]
@@ -855,7 +911,8 @@ mod tests {
         for host_name in [
             "postgresql://localhost/app",
             "postgresql://db.example.com/app",
-            "postgresql://db.example.com/app?sslmode=require",
+            "postgresql://db.example.com/app?sslmode=disable",
+            "postgresql://db.example.com/app?sslmode=verify-full",
         ] {
             let Err(error) = DatabaseUrl::parse(host_name) else {
                 panic!("{host_name} was accepted");
@@ -876,6 +933,159 @@ mod tests {
                 assert!(message.contains(named), "{message}");
             }
         }
+    }
+
+    /// An unchecked mode is refused by name: `require` encrypts and still
+    /// accepts any certificate, which is the usual first thing to try.
+    #[test]
+    fn an_sslmode_that_does_not_check_the_name_says_so() {
+        let (_directory, _path, root) = root_certificate();
+        for mode in ["require", "verify-ca", "prefer", "allow"] {
+            for url in [
+                format!("postgresql://db.example.com/app?sslmode={mode}"),
+                format!("postgresql://db.example.com/app?sslmode={mode}&sslrootcert={root}"),
+            ] {
+                for parse in [DatabaseUrl::parse, DatabaseUrl::parse_for_dev] {
+                    let error = parse(&url).err().unwrap();
+                    assert!(
+                        matches!(&error, GuardError::DatabaseSslModeUnchecked(found) if found == mode),
+                        "{url}: {error}"
+                    );
+                    let message = error.to_string();
+                    assert!(
+                        message
+                            .contains(&format!("sslmode={mode} does not check the server's name"))
+                            && message.contains("sslmode=verify-full")
+                            && message.contains("sslrootcert="),
+                        "{message}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `calque dev` reaches a database on the developer's machine from a
+    /// container, where `127.0.0.1` is the container itself. It takes an
+    /// explicit `sslmode=disable` for that, and no other command does.
+    #[test]
+    fn dev_takes_an_explicit_plaintext_host_that_no_other_command_does() {
+        for url in [
+            "postgresql://u:s3cr3t@host.docker.internal:5432/app?sslmode=disable",
+            "postgresql://u:s3cr3t@db.example.com/app?sslmode=disable",
+            "postgresql://u:s3cr3t@10.0.0.5:6543/app?sslmode=disable",
+            "postgresql://u:s3cr3t@localhost/app?sslmode=disable",
+            "postgresql://u:s3cr3t@[fd00::5]/app?sslmode=disable",
+        ] {
+            let database = DatabaseUrl::parse_for_dev(url).unwrap();
+            assert!(!database.uses_tls(), "{url}");
+            let canonical = Url::parse(database.expose()).unwrap();
+            let query = canonical
+                .query_pairs()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(
+                query.get("sslmode").map(|mode| mode.as_ref()),
+                Some("disable")
+            );
+            assert!(!query.contains_key("sslrootcert"), "{url}");
+            assert_eq!(
+                database.plaintext_remote_host(),
+                Url::parse(url).unwrap().host_str(),
+                "{url}"
+            );
+            assert_eq!(
+                format!("{database:?}"),
+                "DatabaseUrl { scheme: \"postgresql\", transport: \"plaintext\", redacted: true }"
+            );
+            let refusal = DatabaseUrl::parse(url).err().unwrap();
+            assert!(matches!(refusal, GuardError::DatabaseTlsRequired), "{url}");
+            assert!(
+                !refusal.to_string().contains("sslmode=disable"),
+                "serve must not be told plaintext is an option: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_without_an_explicit_sslmode_disable_still_needs_verified_tls() {
+        let (_directory, _path, root) = root_certificate();
+        for url in [
+            "postgresql://u@host.docker.internal/app".to_owned(),
+            "postgresql://u@localhost/app".to_owned(),
+            "postgresql://u@db.example.com/app?sslmode=verify-full".to_owned(),
+        ] {
+            let error = DatabaseUrl::parse_for_dev(&url).err().unwrap();
+            assert!(
+                matches!(error, GuardError::DatabaseTlsRequiredForDev),
+                "{url}: {error}"
+            );
+            assert!(error.to_string().contains("sslmode=disable"), "{error}");
+        }
+        // A plaintext request that also names a CA contradicts itself.
+        assert!(matches!(
+            DatabaseUrl::parse_for_dev(&format!(
+                "postgresql://u@db.example.com/app?sslmode=disable&sslrootcert={root}"
+            )),
+            Err(GuardError::DatabaseRoutingQuery)
+        ));
+        // Verified TLS and the local transports are unchanged.
+        assert!(DatabaseUrl::parse_for_dev(&format!(
+            "postgresql://u@db.example.com/app?sslrootcert={root}"
+        ))
+        .unwrap()
+        .uses_tls());
+        for local in [
+            "postgresql://u@127.0.0.1/app",
+            "postgresql://u@127.0.0.1/app?sslmode=disable",
+            "postgresql:///app?host=%2Ftmp",
+        ] {
+            let database = DatabaseUrl::parse_for_dev(local).unwrap();
+            assert_eq!(database.plaintext_remote_host(), None, "{local}");
+        }
+        assert!(
+            DatabaseUrl::parse_for_dev("postgresql://u@127.0.0.1/app?sslmode=require").is_err()
+        );
+    }
+
+    /// Each of these names the flag to change and, where it is safe to,
+    /// the value that was refused.
+    #[test]
+    fn a_refused_bind_or_origin_names_its_flag_and_value() {
+        let wildcard = HttpBinding::configured(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8787, None)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            wildcard.contains("--expected-host <host[:port]>"),
+            "{wildcard}"
+        );
+        assert!(wildcard.contains("--metrics-expected-host"), "{wildcard}");
+
+        let https = AllowedOrigin::parse_https_or_loopback("http://app.example.com:3000")
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            https,
+            "--allow-origin http://app.example.com:3000 must use HTTPS, or localhost or a loopback IP literal"
+        );
+        let loopback = AllowedOrigin::parse("https://app.example.com")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            loopback.starts_with("--allow-origin https://app.example.com is not loopback"),
+            "{loopback}"
+        );
+        // A malformed origin may carry a credential, so its value is not echoed.
+        let malformed = AllowedOrigin::parse("https://user:s3cr3t@app.example.com")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            malformed.starts_with("--allow-origin must be"),
+            "{malformed}"
+        );
+        assert!(!malformed.contains("s3cr3t"), "{malformed}");
     }
 
     /// A composition addresses a database container by service name, which
@@ -1191,7 +1401,7 @@ mod tests {
             assert!(
                 matches!(
                     AllowedOrigin::parse_https_or_loopback(refused),
-                    Err(GuardError::OriginNotHttpsOrLoopback)
+                    Err(GuardError::OriginNotHttpsOrLoopback(_))
                 ),
                 "{refused}"
             );

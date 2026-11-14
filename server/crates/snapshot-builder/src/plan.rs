@@ -236,11 +236,12 @@ fn compile_table(
         if !permitted.contains(column_id) {
             continue;
         }
-        let codec = PostgresTypeCodec::from_catalog(&inspected.type_schema, &inspected.type_name)
+        let codec = inspected
+            .codec()
             .ok_or_else(|| SnapshotPlanError::UnsupportedType {
-            schema: inspected.type_schema.clone(),
-            name: inspected.type_name.clone(),
-        })?;
+                schema: inspected.type_schema.clone(),
+                name: inspected.type_name.clone(),
+            })?;
         let (postgres_type, cast_to_text) = type_plan(codec);
         columns.push(SnapshotColumnPlan {
             column_id: *column_id,
@@ -512,6 +513,7 @@ mod tests {
             is_partition: false,
             has_publication_row_filter: false,
             has_publication_column_list: false,
+            unlisted_columns: Vec::new(),
             columns: vec![
                 column(1, "id", "uuid", false, Some(1)),
                 column(2, "body\"text", "text", true, None),
@@ -537,6 +539,7 @@ mod tests {
             primary_key_ordinal,
             generated: false,
             nondeterministic_collation: false,
+            carried_as: None,
         }
     }
 

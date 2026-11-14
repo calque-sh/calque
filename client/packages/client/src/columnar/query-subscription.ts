@@ -27,6 +27,16 @@ export const LOADING: LiveQuerySnapshot<never> = Object.freeze({
   status: "loading",
 });
 
+/**
+ * How long a resource no component listens to stays in the session after it
+ * settles or is last handed out. A suspended render that React discards never
+ * subscribes, and its resource would otherwise stay until the client closes.
+ * React retries a suspended render as soon as the promise settles, so a few
+ * seconds cover a retry; a component that commits later subscribes the
+ * released resource again and reads it only if its rows are stale.
+ */
+export const UNLISTENED_GRACE_MS = 5_000;
+
 export type SubscriptionResult = readonly QueryRow[] | QueryWindowRows;
 
 export class QuerySubscription<
@@ -50,6 +60,7 @@ export class QuerySubscription<
   #read: PromiseWithResolvers<void> | undefined;
   /** Set when a caller awaits `#read` through `promise`. */
   #awaited = false;
+  #idle: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     session: ColumnarSession,
@@ -69,6 +80,7 @@ export class QuerySubscription<
     this.options = options;
     this.window = window;
     this.readers = readers;
+    this.touch();
   }
 
   readonly getSnapshot = (): LiveQuerySnapshot<Result> => this.#snapshot;
@@ -80,6 +92,7 @@ export class QuerySubscription<
     if (this.#listeners.has(listener))
       throw new TypeError("listener is already subscribed to this resource");
     this.#listeners.set(listener, true);
+    this.stopIdle();
     // The first listener since the last one left: publications skipped this
     // resource meanwhile.
     if (
@@ -102,6 +115,20 @@ export class QuerySubscription<
 
   get listenerCount(): number {
     return this.#listeners.size;
+  }
+
+  /**
+   * Starts the grace period again for a resource nobody listens to; called
+   * when it is created, handed out or settles.
+   */
+  touch(): void {
+    this.stopIdle();
+    if (this.#listeners.size > 0) return;
+    this.#idle = setTimeout(() => {
+      this.#idle = undefined;
+      if (this.#listeners.size === 0 && !this.#read)
+        this.#session.release(this);
+    }, UNLISTENED_GRACE_MS);
   }
 
   /** Somebody paints these rows or awaits them, so a frame reads them. */
@@ -234,5 +261,12 @@ export class QuerySubscription<
     this.#read = undefined;
     this.#awaited = false;
     if (read) settle(read);
+    this.touch();
+  }
+
+  /** Cancels the grace period; the session does when it closes. */
+  stopIdle(): void {
+    clearTimeout(this.#idle);
+    this.#idle = undefined;
   }
 }

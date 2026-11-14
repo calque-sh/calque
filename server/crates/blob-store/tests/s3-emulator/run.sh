@@ -92,7 +92,7 @@ if ! cargo test -p blob-store >"$evidence_dir/local-tests.log" 2>&1; then
   sed -n '1,240p' "$evidence_dir/local-tests.log"
   exit 1
 fi
-grep -q 'test result: ok. 17 passed; 0 failed; 0 ignored;' "$evidence_dir/local-tests.log"
+grep -q 'test result: ok. 19 passed; 0 failed; 0 ignored;' "$evidence_dir/local-tests.log"
 grep -q 'test result: ok. 3 passed; 0 failed; 2 ignored;' "$evidence_dir/local-tests.log"
 if ! cargo test -p artifact-catalog one_hundred_deterministic_provider_faults_never_publish \
   >"$evidence_dir/catalog-fault-matrix.log" 2>&1; then

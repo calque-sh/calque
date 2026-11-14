@@ -14,6 +14,7 @@ import {
   until,
   type WorkerRequest,
 } from "./session.fixture.js";
+import { stubBrowserFeatures } from "../browser.fixture.js";
 
 interface TaskRow {
   readonly id: string;
@@ -130,9 +131,7 @@ function uuidClient() {
 
 describe("uuid columns through a session", () => {
   beforeEach(() => {
-    vi.stubGlobal("navigator", {
-      userAgentData: { brands: [{ brand: "Chromium" }] },
-    });
+    stubBrowserFeatures();
   });
 
   afterEach(() => {

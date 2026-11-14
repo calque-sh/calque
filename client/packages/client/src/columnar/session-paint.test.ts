@@ -8,6 +8,7 @@ import {
   settled,
   until,
 } from "./session.fixture.js";
+import { stubBrowserFeatures } from "../browser.fixture.js";
 
 /** A visible page whose animation frames run only when the test paints. */
 function stubPage() {
@@ -84,9 +85,7 @@ async function shownWrite() {
 
 describe("a write's confirmation and the paint that shows it", () => {
   beforeEach(() => {
-    vi.stubGlobal("navigator", {
-      userAgentData: { brands: [{ brand: "Chromium" }] },
-    });
+    stubBrowserFeatures();
   });
 
   afterEach(() => {

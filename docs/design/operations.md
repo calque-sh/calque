@@ -82,9 +82,9 @@ decision the `CALQUE_S3_ENDPOINT` variable already allows.
 
 ### Configuration
 
-Every value is an environment variable. Nothing is a command-line argument:
-a secret in argv appears in `ps` and in shell history, which is the same reason
-the PostgreSQL connection string has never been one. That is the whole of what
+Every secret and credential is an environment variable. None is a
+command-line argument: a secret in argv appears in `ps` and in shell history,
+which is the same reason the PostgreSQL connection string has never been one. That is the whole of what
 the environment buys — `docker inspect` prints a container's environment
 verbatim, and so does `/proc/<pid>/environ`, so these values are readable by
 anyone who can reach the Docker socket or the host. Keep them run-scoped. The
@@ -127,7 +127,7 @@ auth_method = 'trust'` returning no rows is the check.
 | `CALQUE_SELFHOST_METRICS_PORT` | `8788` | The metrics listener, the only one that serves `/metrics`, published on `127.0.0.1` for the operator's scraper. It answers `Host: 127.0.0.1:<this port>`, which is what a scraper connecting to that address sends. |
 | `CALQUE_SELFHOST_S3_PORT` | `59001` | The object store, published on `127.0.0.1` for the operator and the conformance run below. |
 | `CALQUE_SELFHOST_S3_HOST` | `objectstore` | The host the server reaches the object store at: `CALQUE_S3_ENDPOINT` is `http://<it>:9000`. |
-| `CALQUE_SELFHOST_CONFIG` | *required* | Absolute path to the `calque.config.json` that `calque init` produced. Its `sources[].connectionEnv` must be `CALQUE_DATABASE_URL`, which is `init`'s default. |
+| `CALQUE_SELFHOST_CONFIG` | *required* | Absolute path to the `calque.config.json` that `calque init` produced. Its `sources[].databaseUrlEnv` must be `CALQUE_DATABASE_URL`, which is `init`'s default. |
 | `CALQUE_SELFHOST_GRANT_AUDIENCE` | *required* | The audience every dataset grant must carry. |
 | `CALQUE_SELFHOST_GRANT_VERIFICATION_KEY` | *required* | The JSON verification-key object. `calque serve` verifies grants and mints none; the application backend that issues them owns the private half. |
 | `CALQUE_SELFHOST_ALLOWED_ORIGIN` | `http://127.0.0.1:5173` | The one browser origin allowed to call the server: an HTTPS origin, or a loopback one over HTTP. `calque serve` refuses to start on a plaintext origin elsewhere. |
@@ -154,8 +154,11 @@ restarted with new credentials before the old ones expire.
 `calque serve --config` reads it once at startup, so a change takes effect at
 the next start. `serve` checks the manifest's shape before it creates any state
 or connects to PostgreSQL, then checks it against the live catalog, and refuses
-to start if either check fails. A field that admits one value is fixed in the
-pre-alpha; `calque init` writes it.
+to start if either check fails. `compileConfig`, which the Vite plugin and
+`calque-bindings` run, refuses the same manifests as the shape check, and
+`tests/fixtures/config/refusals.json` holds the cases both are tested on. A
+field that admits one value is fixed in the pre-alpha; `calque init` writes
+it.
 
 | Field | What it does |
 | --- | --- |
@@ -164,20 +167,20 @@ pre-alpha; `calque init` writes it.
 | `protocol.manifest`, `protocol.artifact`, `protocol.changeStream`, `protocol.mutation` | Fixed in the pre-alpha at `1`; `calque init` writes them. |
 | `sources` | Exactly one. |
 | `sources[].id` | Names the source in the state directory and in its rows under PostgreSQL's `calque_control` schema, the authorization fence among them. It, the publication, the slot and the set of tables are fixed for the life of a state directory: `serve` refuses a state directory recorded with different ones. |
-| `sources[].connectionEnv` | The environment variable `serve` reads the database URL from; `serve` refuses to start when it is unset. With an existing state directory, `serve` refuses a database other than the one the directory was enrolled on before it writes anything there. The composition requires `CALQUE_DATABASE_URL`, `init`'s default. |
-| `sources[].publication` | Created `FOR TABLE` the collections' tables if it does not exist. An existing one must cover exactly those tables, publish insert, update, delete and truncate, be neither `FOR ALL TABLES` nor `publish_via_partition_root`, and carry no row filter or column list on any table. |
+| `sources[].databaseUrlEnv` | The environment variable `serve` reads the database URL from; `serve` refuses to start when it is unset. With an existing state directory, `serve` refuses a database other than the one the directory was enrolled on before it writes anything there. The composition requires `CALQUE_DATABASE_URL`, `init`'s default. |
+| `sources[].publication` | Created `FOR TABLE` the collections' tables if it does not exist and Calque's role owns every one of them; otherwise the start refuses with the `CREATE PUBLICATION` statement for the tables' owner to run. Either way each table carries a column list naming its collection's `columns` in table order, except a table whose replica identity is `FULL`, which is published whole because PostgreSQL refuses its updates and deletes under any column list, so its collection must name every column. An existing one must cover exactly those tables, publish exactly each collection's columns, listed or as the whole table, publish insert, update, delete and truncate, be neither `FOR ALL TABLES` nor `publish_via_partition_root`, and carry no row filter on any table. `serve` refuses one that publishes other columns, with the statement that publishes the right ones; `calque destroy` drops a publication Calque's role owns, so the next start creates it. |
 | `sources[].slot` | The logical replication slot, created if it does not exist. An existing one must use `pgoutput` on the same database. |
 | `scopes` | Exactly one. |
 | `scopes[].id` | Printed at startup as `dataset=`. `calque init` writes `--scope-id`, default `all`. |
 | `scopes[].source` | The source's `id`. |
 | `scopes[].kind` | `source-wide`: every grant sees every row. Or `partitioned`: each grant sees one tenant's rows; see "Tenants". `calque init` writes `source-wide`, or `partitioned` given `--tenant-column`. |
 | `scopes[].attribute` | A partitioned scope's grant attribute, which names the grant's tenant. |
-| `scopes[].dataVersion` | The authorization generation, an integer from `1`. At startup the generation in force becomes the larger of this value and the source's durable fence, printed as `authorization_generation=`. A grant verifies only if it carries that generation (`calque-dev-grant --generation`); any other gets `401`. Raising the value and restarting refuses every grant minted for an older generation and publishes a new artifact, because the artifact's cache key includes the generation. Lowering it changes nothing, because the fence only moves up. |
+| `scopes[].dataVersion` | The authorization generation, an integer from `1`. At startup the generation in force becomes the larger of this value and the source's durable fence, printed as `authorization_generation=`. A grant verifies only if it carries that generation (`calque-grant mint --generation`); any other gets `401`. Raising the value and restarting refuses every grant minted for an older generation and publishes a new artifact, because the artifact's cache key includes the generation. Lowering it changes nothing, because the fence only moves up. |
 | `collections[].id` | The collection's name: its key under `client.db` in the generated bindings, and the key a grant's command capability names (`--command <id>=update`). Unique, and equal to the relation's table name, because the client binds a collection only to the served table of that name: `serve` and `compileConfig` refuse any other id. |
 | `collections[].source`, `collections[].scope` | The source's and the scope's `id`. |
 | `collections[].kind` | Fixed in the pre-alpha at `table`; `calque init` writes it. |
 | `collections[].relation` | The table, as `schema` and `table`. Two collections cannot name one table, nor two tables that share a name in different schemas, because a served collection is named by its table alone. |
-| `collections[].columns[]` | Each column's `name`, `postgresType`, the type's `pg_catalog` name such as `int4` or `timestamptz`, and `nullable`, which must match the live table. The list names every column of the table, because the table's `crud` command must write every non-key column and may name only listed ones. |
+| `collections[].columns[]` | Each column's `name`, `postgresType`, the `pg_catalog` name of the type it travels as such as `int4` or `timestamptz` (`text` for an enum, the base type for a domain), and `nullable`, which must match the live table. The list includes the primary key. A column it leaves out is left out of the publication, so PostgreSQL never sends it: it reaches neither the artifact nor the canonical log, may have any type or be generated, and a migration may add, change or drop it while `serve` runs. PostgreSQL refuses to drop a column the publication lists: remove it from `columns` and `writableColumns`, run `calque destroy`, restart `serve`, then drop it. When the list leaves out a `NOT NULL` column with no default, PostgreSQL would refuse every insert, so the table admits none and `calque init` leaves `insert` out of its command. |
 | `collections[].primaryKey` | The table's primary-key columns, in key order, which must match the live table's. No command can write them. |
 | `collections[].partitionColumn` | Under a partitioned scope, the column that holds the tenant. It must be the first column of `primaryKey`, of type `int2`, `int4`, `int8` or `uuid`, the same type in every partitioned collection. |
 | `collections[].shared` | Under a partitioned scope, `true` for a table no tenant owns: every tenant receives it whole. A collection under a partitioned scope sets exactly one of `partitionColumn` and `shared`. |
@@ -187,7 +190,7 @@ pre-alpha; `calque init` writes it.
 | `commands[].kind` | `crud`, the kind `calque init` writes and `serve` runs. Backend commands are not supported: `serve` refuses a `backend` command (`E_SERVE_COMMAND_INVALID`), and so does `compileConfig`. |
 | `commands[].collection` | The collection's `id`. |
 | `commands[].operations` | A set drawn from `insert`, `update` and `delete`, without repeats: the most any grant can do on this collection, because a grant's command capability is intersected with it. `calque init` writes every operation the catalog admits for the table. |
-| `commands[].writableColumns` | Exactly the table's columns less its primary key; `serve` refuses any other set. It must not be empty when `operations` includes `update`. |
+| `commands[].writableColumns` | Exactly the collection's columns less its primary key; `serve` refuses any other set. It must not be empty when `operations` includes `update`. |
 
 ### TLS at the edge
 
@@ -301,12 +304,14 @@ was refused for good, when a renewed grant is all it needs.
 
 Grants are minted by the application backend, never by Calque.
 `spec/dataset-grant-v1.md` specifies the token for an issuer in any language,
-and `client/examples/grant-issuer/` is a Node issuer with no dependency beyond
-`node:crypto`. On a development machine `calque-dev-grant` stands in for one:
+and `@calque/grant` is a Node issuer with no dependency beyond `node:crypto`:
+`npm install @calque/grant`, then `mintGrant` in the backend. On a development
+machine its `calque-grant` command stands in for one, creating the key and
+printing the verification-key value `--grant-verification-key-env` reads:
 
 ```sh
-cargo run -q -p dataset-grant-issuer --bin calque-dev-grant -- \
-  --key-file dev/grant-key.pk8 --key-id dev-key \
+npx calque-grant keygen --key-file dev/grant-key.pem --key-id dev-key
+npx calque-grant mint --key-file dev/grant-key.pem --key-id dev-key \
   --audience incident.test --generation 1 --subject alice \
   --lifetime-seconds 900 --command tasks=update
 ```
@@ -381,7 +386,7 @@ barriers never come, their plans expire.
 A client created with `grantVerificationKey` verifies each barrier itself, so
 the backend must sign barriers with the key that option names. The option is
 the `{ keyId, publicKey }` object `--grant-verification-key-env` reads and
-`calque-dev-grant` prints as `verificationKeyEnvironment`: `publicKey` is the
+`calque-grant keygen` prints: `publicKey` is the
 32-byte Ed25519 public key in unpadded base64url, 43 characters, and
 `createSyncClient` throws on a malformed one. On the barrier the session empties
 every subscription, ends each pending mutation ambiguous with a message that it
@@ -419,12 +424,14 @@ export CALQUE_SELFHOST_POSTGRES_SUPERUSER_PASSWORD=… \
 docker compose -f docker-compose.selfhost.yml up -d --wait postgres
 docker compose -f docker-compose.selfhost.yml up -d objectstore objectstore-init
 
-# The application's tables and its publication, as the least-privilege role.
-# CREATE PUBLICATION ... FOR TABLE requires ownership of every table named.
-PGPASSWORD="$CALQUE_SELFHOST_DB_PASSWORD" \
+# The application's tables and its publication, as the role that owns them;
+# the superuser stands in for it here. Calque's role owns nothing and gets
+# the rows by grant.
+PGPASSWORD="$CALQUE_SELFHOST_POSTGRES_SUPERUSER_PASSWORD" \
 docker compose -f docker-compose.selfhost.yml exec -T -e PGPASSWORD postgres \
-  psql -h 127.0.0.1 -U calque_sync -d calque -f - <<'SQL'
+  psql -h 127.0.0.1 -U calque_admin -d calque -f - <<'SQL'
 …your schema, then CREATE PUBLICATION calque_app FOR TABLE …;
+GRANT SELECT, INSERT, UPDATE, DELETE ON … TO calque_sync;
 SQL
 
 # On the host, through the published port: loopback, so the guard's other
@@ -518,10 +525,10 @@ land where the other store looks for them. And the object half of the oracle is
 one definition rather than one per store: the SHA-256 of the objects the unit's
 own catalog publishes, in that order, read off the tree or out of the bucket.
 
-A unit's manifest records `formatVersion` 2, and `restore` and
+A unit's manifest records `formatVersion` 3, and `restore` and
 `verify-restore` read only that version. A unit of any other version is refused
 before anything is read, uploaded or committed, with a message that says to
-take a fresh one with `backup`.
+restore it with the release that took it or take a fresh one with `backup`.
 
 What that definition deliberately does not cover is anything a deployment's
 object namespace holds *besides* the published set — a retired artifact's
@@ -712,10 +719,10 @@ A refusal no retry can get past stops the runtime too: PostgreSQL rejecting the
 role's login (SQLSTATE class 28, such as a rotated password), a missing
 privilege (`42501`), a database that no longer exists (`3D000`), or a role that
 lost `REPLICATION`. The runtime logs `CDC runtime stopped without reconnecting`
-with a `failure` field that names the refusal by class, such as
-`cdc-refused: authentication failed` or
-`cdc-refused: replication privilege missing`, and never PostgreSQL's message
-text. A connection that fails with no SQLSTATE is still retried, as is one
+with a `failure` field that names the role, the database and the variable the
+URL came from, and says what to change, such as
+`cdc-refused: role "calque_sync" cannot start replication, which needs the REPLICATION attribute. Run ALTER ROLE "calque_sync" REPLICATION as a superuser; on RDS, run GRANT rds_replication TO "calque_sync" instead`.
+It never carries PostgreSQL's message text, the password or the URL. A connection that fails with no SQLSTATE is still retried, as is one
 refused by a server that is shutting down, crashing, starting up or out of
 connection slots. Alert on `/readyz`, as above.
 `scripts/demo-cdc-restart-e2e.ts` restarts PostgreSQL under an open tab,
@@ -726,17 +733,27 @@ without restarting Calque.
 `CDC runtime stopped without reconnecting`, and
 `the fenced generation's artifact was not published` from a fence order's
 background publication, also carry `state_must_be_destroyed`. When it is `true`
-the state directory holds state this build does not migrate, and a restart
-meets the same refusal: run
+the state directory holds state this build does not migrate, or the source's
+replication slot was dropped or invalidated so its changes cannot be replayed,
+and a restart meets the same refusal: run
 `calque destroy --state-dir <dir> --database-url-env <NAME> --yes`, then
 restart (see "Upgrades").
 
-A reconnect that finds the publication no longer defined as
-`sources[].publication` requires stops the runtime too, and its `failure` field
-names the publication. When the process is then stopped, it prints the refusal
-a start that meets the same publication prints, then `Restore that definition,
-then rerun serve.` (`dev` under `calque dev`). `calque destroy` does not get
-past it: destroy will not drop a publication it cannot verify.
+A running session reads the publication's catalog rows every second, and a
+start or reconnect reads them too. Any `ALTER PUBLICATION`, or dropping and
+creating the publication again, stops the runtime, even when the definition
+`sources[].publication` requires is put back: pgoutput leaves out what an
+altered definition does not publish, from the alteration's commit on, so the
+working set may miss those changes. Adding or renaming a value of an enum an
+enrolled column uses stops it the same way, because the rows holding a renamed
+label change with no row change in the WAL. The `failure` field names the
+publication. When the process is then stopped, it prints the refusal a start
+that meets the same publication prints, then `Restore the publication's
+definition if it was altered, then run calque destroy ... and rerun serve to
+prepare the working set anew` (`dev` under `calque dev`). Destroy drops only a
+publication Calque's role owns and that it can verify, which is why the
+definition is restored first. Changing the publication's owner counts as an
+alteration too.
 
 #### When the server is stopped or killed
 
@@ -927,13 +944,15 @@ The last two end with the same remedy (`pnpm incidents --fresh` does both steps
 for the incidents demo). `<command>` is `dev` or `serve`, whichever refused, and
 `<NAME>` is the variable it read the database URL from: `calque dev`'s
 `--database-url-env`, `CALQUE_DATABASE_URL` by default, or the
-`sources[].connectionEnv` of `calque serve`'s manifest. `destroy` reads the
+`sources[].databaseUrlEnv` of `calque serve`'s manifest. `destroy` reads the
 database URL from the variable its own `--database-url-env` names, so the
 printed line connects to the source the refusing command read.
 
-Recovery units follow the same rule: `restore` and `verify-restore` read only
-the unit format this build writes (see "Backup and restore against the
-composition").
+Recovery units follow the same rule, with one exception: `restore` and
+`verify-restore` read the unit format this build writes, version 3, and
+version 2, which lacks only the log's compaction watermark and restores with
+none recorded. An older unit is refused with the remedy named (see
+"Backup and restore against the composition").
 
 ## Tenants
 
@@ -971,15 +990,41 @@ application, then a refresh. While requests wait, a warm order or a refresh
 queued for `--recut-min-interval` or longer takes every other start, so a
 full queue of requests delays it but cannot hold it back for good, and a
 warm order for every tenant holds back a request by one start at most.
-Compressing an artifact of `--tenant-compress-above-bytes` or more, 16 MiB
-by default (`off` for none), runs in the background only when no preparation
-is queued.
+A preparation writes its first object at zstd level 6. Compressing an
+artifact of `--tenant-compress-above-bytes` or more, 16 MiB by default
+(`off` for none), into the packed object pages download once it is
+published, runs in the background only when no preparation is queued, one
+tenant at a time: the tenant opened last first, then tenants never opened in
+the order they were prepared. Until it runs, a page downloads the first
+object, which is larger.
 
-Preparations run at the priority live delivery runs at, so while they run,
-the tenants already loaded get their changes later. In one directional run
-with four preparing at once and a warm order for every tenant, a loaded
-tenant's commit to paint had a p95 of 157 ms, against 46 ms with nothing
-preparing.
+A preparation a request waits on runs at the priority live delivery runs at
+while it is the only one. Beside another, each runs in a class below live
+delivery: the default QoS class at its lowest relative priority on macOS,
+nice 10 on Linux. It keeps the cores and disk priority of normal work and
+gives way when live delivery wants a core. The 12 compression threads are
+split among the builds the cap allows, 3 each at the default of 4. On macOS
+libzstd starts those threads at normal priority, whatever the preparation's
+class. A warm order's or a refresh's preparation, and the re-encodes that
+follow any tenant's, run in the background class. A preparation moves when
+one starts or ends beside it, or when a request starts waiting on it, at its
+next stage, where the host lets a lowered thread rise: macOS does, and Linux
+does only when `RLIMIT_NICE` is 20 or more. The
+selfhost composition sets it (`ulimits: nice: 20`), and `docker run
+--ulimit nice=20` does the same; adding `SYS_NICE` to a container does not,
+because the image runs as a user other than root. Where it is lower,
+`calque` says so once at startup. In one
+directional run with every preparation at normal priority, four preparing
+at once and a warm order for every tenant, a loaded tenant's commit to paint
+had a p95 of 157 ms, against 46 ms with nothing preparing. In another, with
+the preparations a request waits on in a class below live delivery, their
+answers came four to six times later, and the loaded tenant's p95 rose to
+632 ms in stalls where PostgreSQL stopped committing while preparations
+wrote to the disk it shares with them. In a probe, heavy host writes in the
+background class kept its commits under 220 ms. Keep PostgreSQL's data on a
+disk the state directory does not write to: a preparation a request waits on
+writes at normal priority, and on a shared disk those writes stall the
+commits every loaded tenant waits on.
 
 A tenant opened within `--tenant-warm-days`, 7 by default, or pinned, stays
 warm: its artifact is kept, and it is cut again by the re-cut's rule. A
@@ -1051,10 +1096,25 @@ device. No process holds a
 plan, so a restart on the same state directory keeps every one: an open page
 keeps its artifact and receives what was committed while the process was
 down. A plan expires an hour after the bootstrap, or one second before the
-grant that admitted it expires if that is sooner. Until then its retention
+grant that admitted it expires if that is sooner. A grant lasts at most 15
+minutes, so a plan a grant admitted lasts at most 15 minutes less a second;
+only the development shared bearer, which carries no expiry, gets the hour.
+Until then its retention
 lease keeps the change log from its catch-up's start and its pin keeps its
 artifact, so a closed tab or a reloaded page holds both until its plan
 expires.
+
+An open page renews its plan two thirds into its life. It sends a
+bootstrap with a fresh grant, the plan's resident-state proof, its tables and
+the cursor its rows stand at, and the answer is a plan that installs no
+artifact and continues from that cursor. Its lease holds the log from just
+after that cursor. On a partitioned deployment a renewal records that the
+tenant was used, which keeps it warm, and waits on no build. A renewal
+answered `409` `RESNAPSHOT_REQUIRED` means the scope, the schema or the
+authorization generation changed since the page loaded: the page keeps its
+plan until it expires and then rebuilds. An application whose `auth()` hands
+back a cached grant renews nothing, and its pages download their working set
+again at each expiry.
 
 Each process keeps the scope it rebuilt for each plan it verified lately, at
 most `--max-active-plans`, 4,096 by default, on `calque dev` and
@@ -1155,7 +1215,8 @@ other work leaves idle, and on Linux nice 19. Such a build encodes its zstd
 object on its own thread rather than on libzstd's twelve workers, which macOS
 would start at normal priority. A preparation and a fenced generation's
 publication build and encode at normal priority, and a fenced publication
-cancels a re-cut in its way.
+cancels a re-cut in its way. A tenant's preparation runs at normal priority
+only while a request waits on it, as described above.
 
 `--recut-tail-ratio` defaults to 1/32, the ratio both directional benchmark
 runs used, and 0 turns re-cutting off. Without re-cuts a cold load replays
@@ -1201,7 +1262,11 @@ each one the change tail drops the trimmed entries and their encodings. A
 trimmed entry leaves one row in
 `calque_control.canonical_log_retired_record`, its sequence, transaction
 identity and digest, so that CDC still recognizes a transaction it replays
-after a reconnect. Nothing removes those rows before `calque destroy`.
+after a reconnect. It leaves none once PostgreSQL can no longer send it again:
+each trim reads the lower of the log's durable checkpoint and the replication
+slot's confirmed flush, deletes up to 2,048 of the oldest retired rows that
+end at or before it, and records it. An append of an entry the log forgot that
+way is refused rather than logged twice.
 
 A change request whose cursor is behind the trimmed range is answered `410`
 with a `CURSOR_BEFORE_RETENTION` stream error and `resnapshot_required` set,

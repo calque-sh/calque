@@ -4,7 +4,7 @@ import { defineConfig, type Plugin, type UserConfig } from "vite";
 
 /**
  * Quickstart only. Serves the `grant.json` that the README's
- * `calque-dev-grant` step wrote at `/grant.json`, read again on every request
+ * `calque-grant mint` step wrote at `/grant.json`, read again on every request
  * so a grant minted after the old one expired is picked up without a restart.
  * In production the application's backend issues the grant.
  */
@@ -23,7 +23,7 @@ function quickstartGrant(grantFile: string): Plugin {
             response.statusCode = 404;
             response.setHeader("content-type", "text/plain; charset=utf-8");
             response.end(
-              `${grantFile} is missing; mint a grant with the README's calque-dev-grant step`,
+              `${grantFile} is missing; mint a grant with the README's calque-grant mint step`,
             );
           },
         );

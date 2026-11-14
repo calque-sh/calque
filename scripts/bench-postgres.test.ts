@@ -39,6 +39,7 @@ test("the native cluster's settings are the container's flags, in UTC, on 127.0.
     wal_level: "'logical'",
     max_replication_slots: "'10'",
     max_wal_senders: "'10'",
+    max_slot_wal_keep_size: "'10GB'",
     timezone: "'UTC'",
     log_timezone: "'UTC'",
     listen_addresses: "'127.0.0.1'",

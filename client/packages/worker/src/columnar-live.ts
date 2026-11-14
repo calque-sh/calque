@@ -14,6 +14,10 @@
  * cursor, and the endpoint serves that stretch only to a fenced request. Given
  * an `activationFence`, the session catches up to the fence first and polls
  * live once the mount stands on it.
+ *
+ * A renewed plan replaces the plan id and scope token from the next request
+ * on. The request in flight keeps the terms it was sent with, which the server
+ * honours until they expire, and its batches are checked against them.
  */
 import { create, toBinary } from "@bufbuild/protobuf";
 import { equalBytes } from "@calque/core";
@@ -71,10 +75,14 @@ export interface ColumnarLiveMount {
   ): Promise<ColumnarLivePublication>;
 }
 
-export interface ColumnarLiveSessionOptions {
-  readonly endpoint: string;
+/** The plan a request names, and the token that authorizes it. */
+export interface ColumnarLiveTerms {
   readonly planId: string;
   readonly authorizationScopeToken: string;
+}
+
+export interface ColumnarLiveSessionOptions extends ColumnarLiveTerms {
+  readonly endpoint: string;
   readonly tableIds: readonly string[];
   readonly clientInstanceId: string;
   readonly deviceId: string;
@@ -141,6 +149,8 @@ export class ColumnarLiveSession {
    * live and moved past the fence is not behind it again.
    */
   #fence: ColumnarChangeFence | undefined;
+  /** The terms the next request is sent with. */
+  #terms: ColumnarLiveTerms;
   /** Aborts only the request in flight; the loop's own controller stays. */
   #poll: AbortController | undefined;
   /**
@@ -159,6 +169,10 @@ export class ColumnarLiveSession {
     this.#options = options;
     this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.#cursor = options.cursor.slice();
+    this.#terms = {
+      planId: options.planId,
+      authorizationScopeToken: options.authorizationScopeToken,
+    };
     const fence = options.activationFence;
     if (fence) {
       if (fence.cursor.byteLength === 0)
@@ -224,6 +238,11 @@ export class ColumnarLiveSession {
     await this.#completion;
   }
 
+  /** Sends every request from the next one on under a renewed plan. */
+  renew(terms: ColumnarLiveTerms): void {
+    this.#terms = terms;
+  }
+
   /**
    * Restarts the request in flight so the next one carries the current
    * pending mutation ids. The batches that had arrived whole are applied
@@ -280,8 +299,9 @@ export class ColumnarLiveSession {
     loop.signal.addEventListener("abort", forward, { once: true });
     this.#poll = poll;
     this.#nudged = false;
+    const terms = this.#terms;
     try {
-      const response = await this.#request(poll.signal, fence);
+      const response = await this.#request(poll.signal, fence, terms);
       const reader = response.body?.getReader();
       const splitter = new ChangeBatchSplitter(this.#options.maxBatchBytes);
       // The reader stops while it holds more than one batch's bound, so a
@@ -324,7 +344,7 @@ export class ColumnarLiveSession {
           const batches = await arrived.take();
           // A stopped session applies nothing more.
           if (this.#controller !== loop || batches === undefined) break;
-          await this.#publish(batches, fence);
+          await this.#publish(batches, fence, terms.planId);
         }
       } finally {
         // Whatever ended the loop, the read ends with it: a mount that
@@ -356,11 +376,12 @@ export class ColumnarLiveSession {
   async #publish(
     batches: readonly Uint8Array[],
     fence: ColumnarChangeFence | undefined,
+    planId: string,
   ): Promise<void> {
-    const applied = await this.#mount.applyChangeBatches(
-      batches,
-      fence ? { fence } : {},
-    );
+    const applied = await this.#mount.applyChangeBatches(batches, {
+      ...(fence ? { fence } : {}),
+      ...(planId === this.#options.planId ? {} : { planId }),
+    });
     // The mount is the authority on where it now is. Trusting the response
     // instead would let a rejected batch and an accepted one look alike.
     const cursor = applied.state.cursor;
@@ -400,6 +421,7 @@ export class ColumnarLiveSession {
   async #request(
     signal: AbortSignal,
     fence: ColumnarChangeFence | undefined,
+    terms: ColumnarLiveTerms,
   ): Promise<Response> {
     const startsByTable = new Map(
       fence?.tableStarts.map((start) => [start.tableId, start] as const),
@@ -416,7 +438,7 @@ export class ColumnarLiveSession {
         : this.#options.longPollTimeoutMs;
     const request = create(change.ChangeRequestSchema, {
       protocolVersion: 1,
-      planId: this.#options.planId,
+      planId: terms.planId,
       fromCursorExclusive: create(change.CursorSchema, {
         token: this.#cursor,
       }),
@@ -440,9 +462,7 @@ export class ColumnarLiveSession {
             : {}),
         });
       }),
-      authorizationScopeToken: encoder.encode(
-        this.#options.authorizationScopeToken,
-      ),
+      authorizationScopeToken: encoder.encode(terms.authorizationScopeToken),
       maxBatchBytes: BigInt(this.#options.maxBatchBytes),
       maxTransactions: MAX_BATCH_TRANSACTIONS,
       longPollTimeoutMs: wait,

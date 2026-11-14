@@ -30,6 +30,10 @@ import {
   makeRebuildableClient,
   settled,
 } from "./session.fixture.js";
+import {
+  stubBrowserFeatures,
+  stubWebAssemblyPolicy,
+} from "../browser.fixture.js";
 
 describe("a bootstrap request the page started", () => {
   /** What `makeClient` would send itself, but for the device. */
@@ -119,9 +123,7 @@ describe("a bootstrap request the page started", () => {
   let warn: MockInstance<typeof console.warn>;
 
   beforeEach(() => {
-    vi.stubGlobal("navigator", {
-      userAgentData: { brands: [{ brand: "Chromium" }] },
-    });
+    stubBrowserFeatures();
     performance.clearMarks();
     warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
   });
@@ -207,8 +209,8 @@ describe("a bootstrap request the page started", () => {
   }
 
   it("adopts a plan the backend rendered, posts nothing, and carries the backend's clientInstanceId on change requests and mutations", async () => {
-    // The backend names the decoding list, which a page with workers names.
-    vi.stubGlobal("Worker", vi.fn());
+    // The backend names the decoding list, which a page where WebAssembly
+    // compiles names.
     const backend = vi.fn<typeof fetch>(async () =>
       jsonResponse(renderablePlan()),
     );
@@ -254,7 +256,6 @@ describe("a bootstrap request the page started", () => {
   });
 
   it("binds a client created without a deviceId to the device of the plan the backend rendered", async () => {
-    vi.stubGlobal("Worker", vi.fn());
     const backend = vi.fn<typeof fetch>(async () =>
       jsonResponse(renderablePlan()),
     );
@@ -299,8 +300,9 @@ describe("a bootstrap request the page started", () => {
     await client.close();
   });
 
-  it("does not adopt a plan the backend rendered where the page cannot run the decoder worker, and sends its own", async () => {
-    // This runtime has no workers, so the session names the shorter list.
+  it("does not adopt a plan the backend rendered where the page cannot compile WebAssembly, and sends its own", async () => {
+    // The session names the shorter list.
+    stubWebAssemblyPolicy();
     const backend = vi.fn<typeof fetch>(async () =>
       jsonResponse(renderablePlan()),
     );
@@ -329,7 +331,6 @@ describe("a bootstrap request the page started", () => {
 
   it("does not adopt a plan the backend rendered for another budget, and sends its own", async () => {
     // The lists agree, so the budget is what differs.
-    vi.stubGlobal("Worker", vi.fn());
     const backend = vi.fn<typeof fetch>(async () =>
       jsonResponse(renderablePlan()),
     );
@@ -424,7 +425,6 @@ describe("a bootstrap request the page started", () => {
   it.each(renderedDiffering)(
     "does not adopt a rendered plan whose %s differs: it warns and sends its own",
     async (parameter, change) => {
-      vi.stubGlobal("Worker", vi.fn());
       const head = await renderBootstrap(MATCHING, {
         acceptEncoding: "gzip, deflate, br, zstd",
         fetch: async () => jsonResponse(renderablePlan()),

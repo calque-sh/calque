@@ -35,6 +35,7 @@ import {
   fencedPlan,
   outcomeResponder,
   acceptedResponder,
+  NO_AUTOMATIC_RESENDS,
   until,
   fakeFetch,
   CHUNK_BYTES,
@@ -55,12 +56,11 @@ import {
   type PaintedFrame,
   renderTwoCollections,
 } from "./session.fixture.js";
+import { stubBrowserFeatures } from "../browser.fixture.js";
 
 describe("direct-columnar session", () => {
   beforeEach(() => {
-    vi.stubGlobal("navigator", {
-      userAgentData: { brands: [{ brand: "Chromium" }] },
-    });
+    stubBrowserFeatures();
   });
 
   afterEach(() => {
@@ -278,6 +278,31 @@ describe("direct-columnar session", () => {
     },
   );
 
+  it("refuses a browser without an API it calls before calling auth()", async () => {
+    vi.stubGlobal("Worker", undefined);
+    const auth = vi.fn(() => ({ bearerToken: "token" }));
+    const { client, fetcher, workerFactory } = makeClient(
+      plan(),
+      undefined,
+      undefined,
+      undefined,
+      { auth },
+    );
+    expect(await settled(client)).toMatchObject({
+      state: "error",
+      error: {
+        code: "UNSUPPORTED_BROWSER",
+        recovery: "none",
+        message:
+          'this browser lacks module workers (new Worker(url, { type: "module" })), which Calque needs',
+      },
+    });
+    expect(auth).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(workerFactory).not.toHaveBeenCalled();
+    await client.close();
+  });
+
   it("sends a bearerToken of exactly 16384 code units", async () => {
     const bearerToken = "t".repeat(16_384);
     const { client, fetcher } = makeClient(
@@ -462,25 +487,32 @@ describe("direct-columnar session", () => {
       outcomeResponder(mutation.MutationOutcomeCode.REJECTED_VALIDATION),
     );
     expect(await settled(client)).toEqual({ state: "ready" });
-    const result = await client.db.events.delete({ id: 2n });
-    expect(result).toMatchObject({ state: "rejected" });
+    await expect(client.db.events.delete({ id: 2n })).rejects.toMatchObject({
+      name: "MutationSubmissionError",
+      code: "MUTATION_REJECTED",
+      recovery: "none",
+      message: "REJECTED_VALIDATION",
+    });
     expect(worker.requests.map((request) => request.type)).toEqual([
       "open",
       "artifact-end",
       "mutate",
       "drop",
     ]);
+    const mutationId = worker.requests.find(
+      (request) => request.type === "mutate",
+    )?.mutationId as string;
     expect(worker.pendingIds).toEqual([]);
-    expect(client.mutationStatus(result.mutationId)).toMatchObject({
+    expect(client.mutationStatus(mutationId)).toMatchObject({
       collection: "events",
       key: { id: 2n },
       state: "rejected",
-      result,
+      result: { mutationId, state: "rejected" },
     });
     await client.close();
   });
 
-  it("keeps a conflicting mutation's status with the conflict the server named", async () => {
+  it("rejects a conflicting mutation with the conflict the server named", async () => {
     const { client, worker } = makeClient(
       plan(),
       undefined,
@@ -492,13 +524,22 @@ describe("direct-columnar session", () => {
       }),
     );
     expect(await settled(client)).toEqual({ state: "ready" });
-    const result = await client.db.events.update({ id: 9n }, { level: "x" });
-    expect(result).toMatchObject({
-      state: "conflict",
-      conflict: { kind: "row-missing" },
+    const refusal: unknown = await client.db.events
+      .update({ id: 9n }, { level: "x" })
+      .catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(MutationSubmissionError);
+    expect(refusal).toMatchObject({
+      code: "MUTATION_CONFLICT",
+      scope: "mutation",
+      recovery: "none",
+      conflict: { kind: "row-missing", applicationPayload: new Uint8Array() },
     });
+    expect(Object.isFrozen((refusal as MutationSubmissionError).conflict)).toBe(
+      true,
+    );
+    const mutationId = (refusal as MutationSubmissionError).mutationId;
     expect(worker.pendingIds).toEqual([]);
-    expect(client.mutationStatus(result.mutationId)).toMatchObject({
+    expect(client.mutationStatus(mutationId)).toMatchObject({
       collection: "events",
       key: { id: 9n },
       state: "conflict",
@@ -570,6 +611,8 @@ describe("direct-columnar session", () => {
         }
         return replaying(input, init);
       },
+      undefined,
+      NO_AUTOMATIC_RESENDS,
     );
     expect(await settled(client)).toEqual({ state: "ready" });
     await expect(
@@ -619,6 +662,8 @@ describe("direct-columnar session", () => {
         submitted.push(new Uint8Array(init?.body as ArrayBuffer));
         return (submitted.length === 1 ? malformed : replaying)(input, init);
       },
+      undefined,
+      NO_AUTOMATIC_RESENDS,
     );
     expect(await settled(client)).toEqual({ state: "ready" });
     await expect(
@@ -640,6 +685,214 @@ describe("direct-columnar session", () => {
     });
     expect(submitted).toHaveLength(2);
     expect(submitted[1]).toEqual(submitted[0]);
+    await client.close();
+  });
+
+  it("resends a write whose responses were lost, and resolves once the server answers", async () => {
+    const submitted: Uint8Array[] = [];
+    const replaying = outcomeResponder(
+      mutation.MutationOutcomeCode.ALREADY_ACCEPTED_AWAITING_CANONICAL_ECHO,
+    );
+    const { client, worker } = makeClient(
+      plan(),
+      undefined,
+      async (input, init) => {
+        submitted.push(new Uint8Array(init?.body as ArrayBuffer));
+        if (submitted.length <= 2) throw new TypeError("fetch failed");
+        return replaying(input, init);
+      },
+      undefined,
+      { mutationResendDelayMs: 1 },
+    );
+    expect(await settled(client)).toEqual({ state: "ready" });
+    const states: string[] = [];
+    const stopWatching = client.subscribeMutations((status) => {
+      states.push(status.state);
+    });
+    const result = await client.db.events.update({ id: 1n }, { level: "warn" });
+    stopWatching();
+    expect(result).toMatchObject({ state: "awaiting_canonical_echo" });
+    expect(submitted).toHaveLength(3);
+    expect(submitted[1]).toEqual(submitted[0]);
+    expect(submitted[2]).toEqual(submitted[0]);
+    expect(states).toEqual([
+      "submitting",
+      "ambiguous",
+      "submitting",
+      "ambiguous",
+      "submitting",
+      "awaiting_canonical_echo",
+    ]);
+    expect(worker.pendingIds).toEqual([result.mutationId]);
+    await client.close();
+  });
+
+  it("resends a write the server answered retry-later, after the wait it asked for", async () => {
+    let submissions = 0;
+    const refusing = outcomeResponder(
+      mutation.MutationOutcomeCode.RETRYABLE_FAILURE,
+      { retryAfterMs: 1n },
+    );
+    const { client } = makeClient(plan(), undefined, async (input, init) => {
+      submissions += 1;
+      return (submissions === 1 ? refusing : acceptedResponder)(input, init);
+    });
+    expect(await settled(client)).toEqual({ state: "ready" });
+    await expect(
+      client.db.events.update({ id: 1n }, { level: "warn" }),
+    ).resolves.toMatchObject({ state: "awaiting_canonical_echo" });
+    expect(submissions).toBe(2);
+    await client.close();
+  });
+
+  it("rejects with the last lost response once the resends run out, and keeps the write for retryMutation", async () => {
+    let failing = true;
+    let submissions = 0;
+    const { client, worker } = makeClient(
+      plan(),
+      undefined,
+      async (input, init) => {
+        submissions += 1;
+        if (failing) throw new TypeError("fetch failed");
+        return acceptedResponder(input, init);
+      },
+      undefined,
+      { automaticMutationResends: 2, mutationResendDelayMs: 1 },
+    );
+    expect(await settled(client)).toEqual({ state: "ready" });
+    await expect(
+      client.db.events.update({ id: 1n }, { level: "warn" }),
+    ).rejects.toMatchObject({
+      code: "MUTATION_AMBIGUOUS",
+      recovery: "retry",
+      message:
+        "mutation submission did not receive an HTTP response; retryMutation resends it",
+    });
+    expect(submissions).toBe(3);
+    const mutationId = worker.requests.find(
+      (request) => request.type === "mutate",
+    )?.mutationId as string;
+    expect(client.mutationStatus(mutationId)?.state).toBe("ambiguous");
+    expect(worker.pendingIds).toEqual([mutationId]);
+
+    failing = false;
+    await expect(client.retryMutation(mutationId)).resolves.toMatchObject({
+      mutationId,
+      state: "awaiting_canonical_echo",
+    });
+    expect(submissions).toBe(4);
+    await client.close();
+  });
+
+  it("rejects as undecided when the server stays temporarily unavailable through every resend", async () => {
+    let submissions = 0;
+    const refusing = outcomeResponder(
+      mutation.MutationOutcomeCode.RETRYABLE_FAILURE,
+      { retryAfterMs: 1n },
+    );
+    const { client, worker } = makeClient(
+      plan(),
+      undefined,
+      async (input, init) => {
+        submissions += 1;
+        return refusing(input, init);
+      },
+      undefined,
+      { automaticMutationResends: 2 },
+    );
+    expect(await settled(client)).toEqual({ state: "ready" });
+    await expect(
+      client.db.events.update({ id: 1n }, { level: "warn" }),
+    ).rejects.toMatchObject({
+      code: "MUTATION_AMBIGUOUS",
+      recovery: "retry",
+      message:
+        "the server was temporarily unavailable for 3 attempts; retryMutation resends it",
+    });
+    expect(submissions).toBe(3);
+    const mutationId = worker.requests.find(
+      (request) => request.type === "mutate",
+    )?.mutationId as string;
+    expect(client.mutationStatus(mutationId)?.state).toBe("retryable");
+    await client.close();
+  });
+
+  it("sends a waiting resend at once when retryMutation asks, and settles both calls together", async () => {
+    let submissions = 0;
+    const { client, worker } = makeClient(
+      plan(),
+      undefined,
+      async (input, init) => {
+        submissions += 1;
+        if (submissions === 1) throw new TypeError("fetch failed");
+        return acceptedResponder(input, init);
+      },
+      undefined,
+      { mutationResendDelayMs: 60_000 },
+    );
+    expect(await settled(client)).toEqual({ state: "ready" });
+    const write = client.db.events.update({ id: 1n }, { level: "warn" });
+    await until(
+      () =>
+        worker.requests.some(
+          (request) =>
+            request.type === "mutate" &&
+            client.mutationStatus(request.mutationId as string)?.state ===
+              "ambiguous",
+        ),
+      "the lost response",
+    );
+    const mutationId = worker.requests.find(
+      (request) => request.type === "mutate",
+    )?.mutationId as string;
+    const retried = await client.retryMutation(mutationId);
+    expect(retried).toMatchObject({
+      mutationId,
+      state: "awaiting_canonical_echo",
+    });
+    expect(await write).toBe(retried);
+    expect(submissions).toBe(2);
+    await client.close();
+  });
+
+  it("stops resending a write once a reset tears its mount down", async () => {
+    let submissions = 0;
+    const { client, worker } = makeClient(
+      plan(),
+      undefined,
+      async () => {
+        submissions += 1;
+        throw new TypeError("fetch failed");
+      },
+      undefined,
+      { mutationResendDelayMs: 60_000 },
+    );
+    expect(await settled(client)).toEqual({ state: "ready" });
+    const write = client.db.events
+      .update({ id: 1n }, { level: "warn" })
+      .catch((error: unknown) => error);
+    await until(() => submissions === 1, "the first submission");
+    const mutationId = worker.requests.find(
+      (request) => request.type === "mutate",
+    )?.mutationId as string;
+    await until(
+      () => client.mutationStatus(mutationId)?.state === "ambiguous",
+      "the lost response",
+    );
+    await client.reset();
+    const error = await write;
+    expect(error).toBeInstanceOf(MutationSubmissionError);
+    expect({ ...(error as MutationSubmissionError) }).toEqual({
+      name: "MutationSubmissionError",
+      code: "MUTATION_AMBIGUOUS",
+      scope: "mutation",
+      recovery: "none",
+      mutationId,
+    });
+    expect(submissions).toBe(1);
+    await expect(client.retryMutation(mutationId)).rejects.toMatchObject({
+      code: "MUTATION_REJECTED",
+    });
     await client.close();
   });
 
@@ -666,6 +919,8 @@ describe("direct-columnar session", () => {
         });
         return alreadyCanonical(input, init);
       },
+      undefined,
+      NO_AUTOMATIC_RESENDS,
     );
     expect(await settled(client)).toEqual({ state: "ready" });
     await expect(
@@ -778,6 +1033,7 @@ describe("direct-columnar session", () => {
       },
       undefined,
       {
+        ...NO_AUTOMATIC_RESENDS,
         auth: async () => {
           await authHeld;
           return { bearerToken: "token" };
@@ -838,11 +1094,26 @@ describe("direct-columnar session", () => {
         }
         return acceptedResponder(input, init);
       },
+      undefined,
+      NO_AUTOMATIC_RESENDS,
     );
     expect(await settled(client)).toEqual({ state: "ready" });
-    const result = await client.db.events.update({ id: 1n }, { level: "warn" });
-    expect(result).toMatchObject({ state: "retryable", retryAfterMs: 250n });
-    expect(client.mutationStatus(result.mutationId)?.state).toBe("retryable");
+    await expect(
+      client.db.events.update({ id: 1n }, { level: "warn" }),
+    ).rejects.toMatchObject({
+      code: "MUTATION_AMBIGUOUS",
+      recovery: "retry",
+      message:
+        "the server was temporarily unavailable for 1 attempt; retryMutation resends it",
+    });
+    const result = {
+      mutationId: worker.requests.find((request) => request.type === "mutate")
+        ?.mutationId as string,
+    };
+    expect(client.mutationStatus(result.mutationId)).toMatchObject({
+      state: "retryable",
+      result: { state: "retryable", retryAfterMs: 250n },
+    });
     const states: MutationStatus[] = [];
     const stopWatching = client.subscribeMutations((status) => {
       states.push(status);
@@ -890,6 +1161,8 @@ describe("direct-columnar session", () => {
         if (dropTheResponse) throw new TypeError("fetch failed");
         return acceptedResponder(input, init);
       },
+      undefined,
+      NO_AUTOMATIC_RESENDS,
     );
     expect(await settled(client)).toEqual({ state: "ready" });
     const ambiguous: string[] = [];
@@ -945,6 +1218,8 @@ describe("direct-columnar session", () => {
         }
         return acceptedResponder(input, init);
       },
+      undefined,
+      NO_AUTOMATIC_RESENDS,
     );
     expect(await settled(client)).toEqual({ state: "ready" });
     await expect(
@@ -1107,6 +1382,8 @@ describe("direct-columnar session", () => {
         }
         return acceptedResponder(input, init);
       },
+      undefined,
+      NO_AUTOMATIC_RESENDS,
     );
     expect(await settled(client)).toEqual({ state: "ready" });
     await expect(
@@ -1273,10 +1550,42 @@ describe("direct-columnar session", () => {
     const abandoned = client.mutationStatus(mutationId);
     expect(abandoned?.state).toBe("ambiguous");
     answer.resolve();
-    await write;
+    await expect(write).rejects.toMatchObject({ code: "MUTATION_REJECTED" });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(client.mutationStatus(mutationId)).toEqual(abandoned);
     expect(worker.requests.some(({ type }) => type === "drop")).toBe(false);
+    await client.close();
+  });
+
+  it("tells a write answered retry-later after a reset that nothing is left to resend", async () => {
+    const answer: PromiseWithResolvers<void> = Promise.withResolvers();
+    const refusing = outcomeResponder(
+      mutation.MutationOutcomeCode.RETRYABLE_FAILURE,
+      { retryAfterMs: 1n },
+    );
+    let submitted = false;
+    const { client } = makeClient(
+      plan(),
+      undefined,
+      async (input, init) => {
+        submitted = true;
+        await answer.promise;
+        return refusing(input, init);
+      },
+      undefined,
+      NO_AUTOMATIC_RESENDS,
+    );
+    expect(await settled(client)).toEqual({ state: "ready" });
+    const write = client.db.events
+      .update({ id: 1n }, { level: "warn" })
+      .catch((error: unknown) => error);
+    await until(() => submitted, "the submission");
+    await client.reset();
+    answer.resolve();
+    expect(await write).toMatchObject({
+      code: "MUTATION_AMBIGUOUS",
+      recovery: "none",
+    });
     await client.close();
   });
 
@@ -1354,6 +1663,7 @@ describe("direct-columnar session", () => {
       },
       undefined,
       {
+        ...NO_AUTOMATIC_RESENDS,
         auth: async () => {
           if (holdNextAuth) {
             holdNextAuth = false;
@@ -2404,9 +2714,7 @@ describe("direct-columnar session", () => {
         workerFactory,
         () => {
           if (spawned.length === 2)
-            throw new TypeError(
-              "this runtime has no Worker constructor; Calque runs only in Chromium-based browsers",
-            );
+            throw new TypeError("this runtime has no Worker constructor");
           const hasher = new FakeHasher();
           spawned.push(hasher);
           return hasher as unknown as ColumnarHasherWorker;
@@ -2416,8 +2724,7 @@ describe("direct-columnar session", () => {
       expect(status).toMatchObject({
         state: "error",
         error: {
-          message:
-            "this runtime has no Worker constructor; Calque runs only in Chromium-based browsers",
+          message: "this runtime has no Worker constructor",
         },
       });
       expect(spawned.map(({ terminated }) => terminated)).toEqual([true, true]);

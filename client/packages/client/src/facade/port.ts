@@ -13,7 +13,7 @@ import type {
   GeneratedClientColumnKind,
   GeneratedClientCrudOperation,
 } from "../generated-schema.js";
-import type { MutationResult } from "../mutation.js";
+import type { MutationAccepted } from "../mutation.js";
 import type { LiveQueryResource } from "../resource.js";
 import { uuidText } from "../uuid.js";
 
@@ -98,7 +98,7 @@ export interface FacadePort {
     operation: GeneratedClientCrudOperation,
     key: Readonly<Record<string, unknown>>,
     values: Readonly<Record<string, unknown>> | undefined,
-  ) => Promise<MutationResult>;
+  ) => Promise<MutationAccepted>;
 }
 
 const RUN_OPTION_KEYS = new Set(["maxRows", "maxBytes", "signal"]);

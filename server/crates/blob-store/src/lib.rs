@@ -94,10 +94,11 @@ pub trait BlobStore: Send + Sync {
         metadata: &ObjectMetadata,
     ) -> Result<PutOutcome>;
 
-    /// `put_if_absent` for a complete file the caller will not change while
-    /// this runs. An adapter that can store a file without streaming it
-    /// through memory overrides this, and still verifies the bytes it stored
-    /// against `metadata` before the object becomes visible.
+    /// `put_if_absent` for a complete file the caller has already synced and
+    /// will not change while this runs. An adapter that can store a file
+    /// without streaming it through memory overrides this, and still verifies
+    /// the bytes it stored against `metadata` before the object becomes
+    /// visible.
     async fn put_file_if_absent(
         &self,
         object: &ObjectId,
@@ -358,11 +359,10 @@ impl LocalFilesystemBlobStore {
         let temporary = self.staging.join(format!("{}.tmp", Uuid::new_v4()));
         let guard = StagingFileGuard::new(temporary.clone());
         // On APFS `std::fs::copy` clones: the staged file shares the source's
-        // blocks instead of copying them. The source is flushed first, so the
+        // blocks instead of copying them. The caller synced the source, so the
         // staged file's own F_FULLFSYNC below leaves both its blocks and its
         // metadata on stable storage, as a written copy's would be. Elsewhere
         // it copies.
-        std::fs::File::open(source)?.sync_all()?;
         std::fs::copy(source, &temporary)?;
         // A clone keeps the source's modification time and a copy takes the
         // time it was made. Giving the copy the source's lets the identity
@@ -402,10 +402,12 @@ impl LocalFilesystemBlobStore {
         reject_symlink_async(parent).await?;
         match tokio::fs::hard_link(temporary, &destination).await {
             Ok(()) => {
+                // The staging name's removal is not synced: if a crash brings
+                // it back, startup's `cleanup_staging` removes it before any
+                // publication runs, and the object keeps its own link.
                 tokio::fs::remove_file(temporary).await?;
                 staging_guard.disarm();
                 sync_directory_async(parent).await?;
-                sync_directory_async(&self.staging).await?;
                 // Linking the staged file into place and unlinking its staging
                 // name move only its change time, so the object has the bytes
                 // verified in staging if nothing else about it moved.
@@ -419,7 +421,6 @@ impl LocalFilesystemBlobStore {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 tokio::fs::remove_file(temporary).await?;
                 staging_guard.disarm();
-                sync_directory_async(&self.staging).await?;
                 let actual = self
                     .head(object)
                     .await?
@@ -740,6 +741,15 @@ pub enum StorageError {
     MultipartCleanup {
         operation: &'static str,
         code: String,
+    },
+    /// An S3 failure with the bucket and endpoint it was made against, so an
+    /// operator can tell a wrong bucket or endpoint from a rejected
+    /// credential. Neither field holds a credential.
+    #[error("{source}, using bucket {bucket} at {endpoint}")]
+    ProviderAt {
+        bucket: String,
+        endpoint: String,
+        source: Box<StorageError>,
     },
 }
 

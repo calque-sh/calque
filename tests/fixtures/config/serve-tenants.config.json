@@ -9,7 +9,7 @@
   "sources": [
     {
       "id": "serve-tenants",
-      "connectionEnv": "SERVE_TENANTS_DATABASE_URL",
+      "databaseUrlEnv": "SERVE_TENANTS_DATABASE_URL",
       "publication": "calque_serve_tenants",
       "slot": "calque_serve_tenants_slot"
     }

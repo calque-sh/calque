@@ -47,6 +47,13 @@ const probes = [
     phase: "==> Rust warnings/clippy",
   },
   {
+    id: "rust-production-unwrap",
+    path: "server/crates/sync-protocol/src/lib.rs",
+    append:
+      "\npub fn __verify_probe_unwrap(value: Option<u8>) -> u8 {\n    value.unwrap()\n}\n",
+    phase: "==> Rust production panics",
+  },
+  {
     id: "formatting-drift",
     path: "server/crates/sync-protocol/src/lib.rs",
     append: "\npub fn __verify_probe_format( )->bool {true}\n",

@@ -64,6 +64,8 @@ interface BootstrapRecord {
   readonly atEpochMs: number;
   readonly grant: string | null;
   readonly status: number | null;
+  /** Whether it renewed the plan in force, presenting its resident state. */
+  readonly renewal: boolean;
 }
 
 interface MutationRequestRecord {
@@ -103,6 +105,8 @@ interface RevocationPageState {
   readonly paints: readonly PaintRecord[];
   readonly auths: readonly AuthRecord[];
   readonly bootstraps: readonly BootstrapRecord[];
+  /** Artifact downloads the client started. */
+  readonly artifactDownloads: number;
   readonly mutationRequests: readonly MutationRequestRecord[];
   readonly mutationTransitions: readonly MutationTransition[];
   readonly attempts: readonly UpdateAttempt[];
@@ -118,6 +122,13 @@ declare global {
   var __calqueRevocationSetGrant: (
     token: string | null,
     label: string | null,
+  ) => void;
+  /**
+   * Grants `auth()` hands out one per call, in order, before it returns the
+   * last of them from then on.
+   */
+  var __calqueRevocationQueueGrants: (
+    grants: readonly (readonly [token: string, label: string])[],
   ) => void;
   /** Holds every mutation POST the client makes until released. */
   var __calqueRevocationHoldMutations: () => void;
@@ -145,6 +156,7 @@ function requiredElement(id: string): HTMLElement {
 }
 
 let grant: { token: string; label: string } | null = configuration.grant;
+let queuedGrants: (readonly [token: string, label: string])[] = [];
 /** Every token this page handed out, so a request can be named by grant. */
 const grantLabels = new Map<string, string>([
   [configuration.grant.token, configuration.grant.label],
@@ -154,6 +166,7 @@ const statuses: StatusRecord[] = [];
 const paints: PaintRecord[] = [];
 const auths: AuthRecord[] = [];
 const bootstraps: BootstrapRecord[] = [];
+let artifactDownloads = 0;
 const mutationRequests: MutationRequestRecord[] = [];
 const mutationTransitions: MutationTransition[] = [];
 const attempts: UpdateAttempt[] = [];
@@ -168,6 +181,10 @@ globalThis.__calqueRevocationSetGrant = (token, label) => {
   }
   grant = { token, label };
   grantLabels.set(token, label);
+};
+
+globalThis.__calqueRevocationQueueGrants = (grants) => {
+  queuedGrants = [...grants];
 };
 
 globalThis.__calqueRevocationHoldMutations = () => {
@@ -203,16 +220,25 @@ async function recordingFetch(
   if (url.includes("/v1/bootstrap")) {
     const atEpochMs = Date.now();
     const presented = grantOf(init);
+    const renewal =
+      typeof init?.body === "string" &&
+      "residentStateProof" in (JSON.parse(init.body) as object);
     try {
       const response = await globalThis.fetch(input, init);
-      bootstraps.push({ atEpochMs, grant: presented, status: response.status });
+      bootstraps.push({
+        atEpochMs,
+        grant: presented,
+        status: response.status,
+        renewal,
+      });
       if (response.ok) mountedGrant = presented;
       return response;
     } catch (error) {
-      bootstraps.push({ atEpochMs, grant: presented, status: null });
+      bootstraps.push({ atEpochMs, grant: presented, status: null, renewal });
       throw error;
     }
   }
+  if (url.includes("/v1/artifact-objects/")) artifactDownloads += 1;
   if (!url.includes("/v1/mutations")) return globalThis.fetch(input, init);
   const calledAtEpochMs = Date.now();
   const mutationIds =
@@ -259,6 +285,8 @@ const client = createSyncClient({
   endpoint: configuration.endpoint,
   auth: () => {
     const atEpochMs = Date.now();
+    const queued = queuedGrants.shift();
+    if (queued) globalThis.__calqueRevocationSetGrant(...queued);
     if (grant === null) {
       auths.push({ atEpochMs, grant: null });
       throw new Error("the application holds no grant for this user");
@@ -373,6 +401,7 @@ globalThis.__calqueRevocationState = () => ({
   paints: [...paints],
   auths: [...auths],
   bootstraps: [...bootstraps],
+  artifactDownloads,
   mutationRequests: [...mutationRequests],
   mutationTransitions: [...mutationTransitions],
   attempts: [...attempts],

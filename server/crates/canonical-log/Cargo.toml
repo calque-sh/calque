@@ -28,6 +28,7 @@ sync-types = { path = "../sync-types" }
 thiserror = "1"
 
 [dev-dependencies]
+postgres-connect = { path = "../postgres-connect", features = ["test-relay"] }
 # calque's binary builds serde_json with `arbitrary_precision`, which
 # cdc-ingest asks for, so the tests decode entries with it as calque does.
 serde_json = { version = "1", features = ["arbitrary_precision"] }

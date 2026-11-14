@@ -120,6 +120,15 @@ fn is_simple_postgres_identifier(value: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$'))
 }
 
+/// SQL that is true when the `pg_roles` row aliased `role` may open a
+/// walsender: it has the REPLICATION attribute or, on Amazon RDS and Aurora,
+/// which grant replication through a role instead, it is a member of
+/// `rds_replication`.
+pub const ROLE_MAY_REPLICATE: &str = "(role.rolreplication OR EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles AS granted
+     WHERE granted.rolname = 'rds_replication'
+       AND pg_catalog.pg_has_role(role.oid, granted.oid, 'MEMBER')))";
+
 /// Quotes one PostgreSQL identifier, doubling any `"` it contains.
 pub fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
@@ -191,6 +200,40 @@ pub struct ColumnInspection {
     /// column under a deterministic collation unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     pub nondeterministic_collation: bool,
+    /// The pg_catalog type this column's values travel as when its own type
+    /// is not a built-in: `text` for an enum, the base type for a domain.
+    /// Serialized only when set, so it leaves the schema fingerprint of a
+    /// built-in column unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_as: Option<String>,
+}
+
+impl ColumnInspection {
+    /// The pg_catalog type name this column's values travel as.
+    pub fn carried_type_name(&self) -> &str {
+        self.carried_as.as_deref().unwrap_or(&self.type_name)
+    }
+
+    /// The codec this column's values travel with, or `None` when Calque
+    /// carries no value of its type.
+    pub fn codec(&self) -> Option<PostgresTypeCodec> {
+        match &self.carried_as {
+            Some(carried) => PostgresTypeCodec::from_catalog("pg_catalog", carried),
+            None => PostgresTypeCodec::from_catalog(&self.type_schema, &self.type_name),
+        }
+    }
+}
+
+/// A column the publication's column list leaves out. pgoutput never sends
+/// it, and no snapshot, plan or command of Calque's reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnlistedColumn {
+    pub name: String,
+    pub primary_key: bool,
+    /// An insert must give it a value: it is NOT NULL, directly or through a
+    /// domain, and has no default, identity or generation expression.
+    pub required_on_insert: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -211,7 +254,23 @@ pub struct TableInspection {
     pub is_partition: bool,
     pub has_publication_row_filter: bool,
     pub has_publication_column_list: bool,
+    /// The columns the publication carries, in attribute order.
     pub columns: Vec<ColumnInspection>,
+    /// The columns its column list leaves out. Serialized only when there
+    /// are some, so it leaves the schema fingerprint of a table published
+    /// whole unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unlisted_columns: Vec<UnlistedColumn>,
+}
+
+impl TableInspection {
+    /// An insert through Calque cannot succeed: it names only the columns
+    /// the publication carries, and an unlisted one needs a value.
+    pub fn insert_needs_unlisted_column(&self) -> bool {
+        self.unlisted_columns
+            .iter()
+            .any(|column| column.required_on_insert)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,7 +396,8 @@ pub fn inspect_source(
         .start()?;
 
     let row = transaction.query_one(
-        "SELECT current_setting('server_version_num')::int4,
+        &format!(
+            "SELECT current_setting('server_version_num')::int4,
                 current_setting('server_encoding'),
                 current_setting('DateStyle'),
                 current_setting('TimeZone'),
@@ -347,7 +407,7 @@ pub fn inspect_source(
                 current_setting('max_wal_senders')::int4,
                 current_user,
                 role.rolsuper,
-                role.rolreplication,
+                {ROLE_MAY_REPLICATE},
                 current_database(),
                 control.system_identifier::text,
                 checkpoint.timeline_id,
@@ -355,7 +415,8 @@ pub fn inspect_source(
            FROM pg_catalog.pg_roles AS role
           CROSS JOIN pg_catalog.pg_control_system() AS control
           CROSS JOIN pg_catalog.pg_control_checkpoint() AS checkpoint
-          WHERE role.rolname = current_user",
+          WHERE role.rolname = current_user"
+        ),
         &[],
     )?;
     let settings = SourceSettings {
@@ -472,9 +533,42 @@ pub fn inspect_source(
         .values()
         .map(|relation| catalog_oid("relation_oid", relation.get(1)))
         .collect::<Result<Vec<_>, InspectError>>()?;
+    // A column of an enum travels as its label's text, and a column of a
+    // domain as the type under it, through any chain of domains. A column the
+    // publication's column list leaves out is kept apart: pgoutput never
+    // sends it, so no snapshot, plan or command may read it either.
     let mut columns: BTreeMap<u32, Vec<ColumnInspection>> = BTreeMap::new();
+    let mut unlisted: BTreeMap<u32, Vec<UnlistedColumn>> = BTreeMap::new();
     for row in transaction.query(
-        "SELECT attribute.attrelid::int8,
+        "WITH RECURSIVE chain(start_oid, oid, depth, not_null, has_default) AS (
+             SELECT DISTINCT attribute.atttypid, attribute.atttypid, 0, false, false
+               FROM pg_catalog.pg_attribute AS attribute
+              WHERE attribute.attrelid = ANY($1::oid[])
+                AND attribute.attnum > 0
+                AND NOT attribute.attisdropped
+             UNION ALL
+             SELECT chain.start_oid, domain.typbasetype, chain.depth + 1,
+                    chain.not_null OR domain.typnotnull,
+                    chain.has_default OR domain.typdefaultbin IS NOT NULL
+               FROM chain
+               JOIN pg_catalog.pg_type AS domain ON domain.oid = chain.oid
+              WHERE domain.typtype = 'd'
+         ),
+         carried AS (
+             SELECT chain.start_oid,
+                    CASE WHEN base.typtype = 'e' THEN 'text'
+                         WHEN chain.depth > 0 AND base_namespace.nspname = 'pg_catalog'
+                         THEN base.typname::text
+                    END AS type_name,
+                    chain.not_null,
+                    chain.has_default
+               FROM chain
+               JOIN pg_catalog.pg_type AS base ON base.oid = chain.oid
+               JOIN pg_catalog.pg_namespace AS base_namespace
+                 ON base_namespace.oid = base.typnamespace
+              WHERE base.typtype <> 'd'
+         )
+         SELECT attribute.attrelid::int8,
                 attribute.attnum,
                 attribute.attname,
                 type.oid::int8,
@@ -484,13 +578,27 @@ pub fn inspect_source(
                 NOT attribute.attnotnull,
                 key.ordinality::int4,
                 attribute.attgenerated <> '',
-                NOT COALESCE(column_collation.collisdeterministic, true)
+                NOT COALESCE(column_collation.collisdeterministic, true),
+                carried.type_name,
+                publication_relation.prattrs IS NULL
+                  OR attribute.attnum = ANY(publication_relation.prattrs::int2[]),
+                (attribute.attnotnull OR COALESCE(carried.not_null, false))
+                  AND NOT attribute.atthasdef
+                  AND NOT COALESCE(carried.has_default, false)
+                  AND attribute.attidentity = ''
+                  AND attribute.attgenerated = ''
            FROM pg_catalog.pg_attribute AS attribute
            JOIN pg_catalog.pg_type AS type ON type.oid = attribute.atttypid
            JOIN pg_catalog.pg_namespace AS type_namespace
              ON type_namespace.oid = type.typnamespace
+      LEFT JOIN carried ON carried.start_oid = attribute.atttypid
       LEFT JOIN pg_catalog.pg_collation AS column_collation
              ON column_collation.oid = attribute.attcollation
+      LEFT JOIN pg_catalog.pg_publication_rel AS publication_relation
+             ON publication_relation.prrelid = attribute.attrelid
+            AND publication_relation.prpubid = (
+                  SELECT publication.oid FROM pg_catalog.pg_publication AS publication
+                   WHERE publication.pubname = $2)
       LEFT JOIN pg_catalog.pg_index AS primary_index
              ON primary_index.indrelid = attribute.attrelid
             AND primary_index.indisprimary
@@ -501,11 +609,26 @@ pub fn inspect_source(
             AND attribute.attnum > 0
             AND NOT attribute.attisdropped
        ORDER BY attribute.attrelid, attribute.attnum",
-        &[&relation_oids],
+        &[&relation_oids, &publication_name],
     )? {
+        let relation_oid = catalog_oid("relation_oid", row.get(0))?;
         let ordinal: Option<i32> = row.get(8);
+        let primary_key_ordinal = ordinal
+            .map(|value| non_negative_setting("primary_key_ordinal", value))
+            .transpose()?;
+        if !row.get::<_, bool>(12) {
+            unlisted
+                .entry(relation_oid)
+                .or_default()
+                .push(UnlistedColumn {
+                    name: row.get(2),
+                    primary_key: primary_key_ordinal.is_some(),
+                    required_on_insert: row.get(13),
+                });
+            continue;
+        }
         columns
-            .entry(catalog_oid("relation_oid", row.get(0))?)
+            .entry(relation_oid)
             .or_default()
             .push(ColumnInspection {
                 attribute_number: row.get(1),
@@ -515,11 +638,10 @@ pub fn inspect_source(
                 type_schema: row.get(5),
                 type_name: row.get(6),
                 nullable: row.get(7),
-                primary_key_ordinal: ordinal
-                    .map(|value| non_negative_setting("primary_key_ordinal", value))
-                    .transpose()?,
+                primary_key_ordinal,
                 generated: row.get(9),
                 nondeterministic_collation: row.get(10),
+                carried_as: row.get(11),
             });
     }
 
@@ -536,6 +658,7 @@ pub fn inspect_source(
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                unlisted_columns: Vec::new(),
                 columns: Vec::new(),
             });
             continue;
@@ -552,6 +675,7 @@ pub fn inspect_source(
             has_publication_row_filter: relation.get(6),
             has_publication_column_list: relation.get(7),
             columns: columns.remove(&relation_oid).unwrap_or_default(),
+            unlisted_columns: unlisted.remove(&relation_oid).unwrap_or_default(),
         });
     }
 
@@ -562,6 +686,16 @@ pub fn inspect_source(
         publication,
         tables,
     })
+}
+
+/// Calque sets these on every connection it opens, so a session that reports
+/// anything else was not opened with them.
+fn session_setting_refusal(name: &str, found: &str, wanted: &str) -> String {
+    format!(
+        "this session's {name} is {found:?}, but Calque opens every connection with {name}={wanted}; \
+         a connection pooler between Calque and PostgreSQL dropped those startup parameters. \
+         Connect directly to PostgreSQL: put the database's own host and port in the database URL, not a pooler's"
+    )
 }
 
 pub fn validate_enrollment(
@@ -590,28 +724,19 @@ pub fn validate_enrollment(
     if !snapshot.settings.date_style.starts_with("ISO,") {
         diagnostics.push(error(
             "DATE_STYLE_UNSUPPORTED",
-            format!(
-                "DateStyle is {:?}, expected ISO output",
-                snapshot.settings.date_style
-            ),
+            session_setting_refusal("DateStyle", &snapshot.settings.date_style, "ISO,MDY"),
         ));
     }
     if !matches!(snapshot.settings.time_zone.as_str(), "UTC" | "Etc/UTC") {
         diagnostics.push(error(
             "TIME_ZONE_UNSUPPORTED",
-            format!(
-                "TimeZone is {:?}, expected UTC or Etc/UTC for deterministic timestamptz output",
-                snapshot.settings.time_zone
-            ),
+            session_setting_refusal("TimeZone", &snapshot.settings.time_zone, "UTC"),
         ));
     }
     if snapshot.settings.bytea_output != "hex" {
         diagnostics.push(error(
             "BYTEA_OUTPUT_UNSUPPORTED",
-            format!(
-                "bytea_output is {:?}, expected hex",
-                snapshot.settings.bytea_output
-            ),
+            session_setting_refusal("bytea_output", &snapshot.settings.bytea_output, "hex"),
         ));
     }
     if snapshot.settings.wal_level != "logical" {
@@ -648,7 +773,7 @@ pub fn validate_enrollment(
         diagnostics.push(error(
             "REPLICATION_PRIVILEGE_REQUIRED",
             format!(
-                "role {:?} needs the REPLICATION attribute",
+                "role {:?} needs the REPLICATION attribute, or on Amazon RDS and Aurora membership in rds_replication",
                 snapshot.settings.current_user
             ),
         ));
@@ -778,7 +903,11 @@ fn validate_tables(
         // primary key, and replica identity DEFAULT (which is the primary key)
         // or FULL. A table without a primary key is refused here once, by
         // PRIMARY_KEY_REQUIRED, whatever its replica identity.
-        if primary_key.is_empty() {
+        let unlisted_key = table
+            .unlisted_columns
+            .iter()
+            .any(|column| column.primary_key);
+        if primary_key.is_empty() && !unlisted_key {
             diagnostics.push(table_error(
                 "PRIMARY_KEY_REQUIRED",
                 format!(
@@ -810,23 +939,41 @@ fn validate_tables(
                 required,
             ));
         }
-        if table.has_publication_column_list {
+        for column in &table.unlisted_columns {
+            if column.primary_key {
+                diagnostics.push(column_error(
+                    "PUBLICATION_COLUMN_LIST_OMITS_KEY",
+                    "the publication's column list leaves out this primary-key column, and Calque identifies every row by its key; add the column to the list"
+                        .to_owned(),
+                    required,
+                    &column.name,
+                ));
+            }
+        }
+        if table.has_publication_column_list && table.replica_identity == 'f' {
             diagnostics.push(table_error(
-                "PUBLICATION_COLUMN_LIST_UNSUPPORTED",
-                "the publication lists only some of this table's columns, and Calque serves every column; publish the table without a column list"
-                    .to_owned(),
+                "PUBLICATION_COLUMN_LIST_WITH_FULL_IDENTITY",
+                format!(
+                    "the table's replica identity is FULL, and PostgreSQL refuses its updates and deletes while a publication lists its columns, even every one of them; publish {0} without a column list, or run ALTER TABLE {0} REPLICA IDENTITY DEFAULT",
+                    required.display_name()
+                ),
                 required,
             ));
         }
         for column in &table.columns {
-            let codec = PostgresTypeCodec::from_catalog(&column.type_schema, &column.type_name);
+            let codec = column.codec();
             if codec.is_none() {
+                let declared = match &column.carried_as {
+                    Some(base) => format!(
+                        "{}.{}, a domain over pg_catalog.{base},",
+                        column.type_schema, column.type_name
+                    ),
+                    None => format!("{}.{}", column.type_schema, column.type_name),
+                };
                 diagnostics.push(column_error(
                     "TYPE_CODEC_UNSUPPORTED",
                     format!(
-                        "column type {}.{} is not supported; supported types are pg_catalog {}",
-                        column.type_schema,
-                        column.type_name,
+                        "column type {declared} is not supported; supported types are pg_catalog {}, enums, and domains over any of them; leave the column out of the publication's column list to enroll the table without it",
                         PostgresTypeCodec::ALL
                             .map(PostgresTypeCodec::catalog_name)
                             .join(", ")
@@ -838,7 +985,7 @@ fn validate_tables(
             if column.generated {
                 diagnostics.push(column_error(
                     "GENERATED_COLUMN_UNSUPPORTED",
-                    "generated columns are not supported, because logical replication does not carry their values by default; replace the column with an ordinary one, or compute the value in the application".to_owned(),
+                    "generated columns are not supported, because logical replication does not carry their values by default; leave the column out of the publication's column list, replace it with an ordinary one, or compute the value in the application".to_owned(),
                     required,
                     &column.name,
                 ));
@@ -857,7 +1004,7 @@ fn validate_tables(
                 diagnostics.push(column_error(
                     "PRIMARY_KEY_CODEC_UNSUPPORTED",
                     format!(
-                        "version-1 primary keys support only pg_catalog bool, int2, int4, int8, text, varchar, uuid, and bytea; {}.{} does not yet have proven equality semantics across PostgreSQL and JavaScript",
+                        "version-1 primary keys support only pg_catalog bool, int2, int4, int8, text, varchar, uuid, and bytea, enums, and domains over any of them; {}.{} does not yet have proven equality semantics across PostgreSQL and JavaScript",
                         column.type_schema, column.type_name
                     ),
                     required,
@@ -1003,6 +1150,7 @@ mod tests {
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                unlisted_columns: Vec::new(),
                 columns: vec![ColumnInspection {
                     attribute_number: 1,
                     name: "id".to_owned(),
@@ -1014,6 +1162,7 @@ mod tests {
                     primary_key_ordinal: Some(1),
                     generated: false,
                     nondeterministic_collation: false,
+                    carried_as: None,
                 }],
             }],
         }
@@ -1121,6 +1270,31 @@ mod tests {
     }
 
     #[test]
+    fn a_session_setting_refusal_blames_a_pooler_and_says_to_connect_directly() {
+        let mut snapshot = snapshot();
+        snapshot.settings.date_style = "SQL, DMY".to_owned();
+        snapshot.settings.time_zone = "America/Sao_Paulo".to_owned();
+        snapshot.settings.bytea_output = "escape".to_owned();
+        let report = validate_enrollment(&snapshot, &requirements());
+        for (code, name, found) in [
+            ("DATE_STYLE_UNSUPPORTED", "DateStyle=ISO,MDY", "SQL, DMY"),
+            ("TIME_ZONE_UNSUPPORTED", "TimeZone=UTC", "America/Sao_Paulo"),
+            ("BYTEA_OUTPUT_UNSUPPORTED", "bytea_output=hex", "escape"),
+        ] {
+            let message = &report
+                .diagnostics
+                .iter()
+                .find(|item| item.code == code)
+                .unwrap()
+                .message;
+            assert!(message.contains(name), "{message}");
+            assert!(message.contains(found), "{message}");
+            assert!(message.contains("connection pooler"), "{message}");
+            assert!(message.contains("Connect directly"), "{message}");
+        }
+    }
+
+    #[test]
     fn superuser_is_rejected_even_with_replication_privilege() {
         let mut snapshot = snapshot();
         snapshot.settings.current_user_is_superuser = true;
@@ -1216,6 +1390,7 @@ mod tests {
             primary_key_ordinal: None,
             generated: true,
             nondeterministic_collation: false,
+            carried_as: None,
         });
         let report = validate_enrollment(&snapshot, &requirements());
         let codes: BTreeSet<_> = report
@@ -1280,18 +1455,188 @@ mod tests {
             primary_key_ordinal: None,
             generated: true,
             nondeterministic_collation: false,
+            carried_as: None,
         });
         assert_eq!(
             message(&columns, "TYPE_CODEC_UNSUPPORTED"),
             "column type public.geography is not supported; supported types are pg_catalog \
              bool, int2, int4, int8, float4, float8, numeric, text, varchar, bpchar, bytea, \
-             uuid, json, jsonb, date, time, timestamp, timestamptz"
+             uuid, json, jsonb, date, time, timestamp, timestamptz, enums, and domains over \
+             any of them; leave the column out of the publication's column list to enroll \
+             the table without it"
         );
         assert_eq!(
             message(&columns, "GENERATED_COLUMN_UNSUPPORTED"),
             "generated columns are not supported, because logical replication does not \
-             carry their values by default; replace the column with an ordinary one, or \
-             compute the value in the application"
+             carry their values by default; leave the column out of the publication's \
+             column list, replace it with an ordinary one, or compute the value in the \
+             application"
+        );
+
+        let mut span = snapshot();
+        span.tables[0].columns.push(ColumnInspection {
+            type_schema: "public".to_owned(),
+            type_name: "span".to_owned(),
+            carried_as: Some("interval".to_owned()),
+            ..text_column(2, "span")
+        });
+        assert!(message(&span, "TYPE_CODEC_UNSUPPORTED").starts_with(
+            "column type public.span, a domain over pg_catalog.interval, is not supported;"
+        ));
+
+        let mut hidden_key = snapshot();
+        let key = hidden_key.tables[0].columns.remove(0);
+        hidden_key.tables[0].columns.push(text_column(2, "title"));
+        hidden_key.tables[0].unlisted_columns.push(UnlistedColumn {
+            name: key.name,
+            primary_key: true,
+            required_on_insert: true,
+        });
+        assert_eq!(
+            message(&hidden_key, "PUBLICATION_COLUMN_LIST_OMITS_KEY"),
+            "the publication's column list leaves out this primary-key column, and Calque \
+             identifies every row by its key; add the column to the list"
+        );
+
+        let mut full = snapshot();
+        full.tables[0].replica_identity = 'f';
+        full.tables[0].has_publication_column_list = true;
+        assert_eq!(
+            message(&full, "PUBLICATION_COLUMN_LIST_WITH_FULL_IDENTITY"),
+            "the table's replica identity is FULL, and PostgreSQL refuses its updates and \
+             deletes while a publication lists its columns, even every one of them; publish \
+             public.tasks without a column list, or run ALTER TABLE public.tasks REPLICA \
+             IDENTITY DEFAULT"
+        );
+    }
+
+    fn text_column(attribute_number: i16, name: &str) -> ColumnInspection {
+        ColumnInspection {
+            attribute_number,
+            name: name.to_owned(),
+            type_oid: 25,
+            type_modifier: -1,
+            type_schema: "pg_catalog".to_owned(),
+            type_name: "text".to_owned(),
+            nullable: true,
+            primary_key_ordinal: None,
+            generated: false,
+            nondeterministic_collation: false,
+            carried_as: None,
+        }
+    }
+
+    fn unlisted(name: &str, required_on_insert: bool) -> UnlistedColumn {
+        UnlistedColumn {
+            name: name.to_owned(),
+            primary_key: false,
+            required_on_insert,
+        }
+    }
+
+    /// An enum travels as its label's text and a domain as its base type, so
+    /// each enrolls wherever that type does, the key included.
+    #[test]
+    fn enums_and_domains_enroll_as_the_type_they_travel_as() {
+        let mut snapshot = snapshot();
+        let key = &mut snapshot.tables[0].columns[0];
+        key.type_schema = "public".to_owned();
+        key.type_name = "task_id".to_owned();
+        key.carried_as = Some("uuid".to_owned());
+        snapshot.tables[0].columns.push(ColumnInspection {
+            type_oid: 70_001,
+            type_schema: "public".to_owned(),
+            type_name: "mood".to_owned(),
+            carried_as: Some("text".to_owned()),
+            ..text_column(2, "mood")
+        });
+        assert!(
+            validate_enrollment(&snapshot, &requirements()).is_ready(),
+            "{}",
+            validate_enrollment(&snapshot, &requirements())
+        );
+        assert_eq!(
+            snapshot.tables[0].columns[0].codec(),
+            Some(PostgresTypeCodec::Uuid)
+        );
+        assert_eq!(
+            snapshot.tables[0].columns[1].codec(),
+            Some(PostgresTypeCodec::Text)
+        );
+        assert_eq!(snapshot.tables[0].columns[1].carried_type_name(), "text");
+
+        // A key whose domain sits over a type keys cannot use stays refused.
+        snapshot.tables[0].columns[0].carried_as = Some("float8".to_owned());
+        let codes: Vec<_> = validate_enrollment(&snapshot, &requirements())
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert_eq!(codes, ["PRIMARY_KEY_CODEC_UNSUPPORTED"]);
+    }
+
+    /// A column the publication's column list leaves out is not carried, so a
+    /// generated or uncarried type there no longer blocks the table. The key
+    /// must stay listed, and a table under REPLICA IDENTITY FULL takes no list,
+    /// even one naming every column.
+    #[test]
+    fn a_column_list_enrolls_the_listed_columns_and_keeps_the_key() {
+        let mut snapshot = snapshot();
+        snapshot.tables[0].has_publication_column_list = true;
+        snapshot.tables[0]
+            .unlisted_columns
+            .extend([unlisted("location", false), unlisted("secret", true)]);
+        let report = validate_enrollment(&snapshot, &requirements());
+        assert!(report.is_ready(), "{report}");
+        assert!(snapshot.tables[0].insert_needs_unlisted_column());
+
+        snapshot.tables[0]
+            .unlisted_columns
+            .retain(|column| !column.required_on_insert);
+        assert!(!snapshot.tables[0].insert_needs_unlisted_column());
+
+        let mut full = snapshot.clone();
+        full.tables[0].replica_identity = 'f';
+        let codes: Vec<_> = validate_enrollment(&full, &requirements())
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert_eq!(codes, ["PUBLICATION_COLUMN_LIST_WITH_FULL_IDENTITY"]);
+        full.tables[0].unlisted_columns.clear();
+        let codes: Vec<_> = validate_enrollment(&full, &requirements())
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert_eq!(codes, ["PUBLICATION_COLUMN_LIST_WITH_FULL_IDENTITY"]);
+
+        // With the key unlisted, the table reports the list, not a missing key.
+        let mut hidden_key = snapshot;
+        hidden_key.tables[0].columns[0].primary_key_ordinal = None;
+        hidden_key.tables[0].unlisted_columns.push(UnlistedColumn {
+            primary_key: true,
+            ..unlisted("id", true)
+        });
+        let codes: Vec<_> = validate_enrollment(&hidden_key, &requirements())
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert_eq!(codes, ["PUBLICATION_COLUMN_LIST_OMITS_KEY"]);
+    }
+
+    /// The schema fingerprint hashes serialized inspections, so a built-in
+    /// column and a table published whole serialize without the new fields.
+    #[test]
+    fn carried_types_and_unlisted_columns_serialize_only_when_present() {
+        let table = snapshot().tables[0].clone();
+        let json = serde_json::to_value(&table).unwrap();
+        assert!(json.get("unlistedColumns").is_none(), "{json}");
+        assert!(json["columns"][0].get("carriedAs").is_none(), "{json}");
+        assert_eq!(
+            serde_json::from_value::<TableInspection>(json).unwrap(),
+            table
         );
     }
 
@@ -1364,6 +1709,7 @@ mod tests {
             primary_key_ordinal: None,
             generated: false,
             nondeterministic_collation: true,
+            carried_as: None,
         });
         assert!(validate_enrollment(&snapshot, &requirements()).is_ready());
     }
@@ -1375,7 +1721,6 @@ mod tests {
         snapshot.tables[0].is_partition = true;
         snapshot.tables[0].replica_identity = 'i';
         snapshot.tables[0].has_publication_row_filter = true;
-        snapshot.tables[0].has_publication_column_list = true;
         let report = validate_enrollment(&snapshot, &requirements());
         let codes: BTreeSet<_> = report
             .diagnostics
@@ -1387,7 +1732,6 @@ mod tests {
         assert!(codes.contains("RELATION_KIND_UNSUPPORTED"));
         assert!(codes.contains("CUSTOM_REPLICA_IDENTITY_UNSUPPORTED"));
         assert!(codes.contains("PUBLICATION_ROW_FILTER_UNSUPPORTED"));
-        assert!(codes.contains("PUBLICATION_COLUMN_LIST_UNSUPPORTED"));
     }
 
     /// Each publication refusal names what to change, not only what is wrong.
@@ -1396,7 +1740,6 @@ mod tests {
         let mut snapshot = snapshot();
         snapshot.publication.publishes_via_partition_root = true;
         snapshot.tables[0].has_publication_row_filter = true;
-        snapshot.tables[0].has_publication_column_list = true;
         let rendered = validate_enrollment(&snapshot, &requirements()).to_string();
 
         for remedy in [
@@ -1406,7 +1749,6 @@ mod tests {
             ),
             "SET (publish_via_partition_root = false)".to_owned(),
             "publish the table without one".to_owned(),
-            "publish the table without a column list".to_owned(),
         ] {
             assert!(rendered.contains(&remedy), "{rendered}");
         }

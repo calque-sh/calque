@@ -10,6 +10,10 @@
 //! a fence. A tenant opened neither recently nor pinned is evicted, and its
 //! next open is cold.
 //!
+//! A build a page waits on runs at normal priority. One nobody waits on, a
+//! warm order's or a refresh's, runs in the background class until a page
+//! starts waiting on it. Background compression runs in the background class.
+//!
 //! The directory beside the catalog keeps what a restart needs: each tenant's
 //! pin, last open and the bytes routed to it since its cut, every open, every
 //! tenant order until it expires, and how far the follower has read the log.
@@ -40,7 +44,7 @@ use canonical_log::{CanonicalEntry, CanonicalLogRead, LogError, PostgresFencedCa
 use dataset_grant::{TenantAction, VerifiedTenantOrder};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use snapshot_pipeline::CanonicalHeadSignal;
+use snapshot_pipeline::{CanonicalHeadSignal, SharedBuildZstd};
 use source_control::PostgresTypeCodec;
 use sync_types::{ArtifactId, OpaqueCursor};
 use thiserror::Error;
@@ -49,7 +53,10 @@ use tokio::sync::{oneshot, watch, RwLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use background_thread::Class;
+
 use crate::{
+    background::{current_thread_runtime, lower_current_thread, WorkClass},
     guard::PostgresConnectionFamily,
     limits::MIB,
     log_readers::{LogReaders, SourceLogReaders},
@@ -233,6 +240,16 @@ impl Priority {
     const fn lane(self) -> usize {
         self as usize
     }
+
+    /// The class a build starts in: below live delivery while no page waits
+    /// on the build. [`TenantState::retune_waited_builds`] then moves builds
+    /// a page waits on as others start and end.
+    const fn class(self) -> Class {
+        match self {
+            Self::Waiting => Class::Normal,
+            Self::Warm | Self::Refresh => Class::Background,
+        }
+    }
 }
 
 /// Builds waiting for a slot, one lane per priority, each in the order they
@@ -321,6 +338,7 @@ enum Job {
         /// another, or none, is discarded.
         build: u64,
         cancellation: CancellationToken,
+        class: WorkClass,
         /// The follower's position when the build started. Its cut falls
         /// after it, so the log is kept from here until the cut is the
         /// entry's.
@@ -446,8 +464,33 @@ impl TenantState {
             .or_insert_with(|| Entry::new(followed))
     }
 
+    /// A build a page waits on runs as normal work while it is the only one:
+    /// a lone build's few threads cannot take the CPU live delivery needs,
+    /// and on a host shared with other work the below class would give its
+    /// user's wait away to that work. Builds a page waits on that run beside
+    /// each other run below live delivery, which together they could starve.
+    fn retune_waited_builds(&self) {
+        let waited = self
+            .entries
+            .values()
+            .filter_map(|entry| match &entry.job {
+                Some(Job::Running { class, .. }) if class.get() != Class::Background => Some(class),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let class = if waited.len() > 1 {
+            Class::Below
+        } else {
+            Class::Normal
+        };
+        for work in waited {
+            work.set(class);
+        }
+    }
+
     /// Queues a build of `value` at `priority`, or raises the priority of one
-    /// already queued. A running build is left to finish.
+    /// already queued. A running build is left to finish, in the class of a
+    /// build a page waits on once one does.
     fn request_build(&mut self, value: &PartitionValue, priority: Priority) {
         let order = self.next_order;
         let followed = self.followed;
@@ -456,7 +499,12 @@ impl TenantState {
             .entry(value.clone())
             .or_insert_with(|| Entry::new(followed));
         match &mut entry.job {
-            Some(Job::Running { .. }) => {}
+            Some(Job::Running { class, .. }) => {
+                if class.get() == Class::Background && class.raise(priority.class()) {
+                    tracing::info!(target: "calque::tenants", tenant = %value, "a page waits on the tenant's build, which moves up");
+                    self.retune_waited_builds();
+                }
+            }
             Some(Job::Queued {
                 priority: queued_priority,
                 order: queued_order,
@@ -588,7 +636,7 @@ impl TenantState {
             }
         }
         entry.notify();
-        if compress {
+        if compress && !self.compress_queue.contains(value) {
             self.compress_queue.push_back(value.clone());
         }
         if rebuild {
@@ -600,6 +648,38 @@ impl TenantState {
             self.request_build(value, priority);
         }
         (retire, tail)
+    }
+
+    /// The tenant whose background stages run next, and its cut.
+    /// Until they run, a page that opens the tenant downloads the object its
+    /// build wrote, so the tenant opened last goes first; of tenants never
+    /// opened, the one queued first. A tenant with no current cut leaves the
+    /// queue.
+    fn next_compress(&mut self) -> Option<(PartitionValue, Cut)> {
+        let generation = self.generation();
+        let mut queued = std::mem::take(&mut self.compress_queue);
+        queued.retain(|value| {
+            self.entries
+                .get(value)
+                .is_some_and(|entry| entry.current(generation).is_some())
+        });
+        let next = queued
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, value)| {
+                (
+                    self.entries
+                        .get(*value)
+                        .and_then(|entry| entry.last_opened_ms),
+                    std::cmp::Reverse(*index),
+                )
+            })
+            .map(|(index, _)| index);
+        let value = next.and_then(|index| queued.remove(index));
+        self.compress_queue = queued;
+        let value = value?;
+        let cut = self.entry(&value).current(generation).cloned()?;
+        Some((value, cut))
     }
 
     /// The scope of one tenant under the generation in force.
@@ -683,6 +763,12 @@ enum DirectoryWrite {
         at_ms: i64,
         size_bytes: Option<u64>,
         warm: bool,
+        touched_at: u64,
+    },
+    /// A renewal: the tenant was used, and no open is counted.
+    Renewed {
+        tenant: String,
+        at_ms: i64,
         touched_at: u64,
     },
     Warmed {
@@ -898,12 +984,34 @@ fn spawn_directory_writer(
 const TOUCHED: &str =
     "touched_at = max(coalesce(tenants.touched_at, excluded.touched_at), excluded.touched_at)";
 
+fn record_last_opened(
+    transaction: &rusqlite::Transaction<'_>,
+    tenant: &str,
+    at_ms: i64,
+    touched_at: u64,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        &format!(
+            "INSERT INTO tenants (tenant, last_opened_ms, touched_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (tenant) DO UPDATE SET last_opened_ms = excluded.last_opened_ms,
+                {TOUCHED}"
+        ),
+        params![tenant, at_ms, signed(touched_at)],
+    )?;
+    Ok(())
+}
+
 fn apply_writes(connection: &mut Connection, batch: Vec<DirectoryWrite>) -> rusqlite::Result<()> {
     let transaction = connection.transaction()?;
     let mut flushed = Vec::new();
     for write in batch {
         match write {
             DirectoryWrite::Flush(done) => flushed.push(done),
+            DirectoryWrite::Renewed {
+                tenant,
+                at_ms,
+                touched_at,
+            } => record_last_opened(&transaction, &tenant, at_ms, touched_at)?,
             DirectoryWrite::Opened {
                 tenant,
                 at_ms,
@@ -911,14 +1019,7 @@ fn apply_writes(connection: &mut Connection, batch: Vec<DirectoryWrite>) -> rusq
                 warm,
                 touched_at,
             } => {
-                transaction.execute(
-                    &format!(
-                        "INSERT INTO tenants (tenant, last_opened_ms, touched_at) VALUES (?1, ?2, ?3)
-                         ON CONFLICT (tenant) DO UPDATE SET last_opened_ms = excluded.last_opened_ms,
-                            {TOUCHED}"
-                    ),
-                    params![tenant, at_ms, signed(touched_at)],
-                )?;
+                record_last_opened(&transaction, &tenant, at_ms, touched_at)?;
                 transaction.execute(
                     "INSERT INTO opens (at_ms, tenant, size_bytes, warm) VALUES (?1, ?2, ?3, ?4)",
                     params![
@@ -1110,6 +1211,7 @@ struct Started {
     build: u64,
     generation: u64,
     cancellation: CancellationToken,
+    class: WorkClass,
     priority: Priority,
     queued: Instant,
 }
@@ -1197,6 +1299,10 @@ struct Inner {
     head_readers: OffRuntime<Arc<LogReaders>>,
     cancellation: CancellationToken,
     metrics: OperationsMetrics,
+    /// The process's runtime, on which a build's thread schedules the next:
+    /// Linux starts a thread at its creator's niceness, and a lowered thread
+    /// cannot raise a build it starts.
+    runtime: tokio::runtime::Handle,
     directory: StdMutex<mpsc::Sender<DirectoryWrite>>,
     state: StdMutex<TenantState>,
     /// Held exclusively while a tenant's artifacts are retired or its cut
@@ -1247,6 +1353,12 @@ impl Tenants {
             .policy
             .partition()
             .ok_or(TenantError::NotPartitioned)?;
+        if !background_thread::lowered_threads_can_rise() {
+            tracing::warn!(
+                target: "calque::tenants",
+                "a build a request starts waiting on, or one left alone among waited builds, stays where it runs: this host does not let a lowered thread rise; set RLIMIT_NICE to 20 to allow it, as docker run --ulimit nice=20 does"
+            );
+        }
         let journal_root = journal_root(&config.builder.state_root);
         std::fs::create_dir_all(&journal_root)?;
         {
@@ -1396,6 +1508,7 @@ impl Tenants {
                 head_readers: OffRuntime(Some(Arc::clone(&config.log_readers.planners))),
                 cancellation: config.builder.cancellation,
                 metrics: config.builder.metrics,
+                runtime: tokio::runtime::Handle::current(),
                 directory: StdMutex::new(directory),
                 state: StdMutex::new(state),
                 publish_fence: RwLock::new(()),
@@ -1485,6 +1598,29 @@ impl Tenants {
                 "cold tenant answered"
             );
         }
+        Ok(())
+    }
+
+    /// Records that a page renewed its plan for `value`'s tenant, which keeps
+    /// the tenant warm as an open does. A renewal installs no artifact, so it
+    /// queues no build and waits on none.
+    pub(crate) fn renewed(
+        &self,
+        generation: u64,
+        value: &PartitionValue,
+    ) -> Result<(), BootstrapHttpError> {
+        let mut state = self.state();
+        if state.generation() != generation {
+            return Err(BootstrapHttpError::Unavailable);
+        }
+        let now = now_ms();
+        let entry = state.entry(value);
+        entry.last_opened_ms = Some(now);
+        self.write(DirectoryWrite::Renewed {
+            tenant: value.to_string(),
+            at_ms: now,
+            touched_at: entry.touched_at,
+        });
         Ok(())
     }
 
@@ -1767,6 +1903,7 @@ impl Tenants {
                     continue;
                 };
                 let cancellation = self.inner.cancellation.child_token();
+                let class = WorkClass::new(priority.class());
                 let build = state.next_build;
                 state.next_build += 1;
                 let entry = state.entry(&value);
@@ -1777,6 +1914,7 @@ impl Tenants {
                 entry.job = Some(Job::Running {
                     build,
                     cancellation: cancellation.clone(),
+                    class: class.clone(),
                     held_from: *self.inner.followed.borrow(),
                 });
                 state.running_builds += 1;
@@ -1786,17 +1924,15 @@ impl Tenants {
                     build,
                     generation,
                     cancellation,
+                    class,
                     priority,
                     queued,
                 });
             }
+            state.retune_waited_builds();
             if state.queue.is_empty() && !state.compressing {
-                let generation = state.generation();
-                while let Some(value) = state.compress_queue.pop_front() {
+                while let Some((value, cut)) = state.next_compress() {
                     let Some(prepared) = state.prepared_for(&value) else {
-                        continue;
-                    };
-                    let Some(cut) = state.entry(&value).current(generation).cloned() else {
                         continue;
                     };
                     state.compressing = true;
@@ -1827,6 +1963,13 @@ impl Tenants {
         }
     }
 
+    /// [`Self::schedule`] from a build's or a stage's thread, on the
+    /// process's runtime.
+    fn schedule_from_lane(&self) {
+        let tenants = self.clone();
+        self.inner.runtime.spawn(async move { tenants.schedule() });
+    }
+
     fn run_build(&self, started: Started) {
         let Started {
             value,
@@ -1834,15 +1977,14 @@ impl Tenants {
             build,
             generation,
             cancellation,
+            class,
             priority,
             queued,
         } = started;
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
+        class.enter("a tenant build");
+        let Ok(runtime) = class.build_runtime() else {
             self.finish_build(&value, build, generation, BuildEnd::Failed);
-            self.schedule();
+            self.schedule_from_lane();
             return;
         };
         let inner = &self.inner;
@@ -1850,6 +1992,7 @@ impl Tenants {
             target: "calque::tenants",
             tenant = %value,
             priority = priority.as_str(),
+            class = ?background_thread::current_thread_class(),
             queued_ms = queued.elapsed().as_millis() as u64,
             "tenant build started"
         );
@@ -1871,16 +2014,25 @@ impl Tenants {
                 &prepared,
                 &nonce[..16],
                 inner.settings.max_tenant_bytes,
+                Some(SharedBuildZstd::split_among(
+                    inner.settings.max_builds,
+                    inner
+                        .settings
+                        .compress_above_bytes
+                        .unwrap_or(DEFAULT_TENANT_COMPRESS_ABOVE_BYTES),
+                )),
                 Arc::clone(&inner.provider),
                 &inner.head_signal,
                 &mut catalog,
                 &inner.store,
                 &cancellation,
                 |stage| {
+                    class.enter("a tenant build");
                     tracing::info!(
                         target: "calque::tenants",
                         tenant = %value,
                         ?stage,
+                        class = ?background_thread::current_thread_class(),
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "tenant build stage entered"
                     );
@@ -1927,7 +2079,7 @@ impl Tenants {
                 retire_in(&mut catalog, retire);
             }
         });
-        self.schedule();
+        self.schedule_from_lane();
     }
 
     /// Records one build's end under the state lock, and returns the catalog
@@ -1950,15 +2102,19 @@ impl Tenants {
 
     fn run_compress(&self, value: PartitionValue, prepared: PreparedLocalSource, cut: Cut) {
         let inner = &self.inner;
+        lower_current_thread("a tenant's background stages");
         let outcome = (|| -> Result<(), String> {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
+            let runtime = current_thread_runtime().map_err(|error| error.to_string())?;
             let query = published_query_for(&prepared).map_err(|error| error.to_string())?;
             let cancellation = inner.cancellation.child_token();
             let generation = cut.generation;
             let started = Instant::now();
+            tracing::info!(
+                target: "calque::tenants",
+                tenant = %value,
+                decoded_bytes = cut.decoded_bytes,
+                "tenant background stages started"
+            );
             let (outcomes, replaced) = runtime
                 .block_on(reencode_leaving_replaced(
                     ReencodeRequest {
@@ -2007,7 +2163,7 @@ impl Tenants {
             tracing::warn!(target: "calque::tenants", tenant = %value, %error, "tenant background stages failed");
         }
         self.state().compressing = false;
-        self.schedule();
+        self.schedule_from_lane();
     }
 
     /// Reads the log after the directory's position for as long as the
@@ -2533,6 +2689,7 @@ mod tests {
         entry.job = Some(Job::Running {
             build: 0,
             cancellation: CancellationToken::new(),
+            class: WorkClass::new(Class::Background),
             held_from,
         });
         entry
@@ -2557,18 +2714,109 @@ mod tests {
         }
     }
 
-    /// What `schedule` does to start the next queued build.
-    fn start(state: &mut TenantState, build: u64) {
-        let (_, value) = state
+    fn opened_with_a_cut(
+        state: &mut TenantState,
+        tenant: i64,
+        opened: Option<i64>,
+    ) -> PartitionValue {
+        let value = PartitionValue::Int(tenant);
+        let generation = state.generation();
+        let mut entry = cut_at(1);
+        if let Some(cut) = entry.cut.as_mut() {
+            cut.generation = generation;
+        }
+        entry.last_opened_ms = opened;
+        state.entries.insert(value.clone(), entry);
+        state.compress_queue.push_back(value.clone());
+        value
+    }
+
+    #[test]
+    fn the_tenant_opened_last_is_compressed_first_and_one_without_a_cut_leaves_the_queue() {
+        let mut state = state();
+        let early = opened_with_a_cut(&mut state, 14, Some(10));
+        let never = opened_with_a_cut(&mut state, 15, None);
+        let late = opened_with_a_cut(&mut state, 13, Some(20));
+        let never_after = opened_with_a_cut(&mut state, 16, None);
+        let evicted = opened_with_a_cut(&mut state, 17, Some(30));
+        state.entries.get_mut(&evicted).unwrap().cut = None;
+
+        let order: Vec<_> =
+            std::iter::from_fn(|| state.next_compress().map(|(value, _)| value)).collect();
+        assert_eq!(order, [late, early, never, never_after]);
+        assert!(state.compress_queue.is_empty());
+    }
+
+    /// What `schedule` does to start the next queued build. Returns the
+    /// build's class.
+    fn start(state: &mut TenantState, build: u64) -> WorkClass {
+        let (priority, value) = state
             .queue
             .pop(Instant::now(), Duration::from_secs(60))
             .unwrap();
+        let class = WorkClass::new(priority.class());
         state.entry(&value).job = Some(Job::Running {
             build,
             cancellation: CancellationToken::new(),
+            class: class.clone(),
             held_from: 0,
         });
         state.running_builds += 1;
+        state.retune_waited_builds();
+        class
+    }
+
+    #[test]
+    fn a_build_runs_at_normal_priority_from_the_moment_a_page_waits_on_it() {
+        let mut state = state();
+        let (waited, warmed) = (PartitionValue::Int(1), PartitionValue::Int(2));
+        state.request_build(&waited, Priority::Waiting);
+        let waited_class = start(&mut state, 0);
+        assert_eq!(waited_class.get(), Class::Normal);
+        state.request_build(&waited, Priority::Refresh);
+        assert_eq!(waited_class.get(), Class::Normal);
+
+        for priority in [Priority::Warm, Priority::Refresh] {
+            state.request_build(&warmed, priority);
+            let class = start(&mut state, 1);
+            assert_eq!(class.get(), Class::Background);
+            state.request_build(&warmed, Priority::Refresh);
+            assert_eq!(class.get(), Class::Background);
+            state.request_build(&warmed, Priority::Waiting);
+            assert_eq!(class.get(), Class::Below);
+            assert_eq!(waited_class.get(), Class::Below);
+            state.entry(&warmed).job = None;
+            state.retune_waited_builds();
+            assert_eq!(waited_class.get(), Class::Normal);
+        }
+    }
+
+    #[test]
+    fn builds_a_page_waits_on_go_below_delivery_only_beside_each_other() {
+        let mut state = state();
+        let (first, second, warmed) = (
+            PartitionValue::Int(1),
+            PartitionValue::Int(2),
+            PartitionValue::Int(3),
+        );
+        state.request_build(&warmed, Priority::Warm);
+        let warm_class = start(&mut state, 0);
+        state.request_build(&first, Priority::Waiting);
+        let first_class = start(&mut state, 1);
+        assert_eq!(
+            first_class.get(),
+            Class::Normal,
+            "a background build is not beside it"
+        );
+        state.request_build(&second, Priority::Waiting);
+        let second_class = start(&mut state, 2);
+        assert_eq!(first_class.get(), Class::Below);
+        assert_eq!(second_class.get(), Class::Below);
+        assert_eq!(warm_class.get(), Class::Background);
+        state.entry(&second).job = None;
+        state.retune_waited_builds();
+        assert_eq!(first_class.get(), Class::Normal);
+        assert_eq!(warm_class.get(), Class::Background);
     }
 
     #[test]

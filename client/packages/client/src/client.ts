@@ -1,6 +1,6 @@
 import type { SyncAuth } from "./bootstrap-start.js";
 import { SyncError } from "./error.js";
-import type { MutationResult, MutationStatus } from "./mutation.js";
+import type { MutationAccepted, MutationStatus } from "./mutation.js";
 import { publicColumnarClient } from "./columnar/public-columnar-client.js";
 import { ColumnarSession } from "./columnar/session.js";
 import {
@@ -227,11 +227,13 @@ export interface SyncClient<
   ) => () => void;
   /**
    * Resends an `ambiguous` or `retryable` mutation under its original id, so
-   * a server that already committed it answers from its receipt. Resolves at
-   * once for a mutation already `canonical`; rejects with `MUTATION_REJECTED`
-   * when there is nothing to resend, as after a `reset()`.
+   * a server that already committed it answers from its receipt, and settles
+   * as a write's call does. While the client is resending it on its own, its
+   * waiting resend goes at once. Resolves at once for a mutation already
+   * `canonical`; rejects with `MUTATION_REJECTED` when there is nothing to
+   * resend, as after a `reset()`.
    */
-  readonly retryMutation: (mutationId: string) => Promise<MutationResult>;
+  readonly retryMutation: (mutationId: string) => Promise<MutationAccepted>;
   /**
    * Resolves once the client is ready; from the `error` state it runs
    * `reset()` instead. Rejects with the status's error if the client fails or
@@ -258,6 +260,10 @@ export interface InternalSyncClientOptions extends SyncClientOptions {
    * which `createSyncClient` derives from the budget.
    */
   readonly clientHeapReserveBytes: number;
+  /** How many times an undecided write is resent before its call rejects. */
+  readonly automaticMutationResends?: number;
+  /** The wait before the first resend after a lost response. */
+  readonly mutationResendDelayMs?: number;
 }
 
 /**

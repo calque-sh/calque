@@ -89,9 +89,8 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # @calque/worker, @calque/client, and @calque/react all run part or all
-      # of their vitest suite in browser mode (chromium; @calque/client also needs
-      # firefox for its unsupported-browser project), so the Playwright browsers must
-      # be present before any test step runs.
+      # of their vitest suite in browser mode, in Chromium and Firefox, so the
+      # Playwright browsers must be present before any test step runs.
       - name: Install Playwright browsers
         run: pnpm exec playwright install --with-deps chromium firefox
 

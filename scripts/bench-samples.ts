@@ -11,8 +11,9 @@ import type { Verdict } from "./bench-results.ts";
 export const RETAKES = 3;
 
 /**
- * How far Chrome's wall clock may move against its monotonic clock during a
- * probe before the probe stops trusting its frame mapping.
+ * How far Chrome's wall clock may move against its monotonic clock between a
+ * probe's start and its match before the probe stops trusting its frame
+ * mapping.
  */
 const WALL_DRIFT_LIMIT_MS = 5;
 
@@ -156,8 +157,8 @@ export function coldInvalidity(
  * Why a probe is `INVALID_RUN`, if it is. Its frames map to the probe's clock
  * through the offset read when the page loaded, moved by the wall clock's
  * drift read as the probe began, so Chrome's wall clock drifting from its
- * monotonic clock during the probe fails a clock check too, and so does the
- * host sleeping since the previous probe.
+ * monotonic clock before the probe's match fails a clock check too, and so
+ * does the host sleeping since the previous probe.
  */
 export function probeInvalidity(
   judgement: HoldJudgement,
@@ -188,7 +189,7 @@ export function probeInvalidity(
     ...(Math.abs(checks.wallDriftMs) > WALL_DRIFT_LIMIT_MS
       ? [
           {
-            reason: `Chrome's wall clock moved ${checks.wallDriftMs.toFixed(1)} ms against its monotonic clock during the probe`,
+            reason: `Chrome's wall clock moved ${checks.wallDriftMs.toFixed(1)} ms against its monotonic clock before the probe's match`,
             instrument: true,
           },
         ]

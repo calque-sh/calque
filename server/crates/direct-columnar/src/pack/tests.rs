@@ -21,6 +21,16 @@ fn restores(body: &[u8], artifact: &[u8]) {
     assert!(unpack(body, artifact.len() as u64).unwrap() == artifact);
 }
 
+/// A packed body's section ends rise to its length.
+fn ends_rise_to_the_body(packed: &Packed) {
+    if packed.stored {
+        assert!(packed.part_ends.is_empty());
+        return;
+    }
+    assert!(packed.part_ends.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert_eq!(packed.part_ends.last(), Some(&packed.body.len()));
+}
+
 /// Packs `artifact` under the frozen rule and with every eligible column
 /// transformed, checks that both bodies restore it, and returns the second.
 fn round_trip(artifact: &[u8]) -> Packed {
@@ -28,11 +38,13 @@ fn round_trip(artifact: &[u8]) -> Packed {
     assert!(frozen.body.len() <= artifact.len());
     assert_eq!(frozen.stored, frozen.body == artifact);
     restores(&frozen.body, artifact);
+    ends_rise_to_the_body(&frozen);
     assert!(pack(artifact).unwrap() == frozen);
 
     let every = pack_under(artifact, Rule::Every).unwrap();
     assert!(every.body.starts_with(BODY_MAGIC));
     restores(&every.body, artifact);
+    ends_rise_to_the_body(&every);
     for column in &every.columns {
         assert_eq!(column.transform, column.considered);
     }

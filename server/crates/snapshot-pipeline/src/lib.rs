@@ -33,7 +33,8 @@ use representations::ZstdWhileWriting;
 pub use representations::{
     encode_brotli_large_window_controlled, encode_packed_brotli_large_window_controlled,
     pack_artifact_controlled, reencode_zstd_controlled, PackedArtifact, PreparedRepresentation,
-    PreparedRepresentations, RepresentationError, BROTLI_QUALITY, REENCODED_ZSTD_LEVEL,
+    PreparedRepresentations, RepresentationError, SharedBuildZstd, BROTLI_QUALITY,
+    REENCODED_ZSTD_LEVEL, REPLACED_ZSTD_LEVEL,
 };
 pub(crate) use watchdog::{
     SnapshotLifecycleWatchdog, SnapshotPressureMonitor, SnapshotWatchdogState,
@@ -46,7 +47,10 @@ pub use watchdog::{
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -104,6 +108,9 @@ pub struct SnapshotPublicationRequest {
     /// cleanup before control returns to the lifecycle supervisor.
     pub publication_cleanup_timeout: Duration,
     pub max_encoded_representation_bytes: u64,
+    /// How the zstd object is written when other builds run beside this
+    /// one. `None` for a build that runs alone.
+    pub shared_build_zstd: Option<SharedBuildZstd>,
     /// `None` publishes once everything else holds.
     pub admission: Option<PublicationAdmission>,
 }
@@ -146,7 +153,8 @@ pub(crate) enum SnapshotPublicationPhase {
 /// Publishes a direct-columnar build once its cut is proven: writes the
 /// artifact at the proof's cursor and checks it, prepares and verifies its
 /// representations, uploads them, and crosses the catalog's `PUBLISHED`
-/// boundary.
+/// boundary. While it writes and encodes the artifact, `on_progress` runs
+/// every `progress_interval` in which the write or the encode advanced.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn publish_direct_with_proven_cut_before_publish_controlled<
     S: BlobStore + ?Sized,
@@ -159,6 +167,8 @@ pub(crate) async fn publish_direct_with_proven_cut_before_publish_controlled<
     cancellation: &CancellationToken,
     before_publish: BeforePublishFuture<'_>,
     mut on_phase: impl FnMut(SnapshotPublicationPhase) -> Result<(), SnapshotBuildProgressError>,
+    progress_interval: Duration,
+    on_progress: impl FnMut(),
 ) -> Result<SnapshotPublicationReport, SnapshotPublicationError> {
     validate_request(&request)?;
     ensure_not_cancelled(cancellation)?;
@@ -167,17 +177,22 @@ pub(crate) async fn publish_direct_with_proven_cut_before_publish_controlled<
     let artifact_request = request.artifact.clone();
     let cut_proof = proof.clone();
     let max_encoded_bytes = request.max_encoded_representation_bytes;
-    let encode_cancellation = cancellation.clone();
+    let directory = build
+        .artifact_path()
+        .parent()
+        .ok_or(RepresentationError::MissingParentDirectory)?
+        .to_path_buf();
     // The zstd representation is encoded from the artifact's bytes as they
     // are written, on the encoder's own workers, rather than from the file
     // afterwards.
-    let (at_cut, finalization_micros, prepared) = tokio::task::spawn_blocking(move || {
-        let directory = build
-            .artifact_path()
-            .parent()
-            .ok_or(RepresentationError::MissingParentDirectory)?
-            .to_path_buf();
-        let mut zstd = ZstdWhileWriting::new(&directory, max_encoded_bytes, &encode_cancellation);
+    let mut zstd = ZstdWhileWriting::new(
+        &directory,
+        max_encoded_bytes,
+        request.shared_build_zstd,
+        cancellation,
+    );
+    let progress = zstd.progress();
+    let finalization = tokio::task::spawn_blocking(move || {
         let at_cut = match build.finish_at_cut(&cut_proof, artifact_request, &mut zstd) {
             Ok(at_cut) => at_cut,
             Err(error) => {
@@ -194,9 +209,11 @@ pub(crate) async fn publish_direct_with_proven_cut_before_publish_controlled<
             at_cut.decoded_sha256(),
         )?;
         Ok::<_, SnapshotPublicationError>((at_cut, finalization_micros, prepared))
-    })
-    .await
-    .map_err(SnapshotPublicationError::FinalizationTask)??;
+    });
+    let (at_cut, finalization_micros, prepared) =
+        await_progressing(finalization, &progress, progress_interval, on_progress)
+            .await
+            .map_err(SnapshotPublicationError::FinalizationTask)??;
     ensure_not_cancelled(cancellation)?;
 
     let decoded_sha256 = at_cut.decoded_sha256().to_owned();
@@ -231,6 +248,33 @@ pub(crate) async fn publish_direct_with_proven_cut_before_publish_controlled<
         finalization_micros,
         upload_and_publish_micros,
     })
+}
+
+/// Awaits `work`, calling `on_progress` at most once per `interval`, and only
+/// when `progress` moved since the last call: work that slows down keeps
+/// its build alive, and work that stops does not.
+async fn await_progressing<T>(
+    work: impl Future<Output = T>,
+    progress: &AtomicU64,
+    interval: Duration,
+    mut on_progress: impl FnMut(),
+) -> T {
+    tokio::pin!(work);
+    let mut ticks = tokio::time::interval(interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut seen = progress.load(Ordering::Relaxed);
+    loop {
+        tokio::select! {
+            output = &mut work => return output,
+            _ = ticks.tick() => {
+                let now = progress.load(Ordering::Relaxed);
+                if now != seen {
+                    seen = now;
+                    on_progress();
+                }
+            }
+        }
+    }
 }
 
 // Test-only proof for catalog upload idempotency. Production recovery
@@ -741,6 +785,57 @@ mod tests {
     use artifact_contract::ValidatedArtifactManifest;
     use blob_store::{BlobStore, LocalFilesystemBlobStore};
     use sha2::{Digest, Sha256};
+
+    /// Work that advances `progress` once a second for `advancing` seconds,
+    /// then stalls until it is cancelled or `stalled` seconds pass.
+    async fn work_that_stalls(
+        progress: Arc<AtomicU64>,
+        advancing: u64,
+        stalled: u64,
+        cancellation: CancellationToken,
+    ) -> bool {
+        for _ in 0..advancing {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            progress.fetch_add(1, Ordering::Relaxed);
+        }
+        tokio::select! {
+            () = cancellation.cancelled() => false,
+            () = tokio::time::sleep(Duration::from_secs(stalled)) => true,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finalization_that_advances_outlives_the_no_progress_timeout_and_one_that_stalls_does_not(
+    ) {
+        let timeout = Duration::from_secs(2);
+        let config = SnapshotWatchdogConfig::new(Duration::from_secs(600), timeout).unwrap();
+
+        // Ten seconds of slow progress, then a second's pause, then done.
+        let cancellation = CancellationToken::new();
+        let watchdog = SnapshotLifecycleWatchdog::spawn(config, cancellation.clone(), None);
+        let progress = Arc::new(AtomicU64::new(0));
+        let work = work_that_stalls(Arc::clone(&progress), 10, 1, cancellation.clone());
+        let finished =
+            await_progressing(work, &progress, timeout / 4, || watchdog.heartbeat()).await;
+        assert!(finished);
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(watchdog.latest().failure_reason, None);
+
+        // Three seconds of progress, then a stall longer than the timeout.
+        let cancellation = CancellationToken::new();
+        let watchdog = SnapshotLifecycleWatchdog::spawn(config, cancellation.clone(), None);
+        let progress = Arc::new(AtomicU64::new(0));
+        let started = tokio::time::Instant::now();
+        let work = work_that_stalls(Arc::clone(&progress), 3, 600, cancellation.clone());
+        let finished =
+            await_progressing(work, &progress, timeout / 4, || watchdog.heartbeat()).await;
+        assert!(!finished);
+        assert_eq!(
+            watchdog.latest().failure_reason,
+            Some(SnapshotWatchdogFailureReason::NoProgress)
+        );
+        assert!(started.elapsed() < Duration::from_secs(3) + timeout * 2);
+    }
 
     struct HangingCleanupStore;
 

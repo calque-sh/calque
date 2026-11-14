@@ -48,6 +48,21 @@ type MutationResultFor<State extends MutationState> = Extract<
 >;
 
 /**
+ * What a write's call resolves with: the server committed the write, or had
+ * committed it before under the same id. The page shows it optimistically
+ * until PostgreSQL's change reaches the client.
+ */
+export type MutationAccepted = MutationResultFor<
+  "awaiting_canonical_echo" | "already_canonical"
+>;
+
+/** The rule a write broke, as the server named it, on `MUTATION_CONFLICT`. */
+export type MutationConflict = Extract<
+  MutationResult,
+  { readonly state: "conflict" }
+>["conflict"];
+
+/**
  * Where one mutation stands, as `SyncClient.mutationStatus` reports it.
  * `collection` and `key` name the row it writes: the key columns as the
  * facade took them, with a uuid as lowercase text.
@@ -122,11 +137,25 @@ export function freezeMutationStatus<Status extends MutationStatus>(
   return Object.freeze(status);
 }
 
-/** A `SyncError` from one mutation, carrying its `mutationId`. */
+/** The codes a `MutationSubmissionError` carries. */
+export type MutationSubmissionErrorCode = MutationSubmissionError["code"];
+
+/**
+ * A `SyncError` from one mutation, carrying its `mutationId`, and on
+ * `MUTATION_CONFLICT` the `conflict` the server named.
+ */
 export class MutationSubmissionError extends SyncError {
   declare readonly code:
-    "AUTH_FAILED" | "MUTATION_AMBIGUOUS" | "MUTATION_REJECTED";
+    | "AUTH_FAILED"
+    | "MUTATION_AMBIGUOUS"
+    | "MUTATION_CONFLICT"
+    | "MUTATION_REJECTED";
   readonly mutationId: string;
+  /**
+   * The rule a `MUTATION_CONFLICT` broke, as the server's command named it;
+   * `undefined` for every other code.
+   */
+  declare readonly conflict: MutationConflict | undefined;
 
   /**
    * The recovery follows from `code`, unless `options.recovery` sets it to
@@ -135,9 +164,12 @@ export class MutationSubmissionError extends SyncError {
    */
   constructor(
     mutationId: string,
-    code: "AUTH_FAILED" | "MUTATION_AMBIGUOUS" | "MUTATION_REJECTED",
+    code: MutationSubmissionErrorCode,
     message: string,
-    options?: ErrorOptions & { readonly recovery?: "none" },
+    options?: ErrorOptions & {
+      readonly recovery?: "none";
+      readonly conflict?: MutationConflict;
+    },
   ) {
     assertMutationId(mutationId);
     const classification = mutationSubmissionClassification(code);
@@ -150,6 +182,8 @@ export class MutationSubmissionError extends SyncError {
     );
     this.name = "MutationSubmissionError";
     this.mutationId = mutationId;
+    if (options?.conflict)
+      this.conflict = Object.freeze({ ...options.conflict });
     Object.freeze(this);
   }
 }
@@ -163,6 +197,7 @@ function mutationSubmissionClassification(code: SyncError["code"]): {
       return { scope: "auth", recovery: "reset" };
     case "MUTATION_AMBIGUOUS":
       return { scope: "mutation", recovery: "retry" };
+    case "MUTATION_CONFLICT":
     case "MUTATION_REJECTED":
       return { scope: "mutation", recovery: "none" };
     default:

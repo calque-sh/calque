@@ -1,8 +1,8 @@
 //! A direct-columnar build against a live PostgreSQL: it publishes exactly the
 //! rows at its cut, and an interrupted build leaves nothing visible.
 //!
-//! The supervisor's stage observer runs right after each durable transition,
-//! so it places writes exactly: at `RollingForward` the stream has started and
+//! The supervisor's stage observer runs right after each stage transition, so
+//! it places writes exactly: at `RollingForward` the stream has started and
 //! the cut marker is not yet emitted, and at `Copying` the cut is behind the
 //! build and COPY has not started.
 
@@ -486,6 +486,7 @@ impl Fixture {
                 catalog_lease_renewal_interval: Duration::from_secs(5),
                 publication_cleanup_timeout: Duration::from_secs(10),
                 max_encoded_representation_bytes: 16 * 1024 * 1024,
+                shared_build_zstd: None,
                 admission: None,
             },
         })

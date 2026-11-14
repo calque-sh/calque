@@ -18,12 +18,11 @@ import {
   makeRebuildableClient,
   settled,
 } from "./session.fixture.js";
+import { stubBrowserFeatures } from "../browser.fixture.js";
 
 describe("direct-columnar session", () => {
   beforeEach(() => {
-    vi.stubGlobal("navigator", {
-      userAgentData: { brands: [{ brand: "Chromium" }] },
-    });
+    stubBrowserFeatures();
   });
 
   afterEach(() => {

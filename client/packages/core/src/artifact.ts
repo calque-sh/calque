@@ -2471,7 +2471,8 @@ export function receiveDirectColumnarArtifact(
 /**
  * Interprets an artifact whose bytes are verified from the first one up to
  * the end `advance` is given: the header once that end covers it, then each
- * table, in order, once it covers the table's parts. It reads no byte at or
+ * table's columns, in order, each once it covers the column's parts, and a
+ * table's key index once its key columns are read. It reads no byte at or
  * past that end. The first error stops it, and `finish` throws it; otherwise
  * `finish`, called once every byte is verified, interprets the rest.
  */
@@ -2535,16 +2536,28 @@ function interpret(
     return header;
   };
 
-  /** Where the last of a table's parts ends, counted from the first byte. */
-  const tableEnd = (table: TableDefinition): number => {
+  /** Where the last of a column's parts ends, counted from the first byte. */
+  const columnEnd = (column: ColumnDefinition): number => {
     let end = payloadStart;
-    for (const column of table.columns)
-      for (const part of column.parts)
-        end = Math.max(end, payloadStart + part.offset + part.length);
+    for (const part of column.parts)
+      end = Math.max(end, payloadStart + part.offset + part.length);
     return end;
   };
 
-  const addTable = (current: HeaderDefinition, tableIndex: number): void => {
+  /** The table being read: its columns so far, and its key index once built. */
+  interface Building {
+    readonly table: TableDefinition;
+    readonly expectedSchema: DirectColumnarSchema["tables"][number];
+    readonly columns: Map<string, ArtifactColumn>;
+    read: number;
+    slots: Uint32Array | undefined;
+  }
+  let building: Building | undefined;
+
+  const startTable = (
+    current: HeaderDefinition,
+    tableIndex: number,
+  ): Building => {
     const table = current.tables[tableIndex];
     const expectedSchema = trustedSchema.tables[tableIndex];
     if (!table || !expectedSchema)
@@ -2556,29 +2569,16 @@ function interpret(
       !sameValues(table.primaryKey, expectedSchema.primaryKey)
     )
       throw new Error("invalid direct-columnar table");
-    const columns = new Map<string, ArtifactColumn>();
-    for (
-      let columnIndex = 0;
-      columnIndex < table.columns.length;
-      columnIndex++
-    ) {
-      const column = table.columns[columnIndex];
-      const expectedColumn = expectedSchema.columns[columnIndex];
-      if (!column || !expectedColumn)
-        throw new Error("direct-columnar schema binding mismatch");
-      if (
-        expectedColumn.name !== column.name ||
-        expectedColumn.type !== column.type ||
-        expectedColumn.nullable !== column.nullable ||
-        columns.has(column.name)
-      )
-        throw new Error("direct-columnar schema binding mismatch");
-      columns.set(
-        column.name,
-        loadColumn(bytes, payloadStart, table.rows, column, occupied, timing),
-      );
-    }
-    mark(`artifact:columns:${table.name}`);
+    return {
+      table,
+      expectedSchema,
+      columns: new Map(),
+      read: 0,
+      slots: undefined,
+    };
+  };
+
+  const indexKeys = ({ table, columns }: Building): Uint32Array => {
     const keyColumns = table.primaryKey.map((field) => {
       const column = columns.get(field);
       const key = column && KEY_COLUMNS.get(column);
@@ -2588,6 +2588,40 @@ function interpret(
     const started = now();
     const slots = buildKeyIndex(table.rows, keyColumns);
     timing.keysMs += now() - started;
+    mark(`artifact:index:${table.name}`);
+    return slots;
+  };
+
+  /**
+   * Reads the table's next column, and builds the key index as soon as the
+   * key columns are read rather than after the table's last column.
+   */
+  const readColumn = (state: Building): void => {
+    const { table, expectedSchema, columns } = state;
+    const column = table.columns[state.read];
+    const expectedColumn = expectedSchema.columns[state.read];
+    if (!column || !expectedColumn)
+      throw new Error("direct-columnar schema binding mismatch");
+    if (
+      expectedColumn.name !== column.name ||
+      expectedColumn.type !== column.type ||
+      expectedColumn.nullable !== column.nullable ||
+      columns.has(column.name)
+    )
+      throw new Error("direct-columnar schema binding mismatch");
+    columns.set(
+      column.name,
+      loadColumn(bytes, payloadStart, table.rows, column, occupied, timing),
+    );
+    state.read += 1;
+    if (!state.slots && table.primaryKey.every((field) => columns.has(field)))
+      state.slots = indexKeys(state);
+  };
+
+  const finishTable = (state: Building): void => {
+    const { table, expectedSchema, columns } = state;
+    mark(`artifact:columns:${table.name}`);
+    const slots = state.slots ?? indexKeys(state);
     const indexAt = (slot: number) => at(slots, slot) - 1;
     const primaryKeyColumns = table.primaryKey.map((field) => {
       const column = expectedSchema.columns.find(
@@ -2644,9 +2678,14 @@ function interpret(
       const current = readHeader(verified);
       if (!current) return;
       while (next < current.tables.length) {
-        const table = current.tables[next];
-        if (table && tableEnd(table) > verified) return;
-        addTable(current, next);
+        const state = (building ??= startTable(current, next));
+        while (state.read < state.table.columns.length) {
+          const column = state.table.columns[state.read];
+          if (column && columnEnd(column) > verified) return;
+          readColumn(state);
+        }
+        finishTable(state);
+        building = undefined;
         next += 1;
       }
     } catch (error) {

@@ -1,6 +1,6 @@
 {
   "name": "@calque/config",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "calque-bindings: renders a Calque configuration into typed @calque/client bindings.",
   "license": "Apache-2.0",
   "repository": {
@@ -12,7 +12,7 @@
     "access": "public"
   },
   "engines": {
-    "node": ">=22.15.0"
+    "node": "^22.23.4 || ^24.22.1 || >=26.12.1"
   },
   "type": "module",
   "bin": {

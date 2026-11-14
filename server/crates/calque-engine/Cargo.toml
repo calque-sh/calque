@@ -70,12 +70,15 @@ uuid = { version = "1.23.0", features = ["v4"] }
 brotli = { workspace = true }
 canonical-log = { path = "../canonical-log", features = ["test-support"] }
 dataset-grant-issuer = { path = "../dataset-grant-issuer" }
+postgres-connect = { path = "../postgres-connect", features = ["test-relay"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 snapshot-pipeline = { path = "../snapshot-pipeline", features = ["test-support"] }
 # The change tail's tests read the frames a build writes, as a client would.
 sync-protocol = { path = "../sync-protocol", features = ["test-support"] }
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
+# The refused-request tests read the warnings the middleware logs.
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt"] }
 # The re-encode tests decode the objects they publish, as a client would.
 zstd = { version = "0.13.3", default-features = false }
 

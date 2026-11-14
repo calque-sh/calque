@@ -32,12 +32,12 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import process from "node:process";
-import type { Browser, Page } from "playwright";
 import {
   loadSigningKey,
   mintTenantOrder,
   type TenantAction,
-} from "../client/examples/grant-issuer/dataset-grant.mts";
+} from "@calque/grant";
+import type { Browser, Page } from "playwright";
 import {
   buildServeBinaries,
   ensurePostgresContainer,
@@ -103,6 +103,7 @@ interface TenantReport {
 const runId = randomUUID().replaceAll("-", "").slice(0, 12);
 const workDirectory = join(root, "target/serve-tenants-e2e", runId);
 const pageRoot = join(root, "target/client-serve-tenants");
+const calqueGrantBin = join(root, "client/packages/grant/bin/calque-grant.js");
 const container =
   process.env.CALQUE_SERVE_TENANTS_E2E_CONTAINER ?? "calque-servetenants-pg18";
 const postgresPort =
@@ -348,11 +349,11 @@ async function main(): Promise<unknown> {
       "utf8",
     ),
   ) as {
-    sources: { connectionEnv: string; slot: string; publication: string }[];
+    sources: { databaseUrlEnv: string; slot: string; publication: string }[];
   };
   const [source] = manifest.sources;
   if (!source) throw new Error("the tenants fixture declares no source");
-  source.connectionEnv = DATABASE_ENV;
+  source.databaseUrlEnv = DATABASE_ENV;
   source.slot = runSlot;
   source.publication = runPublication;
   writeFileSync(configPath, `${JSON.stringify(manifest, null, 2)}\n`);
@@ -362,7 +363,7 @@ async function main(): Promise<unknown> {
   psql(SEED_SQL);
 
   // `calque-dev-grant` creates the key and mints tenant 1's grant; the Node
-  // example mints tenant 2's and signs the tenant orders, so `calque serve`
+  // package mints tenant 2's and signs the tenant orders, so `calque serve`
   // verifies what no Rust code signed.
   const keyFile = join(workDirectory, "grant-key.pk8");
   const mint = (
@@ -389,13 +390,7 @@ async function main(): Promise<unknown> {
       ]),
     ) as { token: string; verificationKeyEnvironment: unknown };
   const grantOne = mint([join(binaries, "calque-dev-grant")], 1);
-  const grantTwo = mint(
-    [
-      process.execPath,
-      join(root, "client/examples/grant-issuer/mint-grant.mts"),
-    ],
-    2,
-  );
+  const grantTwo = mint([process.execPath, calqueGrantBin, "mint"], 2);
   const signingKey = loadSigningKey(readFileSync(keyFile));
   const order = (action: TenantAction, tenant: number): string => {
     const now = Math.floor(Date.now() / 1000);

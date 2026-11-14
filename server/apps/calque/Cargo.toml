@@ -1,6 +1,6 @@
 [package]
 name = "calque"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -50,6 +50,9 @@ workspace = true
 # The object-store probe's fault doubles implement `blob_store::BlobStore`,
 # which is an `#[async_trait]` trait.
 async-trait = "0.1.89"
+# The tenant suite asks whether this host lets a lowered thread rise again,
+# as a waited-on build does.
+background-thread = { path = "../../crates/background-thread" }
 # The remedy tests build the refusal of a canonical log an earlier release
 # wrote, which reaches this crate only inside `calque_engine`'s errors.
 canonical-log = { path = "../../crates/canonical-log" }

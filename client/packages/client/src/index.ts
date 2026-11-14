@@ -50,7 +50,10 @@ export type {
 } from "./facade/types.js";
 export { MutationSubmissionError } from "./mutation.js";
 export type {
+  MutationAccepted,
+  MutationConflict,
   MutationResult,
   MutationState,
   MutationStatus,
+  MutationSubmissionErrorCode,
 } from "./mutation.js";

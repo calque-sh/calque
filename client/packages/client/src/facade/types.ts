@@ -1,4 +1,4 @@
-import type { MutationResult } from "../mutation.js";
+import type { MutationAccepted } from "../mutation.js";
 import type { LiveQueryResource } from "../resource.js";
 
 /**
@@ -430,21 +430,30 @@ type InsertMethod<Insert> = [Insert] extends [never]
       /**
        * Inserts `row`, which carries every column: a nullable one takes
        * `null` when it has no value. No PostgreSQL column default applies.
+       * Resolves once the server commits it; rejects with a
+       * `MutationSubmissionError` when the server refuses it.
        */
-      readonly insert: (row: Insert) => Promise<MutationResult>;
+      readonly insert: (row: Insert) => Promise<MutationAccepted>;
     };
 
 type UpdateMethod<Key, Patch> = [Patch] extends [never]
   ? object
   : {
-      /** Sets the writable columns `patch` names on the row with `key`. */
-      readonly update: (key: Key, patch: Patch) => Promise<MutationResult>;
+      /**
+       * Sets the writable columns `patch` names on the row with `key`.
+       * Resolves once the server commits it; rejects with a
+       * `MutationSubmissionError` when the server refuses it.
+       */
+      readonly update: (key: Key, patch: Patch) => Promise<MutationAccepted>;
     };
 
 type DeleteMethod<Key, Delete> = Delete extends true
   ? {
-      /** Deletes the row with `key`. */
-      readonly delete: (key: Key) => Promise<MutationResult>;
+      /**
+       * Deletes the row with `key`. Resolves once the server commits it;
+       * rejects with a `MutationSubmissionError` when the server refuses it.
+       */
+      readonly delete: (key: Key) => Promise<MutationAccepted>;
     }
   : object;
 

@@ -20,35 +20,34 @@
  * pnpm, and Playwright's Chromium.
  */
 import assert from "node:assert/strict";
-import {
-  spawn,
-  spawnSync,
-  type ChildProcess,
-  type SpawnSyncReturns,
-} from "node:child_process";
+import { spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID, X509Certificate } from "node:crypto";
 import {
-  closeSync,
   copyFileSync,
   existsSync,
   mkdirSync,
-  openSync,
   readFileSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { connect as tcpConnect } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import process from "node:process";
-import type { Readable } from "node:stream";
 import { connect as tlsConnect, type DetailedPeerCertificate } from "node:tls";
-import { fileURLToPath } from "node:url";
-import type { Browser, Page, Request } from "playwright";
+import type { Browser } from "playwright";
 
+import { expectTasks, watchRequests } from "./lib/doc-walk-browser.ts";
 import { docShellBlocks } from "./lib/doc-walk.ts";
-
-const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+import {
+  listening,
+  logTail,
+  readerEnvironment,
+  root,
+  run,
+  runBlocks,
+  startBlock,
+  stopGroup,
+  succeed,
+} from "./lib/doc-walk-run.ts";
 const COMPOSE_FILE = "docker-compose.selfhost.yml";
 const STOP = "## Tearing it down";
 const PAGE_START = "pnpm --filter @calque/quickstart dev";
@@ -64,7 +63,7 @@ const START_MODULE = "client/examples/quickstart/calque.start.generated.ts";
 /** What the walk writes to the repository root, all deleted by teardown. */
 const WALK_FILES = [
   "grant.json",
-  "grant-key.pk8",
+  "grant-key.pem",
   "calque.inspection.json",
   "calque.config.json",
   "caddy-root.crt",
@@ -73,8 +72,6 @@ const WALK_FILES = [
 // build has a bound of its own.
 const WALK_TIMEOUT_MS = 45 * 60_000;
 const PAGE_START_TIMEOUT_MS = 60_000;
-const CHANGE_TIMEOUT_MS = 60_000;
-const STOP_GRACE_MS = 5_000;
 
 const runId = randomUUID().replaceAll("-", "").slice(0, 12);
 const workDirectory = join(root, "target/quickstart-e2e", runId);
@@ -103,15 +100,6 @@ interface RunOutcome {
   readonly postgresStartupRefusalsExempted: number;
 }
 
-/** The shell a reader starts from: this environment without `CALQUE_*`. */
-function readerEnvironment(): NodeJS.ProcessEnv {
-  const environment: NodeJS.ProcessEnv = {};
-  for (const [name, value] of Object.entries(process.env))
-    if (!name.startsWith("CALQUE_") && value !== undefined)
-      environment[name] = value;
-  return environment;
-}
-
 /**
  * Compose interpolates the whole file for every command, `down` and `config`
  * included, and refuses while one of its `${NAME:?}` variables is unset. Their
@@ -124,33 +112,6 @@ function composeEnvironment(): NodeJS.ProcessEnv {
   for (const [, name] of composition.matchAll(/\$\{([A-Z0-9_]+):\?/gu))
     if (name !== undefined) environment[name] = "/dev/null";
   return environment;
-}
-
-function run(
-  command: string,
-  args: readonly string[],
-  options: { readonly env?: NodeJS.ProcessEnv; readonly input?: string } = {},
-): SpawnSyncReturns<string> {
-  return spawnSync(command, [...args], {
-    cwd: root,
-    encoding: "utf8",
-    env: options.env ?? readerEnvironment(),
-    ...(options.input === undefined ? {} : { input: options.input }),
-    maxBuffer: 64 * 1024 * 1024,
-  });
-}
-
-function succeed(
-  command: string,
-  args: readonly string[],
-  options: { readonly env?: NodeJS.ProcessEnv; readonly input?: string } = {},
-): string {
-  const result = run(command, args, options);
-  if (result.status !== 0)
-    throw new Error(
-      `${command} ${args.join(" ")} exited ${String(result.status)}${result.error === undefined ? "" : ` (${result.error.message})`}\n${result.stdout}\n${result.stderr}`,
-    );
-  return result.stdout;
 }
 
 /**
@@ -189,18 +150,6 @@ function composition(): Composition {
         : [],
     ),
   };
-}
-
-/** Whether something accepts connections on this loopback port. */
-async function listening(port: number): Promise<boolean> {
-  return await new Promise((answer) => {
-    const socket = tcpConnect({ host: "127.0.0.1", port });
-    socket.once("connect", () => {
-      socket.destroy();
-      answer(true);
-    });
-    socket.once("error", () => answer(false));
-  });
 }
 
 function composeProjects(): string[] {
@@ -265,80 +214,23 @@ let walk: ChildProcess | undefined;
 let page: ChildProcess | undefined;
 let browser: Browser | undefined;
 
-/** Stops a detached child's whole process group: SIGTERM, then SIGKILL. */
-async function stopGroup(child: ChildProcess | undefined): Promise<void> {
-  if (child?.pid === undefined || child.exitCode !== null) return;
-  const exited = new Promise<void>((done) => child.once("exit", () => done()));
-  const signal = (name: NodeJS.Signals) => {
-    try {
-      process.kill(-(child.pid ?? 0), name);
-    } catch {
-      // The group is already gone.
-    }
-  };
-  signal("SIGTERM");
-  const timer = new Promise<"timeout">((done) =>
-    setTimeout(() => done("timeout"), STOP_GRACE_MS),
-  );
-  if ((await Promise.race([exited, timer])) === "timeout") {
-    signal("SIGKILL");
-    await exited;
-  }
-}
-
 /**
  * Runs the walk's blocks in one bash and returns the `CALQUE_*` variables the
- * blocks exported, which the checks need to reach the database. The shell
- * hands its environment back over fd 3 after the last block, so nothing the
- * walk exports is written to disk.
+ * blocks exported, which the checks need to reach the database.
  */
 async function runWalk(
   blocks: readonly string[],
 ): Promise<Record<string, string>> {
-  const script = [
-    "set -euo pipefail",
-    ...blocks.flatMap((block, index) => [
-      `printf '\\n== block %d of %d\\n' ${String(index + 1)} ${String(blocks.length)}`,
-      block,
-    ]),
-    `node -p 'JSON.stringify(process.env)' >&3`,
-    "",
-  ].join("\n");
-  const scriptPath = join(workDirectory, "walk.sh");
-  writeFileSync(scriptPath, script);
-  const child = spawn("bash", [scriptPath], {
-    cwd: root,
+  return await runBlocks({
+    blocks,
+    scriptPath: join(workDirectory, "walk.sh"),
     env: readerEnvironment(),
-    detached: true,
-    stdio: ["ignore", "inherit", "inherit", "pipe"],
+    timeoutMs: WALK_TIMEOUT_MS,
+    exported: (name) => name.startsWith("CALQUE_"),
+    track: (child) => {
+      walk = child;
+    },
   });
-  walk = child;
-  let exported = "";
-  const environmentPipe = child.stdio[3] as Readable | null;
-  environmentPipe?.setEncoding("utf8");
-  environmentPipe?.on("data", (chunk: string) => (exported += chunk));
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    void stopGroup(child);
-  }, WALK_TIMEOUT_MS);
-  const [code, signal] = await new Promise<
-    [number | null, NodeJS.Signals | null]
-  >((done) => child.once("exit", (...exit) => done(exit)));
-  clearTimeout(timer);
-  walk = undefined;
-  if (timedOut)
-    throw new Error(
-      `the walk did not finish within ${String(WALK_TIMEOUT_MS / 60_000)} minutes`,
-    );
-  if (code !== 0)
-    throw new Error(
-      `the walk exited ${String(code)}${signal === null ? "" : ` on ${signal}`}`,
-    );
-  const environment = JSON.parse(exported) as Record<string, string>;
-  return Object.fromEntries(
-    Object.entries(environment).filter(([name]) => name.startsWith("CALQUE_")),
-  );
 }
 
 /** Which of the walk's files `docker build` would send to the daemon. */
@@ -373,26 +265,14 @@ function walkFilesInBuildContext(): string[] {
 }
 
 function startPage(block: string, exported: Record<string, string>): void {
-  const log = openSync(join(workDirectory, "page.log"), "w");
-  page = spawn("bash", ["-c", block], {
-    cwd: root,
+  page = startBlock({
+    block,
     env: { ...readerEnvironment(), ...exported },
-    detached: true,
-    stdio: ["ignore", log, log],
+    logFile: join(workDirectory, "page.log"),
   });
-  closeSync(log);
 }
 
-function pageLog(): string {
-  try {
-    return readFileSync(join(workDirectory, "page.log"), "utf8")
-      .split("\n")
-      .slice(-40)
-      .join("\n");
-  } catch {
-    return "(no page log)";
-  }
-}
+const pageLog = (): string => logTail(join(workDirectory, "page.log"));
 
 /**
  * Waits for the quickstart page itself, not just for something on 5173: a
@@ -465,64 +345,6 @@ async function verifiedEdgeChainKeys(caddy: string): Promise<string[]> {
   return [...keys];
 }
 
-/** Waits for `#tasks` to read `expected`, failing at once on an error status. */
-async function expectTasks(
-  opened: Page,
-  step: string,
-  expected: readonly string[],
-): Promise<void> {
-  const want = JSON.stringify(expected);
-  try {
-    const settled = await opened.waitForFunction(
-      (target) => {
-        const status = document.getElementById("status")?.textContent ?? "";
-        if (/^(?:error|locked):/u.test(status)) return { failed: status };
-        const tasks = [...document.querySelectorAll("#tasks li")].map(
-          (item) => item.textContent,
-        );
-        return JSON.stringify(tasks) === target ? { failed: null } : false;
-      },
-      want,
-      { timeout: CHANGE_TIMEOUT_MS, polling: 100 },
-    );
-    const { failed } = (await settled.jsonValue()) as {
-      readonly failed: string | null;
-    };
-    if (failed !== null) throw new Error(`the page reports "${failed}"`);
-  } catch (error) {
-    const seen = await opened.evaluate(() => ({
-      status: document.getElementById("status")?.textContent ?? "",
-      tasks: [...document.querySelectorAll("#tasks li")].map(
-        (item) => item.textContent,
-      ),
-    }));
-    throw new Error(
-      `${step}: expected tasks ${want}; the page shows ${JSON.stringify(seen.tasks)} with status "${seen.status}" (${String(error).split("\n")[0] ?? ""})`,
-    );
-  }
-}
-
-// `calque` serves the bootstrap plan and each artifact `no-store, private`,
-// and the client reads both through a stream. Chromium ends such a request as
-// canceled whenever the page's last read comes after the network's last byte,
-// although the page received every byte, so a request answered 200 can end
-// this way on a load that worked. The steps say the artifact arrived, and the
-// one bootstrap request the run allows says the plan did: the client asks
-// again for a plan whose body the network cut.
-const STREAMED_BODY_END = "net::ERR_ABORTED";
-
-function isBootstrapRequest(method: string, url: string): boolean {
-  return method === "POST" && new URL(url).pathname === "/v1/bootstrap";
-}
-
-function isStreamedRequest(method: string, url: string): boolean {
-  return (
-    isBootstrapRequest(method, url) ||
-    (method === "GET" &&
-      new URL(url).pathname.startsWith("/v1/artifact-objects/"))
-  );
-}
-
 async function drivePage(exported: Record<string, string>): Promise<{
   readonly chainKeys: number;
   readonly steps: string[];
@@ -539,33 +361,7 @@ async function drivePage(exported: Record<string, string>): Promise<{
     args: [`--ignore-certificate-errors-spki-list=${keys.join(",")}`],
   });
   const context = await browser.newContext();
-  const failedRequests: string[] = [];
-  const answeredStreams = new WeakSet<Request>();
-  let streamedReadsEndedCanceled = 0;
-  let bootstrapRequests = 0;
-  context.on("requestfailed", (request) => {
-    const error = request.failure()?.errorText ?? "unknown";
-    if (error === STREAMED_BODY_END && answeredStreams.has(request)) {
-      streamedReadsEndedCanceled += 1;
-      return;
-    }
-    failedRequests.push(`${request.method()} ${request.url()}: ${error}`);
-  });
-  context.on("request", (request) => {
-    if (isBootstrapRequest(request.method(), request.url()))
-      bootstrapRequests += 1;
-  });
-  context.on("response", (response) => {
-    if (
-      response.status() === 200 &&
-      isStreamedRequest(response.request().method(), response.url())
-    )
-      answeredStreams.add(response.request());
-    if (response.status() >= 400)
-      failedRequests.push(
-        `${response.request().method()} ${response.url()}: HTTP ${String(response.status())}`,
-      );
-  });
+  const requests = watchRequests(context);
   const opened = await context.newPage();
   const pageErrors: string[] = [];
   opened.on("pageerror", (error) => pageErrors.push(String(error)));
@@ -632,16 +428,16 @@ async function drivePage(exported: Record<string, string>): Promise<{
     await expectTasks(opened, step, expected);
   }
   assert.deepEqual(pageErrors, [], "the page threw");
-  assert.deepEqual(failedRequests, [], "the page had failed requests");
+  assert.deepEqual(requests.failedRequests, [], "the page had failed requests");
   assert.equal(
-    bootstrapRequests,
+    requests.bootstrapRequests(),
     1,
     "the page did not ask for its plan exactly once",
   );
   return {
     chainKeys: keys.length,
     steps: steps.map(([step]) => step),
-    streamedReadsEndedCanceled,
+    streamedReadsEndedCanceled: requests.streamedReadsEndedCanceled(),
   };
 }
 

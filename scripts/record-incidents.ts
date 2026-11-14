@@ -4,8 +4,7 @@
  * `pnpm record:incidents`: regenerates `docs/assets/calque-incidents-100k.gif`,
  * the README's recording of the incident-operations page at 100k rows.
  *
- * It runs `scripts/incidents.ts --no-open --fresh --rows 100k --dataset
- * content-v1` on free ports, then drives the page in headless Chromium, in a
+ * It runs `scripts/incidents.ts --no-open --fresh --dataset content-v1` on free ports, then drives the page in headless Chromium, in a
  * fresh context with an empty HTTP cache, while Playwright records the
  * viewport: the cold load to a complete paint, a scroll through the events
  * grid, a level filter, a sort, a status write through the page, and a
@@ -99,8 +98,6 @@ const launcher = spawn(
     "scripts/incidents.ts",
     "--no-open",
     "--fresh",
-    "--rows",
-    "100k",
     "--dataset",
     "content-v1",
   ],

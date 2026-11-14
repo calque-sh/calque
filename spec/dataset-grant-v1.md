@@ -4,7 +4,8 @@ The signed dataset grant: minted by the application backend, verified by
 Calque, never minted by Calque. `server/crates/dataset-grant` is the
 verifier and the single definition of the payload. This repository holds two
 issuers: `server/crates/dataset-grant-issuer` in Rust, and
-`client/examples/grant-issuer/` in Node with `node:crypto` alone.
+`client/packages/grant` in Node, published as `@calque/grant`, with
+`node:crypto` alone.
 
 This document is written for an issuer in any language. Where it and the
 verifier disagree, the verifier decides what Calque accepts, and the document is
@@ -207,7 +208,11 @@ drops the old one.
 `calque-dev-grant` keeps its signing key in a PKCS#8 v2 document, the private
 seed together with its public key, 83 bytes, created with mode `0600` on first
 use. `GrantIssuer::from_pkcs8` reads it with ring's `Ed25519KeyPair::from_pkcs8`,
-which requires v2, and Node's `createPrivateKey` reads the same file.
+which requires v2. `@calque/grant` reads the same file on every supported Node,
+from the seed in that layout, because the OpenSSL before 3.5 that older Node
+releases bundle refuses v2. Its `calque-grant keygen` writes a PKCS#8 v1 PEM
+document, which Node reads everywhere and ring's `from_pkcs8` does not; the
+server reads only the public key, so no verifier is affected.
 
 ## Tenant orders
 
@@ -318,8 +323,8 @@ Each issuer is held to the frozen vectors:
   `dataset-grant-issuer` signs each frozen payload to its frozen token, that
   `GrantVerifier` verifies each token, and that the test-only key prints
   `test-only-verification-key.json`.
-- **Node.** `scripts/grant-issuer-example.test.ts`, run by `pnpm verify`,
-  asserts that the example serializes each positive vector's claims to its
+- **Node.** `client/packages/grant`'s tests, run by `pnpm verify`,
+  assert that the package serializes each positive vector's claims to its
   payload bytes, signs each payload to its token, and prints the same
   verification-key value. As an issuer it refuses to mint the claims of five
   of the eight negative vectors: the four malformed capabilities, and
@@ -330,8 +335,13 @@ Each issuer is held to the frozen vectors:
   whose generation in force differs; and `duplicate-attribute.payload.json`
   repeats a name that a JavaScript object holds once.
 - **Live.** `scripts/serve-mutation-e2e.ts` (`pnpm serve:e2e`) gives one page a
-  grant the Node example minted from the key file `calque-dev-grant` created,
-  and that page loads only if a real `calque serve` verifies the grant.
+  grant `calque-grant mint` minted from the key file `calque-dev-grant`
+  created, and that page loads only if a real `calque serve` verifies the
+  grant.
+- **Generated key.** `scripts/grant-package-cross-language.test.ts` has the
+  package create a key and sign a grant and a tenant order, and
+  `server/crates/dataset-grant/examples/verify_node_grant.rs` verifies both from
+  the verification-key value `keygen` printed.
 
 The browser client treats a grant as an opaque bearer string. No vector may be
 regenerated to make a new implementation pass: a disagreement is that

@@ -28,7 +28,7 @@ export interface SourceDefinition {
    * The environment variable that holds the PostgreSQL connection string;
    * a connection string here is refused.
    */
-  readonly connectionEnv: string;
+  readonly databaseUrlEnv: string;
   /**
    * The PostgreSQL publication the collections' tables belong to; a
    * PostgreSQL identifier of at most 63 bytes.

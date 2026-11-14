@@ -1,6 +1,8 @@
 import {
   createSyncClient,
   type ClientSchema,
+  type MutationAccepted,
+  MutationSubmissionError,
   type MutationResult,
   type MutationStatus,
   SyncError,
@@ -109,25 +111,40 @@ export async function ordinaryOperations(client: SyncClient): Promise<void> {
     void client.status.error.code;
   }
 
-  const mutationResult = await client.retryMutation("ambiguous-mutation");
+  let mutationResult: MutationAccepted;
+  try {
+    mutationResult = await client.retryMutation("ambiguous-mutation");
+  } catch (error) {
+    if (error instanceof MutationSubmissionError) {
+      const code:
+        | "AUTH_FAILED"
+        | "MUTATION_AMBIGUOUS"
+        | "MUTATION_CONFLICT"
+        | "MUTATION_REJECTED" = error.code;
+      void code;
+      if (error.code === "MUTATION_CONFLICT" && error.conflict) {
+        const kind: string = error.conflict.kind;
+        const payload: Uint8Array = error.conflict.applicationPayload;
+        void kind;
+        void payload;
+      }
+    }
+    return;
+  }
   // @ts-expect-error server transaction receipts are internal idempotency data.
   void mutationResult.serverTransactionId;
   // @ts-expect-error canonical cursors are internal synchronization metadata.
   void mutationResult.observedCanonicalCursor;
-  if (mutationResult.state === "conflict") {
-    void mutationResult.conflict;
-    // @ts-expect-error retry delay exists only on retryable outcomes.
-    void mutationResult.retryAfterMs;
-  } else if (mutationResult.state === "retryable") {
-    void mutationResult.retryAfterMs;
-    // @ts-expect-error conflict detail exists only on conflict outcomes.
-    void mutationResult.conflict;
-  } else {
-    // @ts-expect-error conflict detail is irrelevant to this outcome.
-    void mutationResult.conflict;
-    // @ts-expect-error retry delay is irrelevant to this outcome.
-    void mutationResult.retryAfterMs;
-  }
+  const accepted: "awaiting_canonical_echo" | "already_canonical" =
+    mutationResult.state;
+  void accepted;
+  // @ts-expect-error a refused write rejects; its call never resolves with the refusal.
+  const refused: "rejected" | "conflict" | "retryable" = mutationResult.state;
+  void refused;
+  // @ts-expect-error conflict detail is irrelevant to an accepted write.
+  void mutationResult.conflict;
+  // @ts-expect-error retry delay is irrelevant to an accepted write.
+  void mutationResult.retryAfterMs;
   const mutationStatus = client.mutationStatus(mutationResult.mutationId);
   if (mutationStatus?.state === "conflict") {
     void mutationStatus.result.conflict;
@@ -222,6 +239,7 @@ export async function recoverFrom(error: SyncError, client: SyncClient) {
     case "INVALID_RESPONSE":
     case "QUERY_FAILED":
     case "RESULT_TOO_LARGE":
+    case "MUTATION_CONFLICT":
     case "MUTATION_REJECTED":
     case "UNSUPPORTED_BROWSER":
       return;

@@ -89,6 +89,10 @@ services:
       - "max_replication_slots=10"
       - "-c"
       - "max_wal_senders=10"
+      # A stopped Calque's slot gives up past this much held-back WAL instead
+      # of filling the disk (docs/postgresql.md, "Protecting the primary's disk").
+      - "-c"
+      - "max_slot_wal_keep_size=10GB"
       - "-c"
       - "timezone=UTC"
     healthcheck:
@@ -195,8 +199,14 @@ services:
       # directory that holds it, so the server cannot create anything beside
       # PostgreSQL's own socket.
       - postgres-socket:/var/run/postgresql:ro
+    # A tenant build that started in the background class moves up to normal
+    # priority when a request starts waiting on it. Linux lets a lowered
+    # thread rise only within RLIMIT_NICE: 20 lets it return to nice 0, and
+    # no higher.
+    ulimits:
+      nice: 20
     environment:
-      # The manifest's `sources[].connectionEnv` names this variable. The
+      # The manifest's `sources[].databaseUrlEnv` names this variable. The
       # socket form takes its credentials as `user`/`password` query parameters
       # because a URL with an empty authority cannot carry userinfo; they are
       # interpolated into a URL query, so the role's password has to be

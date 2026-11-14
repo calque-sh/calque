@@ -38,6 +38,7 @@ fn registered(
             is_partition: false,
             has_publication_row_filter: false,
             has_publication_column_list: false,
+            unlisted_columns: Vec::new(),
             columns: columns
                 .iter()
                 .enumerate()
@@ -53,6 +54,7 @@ fn registered(
                         primary_key_ordinal: *primary_key_ordinal,
                         generated: false,
                         nondeterministic_collation: false,
+                        carried_as: None,
                     },
                 )
                 .collect(),

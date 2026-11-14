@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use postgres::{Client, GenericClient, Row, Statement, Transaction};
+use postgres::{types::PgLsn, Client, GenericClient, Row, Statement, Transaction};
 use postgres_connect::DropOffRuntime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -428,6 +428,10 @@ pub enum LogError {
     },
     #[error("canonical entry identity already exists with different contents")]
     DuplicateTransactionConflict,
+    #[error(
+        "PostgreSQL sent a transaction again that ends at or before the LSN through which the log forgot retired transactions"
+    )]
+    ReplayBehindCompaction,
     #[error("canonical entry is invalid: {0}")]
     InvalidEntry(&'static str),
     #[error("canonical operation primary key is invalid: {0}")]
@@ -601,6 +605,8 @@ CREATE TABLE IF NOT EXISTS calque_control.canonical_log_retention (
     next_build_lease_token bigint NOT NULL DEFAULT 0
         CHECK (next_build_lease_token >= 0)
 );
+ALTER TABLE calque_control.canonical_log_retention
+    ADD COLUMN IF NOT EXISTS retired_compacted_through_lsn pg_lsn;
 CREATE TABLE IF NOT EXISTS calque_control.canonical_log_plan_retention_lease (
     source_id text NOT NULL,
     source_epoch text NOT NULL,
@@ -633,12 +639,15 @@ CREATE TABLE IF NOT EXISTS calque_control.canonical_log_retired_record (
 
 /// Appends a group of canonical entries under the writer fence, in array order.
 ///
-/// `$4`, `$5` and `$6` hold each entry's transaction key, bytes and SHA-256 in
-/// group order, and `$7` is the durable checkpoint LSN or NULL. The statement
-/// returns the group's status, then each entry's status and sequence in group
-/// order, and it writes only when the group's status is `ok`. New entries take
-/// consecutive sequences after the head in group order; an entry already
-/// durable, live or retired, keeps its sequence.
+/// `$4`, `$5`, `$6` and `$8` hold each entry's transaction key, bytes, SHA-256
+/// and end LSN in group order, and `$7` is the durable checkpoint LSN or NULL.
+/// The statement returns the group's status, then each entry's status and
+/// sequence in group order, and it writes only when the group's status is
+/// `ok`. New entries take consecutive sequences after the head in group order;
+/// an entry already durable, live or retired, keeps its sequence. An entry
+/// that is neither and ends at or before the LSN through which the log forgot
+/// retired identities was appended before and forgotten, and its group is
+/// refused as `compacted`.
 const APPEND_GROUP_SQL: &str = "WITH
  authorized AS MATERIALIZED (
     SELECT lease.fence_token
@@ -671,9 +680,17 @@ const APPEND_GROUP_SQL: &str = "WITH
      FOR UPDATE OF enrollment
  ),
  input AS MATERIALIZED (
-    SELECT item.ordinal, item.transaction_identity, item.entry_bytes, item.entry_sha256
-      FROM unnest($4::text[], $5::bytea[], $6::text[])
-           WITH ORDINALITY AS item (transaction_identity, entry_bytes, entry_sha256, ordinal)
+    SELECT item.ordinal, item.transaction_identity, item.entry_bytes, item.entry_sha256,
+           item.end_lsn
+      FROM unnest($4::text[], $5::bytea[], $6::text[], $8::pg_lsn[])
+           WITH ORDINALITY AS item (transaction_identity, entry_bytes, entry_sha256, end_lsn, ordinal)
+ ),
+ compaction AS MATERIALIZED (
+    SELECT retention.retired_compacted_through_lsn AS through_lsn
+      FROM calque_control.canonical_log_retention AS retention
+      CROSS JOIN authorized
+     WHERE retention.source_id = $1
+       AND retention.source_epoch = $2
  ),
  existing AS MATERIALIZED (
     SELECT input.ordinal, record.sequence, record.entry_bytes
@@ -703,6 +720,7 @@ const APPEND_GROUP_SQL: &str = "WITH
                      OR retired.entry_sha256 <> input.entry_sha256)
                  THEN 'duplicate_conflict'
                WHEN retired.ordinal IS NOT NULL THEN 'retired'
+               WHEN input.end_lsn <= (SELECT through_lsn FROM compaction) THEN 'compacted'
                ELSE 'new'
            END AS status,
            COALESCE(existing.sequence, retired.original_sequence) AS present_sequence
@@ -733,6 +751,7 @@ const APPEND_GROUP_SQL: &str = "WITH
           OR (SELECT head_sequence FROM locked_head) < 0) THEN 'corrupt'
         WHEN $7::text IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM locked_enrollment) THEN 'checkpoint_missing'
+        WHEN EXISTS (SELECT 1 FROM numbered WHERE status = 'compacted') THEN 'compacted'
         WHEN EXISTS (SELECT 1 FROM numbered WHERE status = 'duplicate_conflict')
           THEN 'duplicate_conflict'
         WHEN EXISTS (SELECT 1 FROM numbered WHERE status = 'new' AND sequence IS NULL)
@@ -862,11 +881,12 @@ impl PostgresFencedCanonicalLog {
             return Err(LogError::DatastoreIdentityMismatch);
         }
         client
-            .batch_execute(
-                "SET statement_timeout = '2s';
+            .batch_execute(&format!(
+                "SET statement_timeout = {};
                  SET lock_timeout = '1s';
                  SET synchronous_commit = on;",
-            )
+                LOG_STATEMENT_TIMEOUT.as_millis()
+            ))
             .map_err(postgres_log_error)?;
         Self::install_schema(&mut client)?;
         let log = Self {
@@ -1174,6 +1194,8 @@ impl PostgresFencedCanonicalLog {
         transaction
             .batch_execute("SET LOCAL synchronous_commit = on")
             .map_err(postgres_log_error)?;
+        // Lock the fence rows first, in the order an append locks them.
+        let compaction = compaction_floor(&mut transaction, &self.writer)?;
         ensure_postgres_retention_state(&mut transaction, &self.writer)?;
         let state = transaction
             .query_one(
@@ -1264,6 +1286,8 @@ impl PostgresFencedCanonicalLog {
             }
             retained = retained.min(lease_floor);
         }
+        // A trimmed entry PostgreSQL can still send again keeps its identity;
+        // one that ends at or before the compaction floor leaves none.
         transaction
             .execute(
                 "INSERT INTO calque_control.canonical_log_retired_record
@@ -1273,14 +1297,19 @@ impl PostgresFencedCanonicalLog {
                         transaction_identity, entry_sha256
                    FROM calque_control.canonical_log_record
                   WHERE source_id = $1 AND source_epoch = $2
-                    AND sequence < $3::bigint",
+                    AND sequence < $3::bigint
+                    AND ($4::pg_lsn IS NULL OR $4::pg_lsn < (transaction_identity::jsonb ->> 'endLsn')::pg_lsn)",
                 &[
                     &self.writer.source_id.as_str(),
                     &self.writer.source_epoch.as_str(),
                     &retained,
+                    &compaction,
                 ],
             )
             .map_err(postgres_log_error)?;
+        if let Some(floor) = compaction {
+            compact_retired_records(&mut transaction, &self.writer, floor)?;
+        }
         transaction
             .execute(
                 "DELETE FROM calque_control.canonical_log_record
@@ -1829,10 +1858,16 @@ impl PostgresFencedCanonicalLog {
         if entry_bytes.len() as u64 > MAX_RECORD_BYTES {
             return Err(LogError::RecordTooLarge);
         }
+        let end_lsn = entry
+            .key()
+            .end_lsn
+            .parse::<PgLsn>()
+            .map_err(|_| LogError::InvalidEntry("end LSN is not a PostgreSQL LSN"))?;
         Ok(EncodedAppend {
             transaction_identity: transaction_key_string(entry.key())?,
             entry_sha256: sha256_hex(&entry_bytes),
             entry_bytes,
+            end_lsn,
         })
     }
 
@@ -1866,6 +1901,7 @@ impl PostgresFencedCanonicalLog {
             .iter()
             .map(|entry| entry.entry_sha256.as_str())
             .collect();
+        let end_lsns: Vec<PgLsn> = entries.iter().map(|entry| entry.end_lsn).collect();
         let row = client
             .query_one(
                 statement,
@@ -1877,6 +1913,7 @@ impl PostgresFencedCanonicalLog {
                     &bytes,
                     &checksums,
                     &durable_lsn,
+                    &end_lsns,
                 ],
             )
             .map_err(postgres_log_error)?;
@@ -1885,6 +1922,7 @@ impl PostgresFencedCanonicalLog {
             "fenced" => return Err(LogError::FencedWriterRejected),
             "corrupt" | "checkpoint_missing" => return Err(LogError::PostgresHeadCorrupt),
             "duplicate_conflict" => return Err(LogError::DuplicateTransactionConflict),
+            "compacted" => return Err(LogError::ReplayBehindCompaction),
             "exhausted" => return Err(LogError::SequenceExhausted),
             "ok" => {}
             _ => return Err(LogError::PostgresHeadCorrupt),
@@ -1920,6 +1958,7 @@ struct EncodedAppend {
     transaction_identity: String,
     entry_bytes: Vec<u8>,
     entry_sha256: String,
+    end_lsn: PgLsn,
 }
 
 /// Splits an append group into statements. A statement ends before the entry
@@ -2355,11 +2394,12 @@ impl PostgresCanonicalLogReader {
             return Err(LogError::DatastoreIdentityMismatch);
         }
         client
-            .batch_execute(
-                "SET statement_timeout = '2s';
+            .batch_execute(&format!(
+                "SET statement_timeout = {};
                  SET lock_timeout = '1s';
                  SET default_transaction_read_only = on;",
-            )
+                LOG_STATEMENT_TIMEOUT.as_millis()
+            ))
             .map_err(postgres_log_error)?;
         Ok(Self {
             client: Mutex::new(DropOffRuntime::new(client)),
@@ -2541,6 +2581,108 @@ impl CanonicalLogPlanRetention for PostgresFencedCanonicalLog {
     }
 }
 
+/// How many retired identities one trim forgets at most. A trim holds back
+/// appends while it runs, so it forgets a backlog a few thousand rows at a
+/// time; twice the trim's own 1,024 entries, so a backlog shrinks with every
+/// trim.
+const COMPACTION_BATCH_ROWS: i64 = 2_048;
+
+/// The LSN at or before which PostgreSQL sends no transaction to this source
+/// again, while `writer` holds the source's active fence: the least of the
+/// log's durable checkpoint and the confirmed flush of the source's own slot
+/// in this cluster. PostgreSQL starts a logical slot no earlier than its
+/// confirmed flush, and calque confirms only what its log holds. `None` when
+/// the fence is not this writer's or the slot is not here, and nothing is
+/// forgotten then.
+fn compaction_floor(
+    transaction: &mut Transaction<'_>,
+    writer: &FencedWriterIdentity,
+) -> Result<Option<PgLsn>, LogError> {
+    let row = transaction
+        .query_opt(
+            "SELECT least(enrollment.durable_canonical_lsn::pg_lsn, slot.confirmed_flush_lsn)
+               FROM calque_control.source_fence_lease AS lease
+               JOIN calque_control.canonical_log_writer_fence AS writer
+                 ON writer.source_id = lease.source_id
+               JOIN calque_control.source_slot_enrollment AS enrollment
+                 ON enrollment.source_id = lease.source_id
+                AND enrollment.source_epoch = lease.source_epoch
+               JOIN pg_catalog.pg_replication_slots AS slot
+                 ON slot.slot_name = enrollment.slot_name
+                AND slot.database = enrollment.database_name
+                AND slot.slot_type = 'logical'
+              WHERE lease.source_id = $1
+                AND lease.source_epoch = $2
+                AND lease.fence_token = $3::bigint
+                AND lease.lease_phase = 'active'
+                AND lease.expires_at > clock_timestamp()
+                AND writer.source_epoch = lease.source_epoch
+                AND writer.fence_token = lease.fence_token
+                AND enrollment.system_identifier
+                    = (SELECT system_identifier::text FROM pg_catalog.pg_control_system())
+                AND slot.confirmed_flush_lsn IS NOT NULL
+              FOR UPDATE OF lease, writer",
+            &[
+                &writer.source_id.as_str(),
+                &writer.source_epoch.as_str(),
+                &writer.fence_token,
+            ],
+        )
+        .map_err(postgres_log_error)?;
+    Ok(row.and_then(|row| row.get::<_, Option<PgLsn>>(0)))
+}
+
+/// Forgets the oldest retired identities that end at or before `floor`, at
+/// most [`COMPACTION_BATCH_ROWS`] of them, and records that the log forgot
+/// every identity through `floor`: the append refuses an entry that ends
+/// there and is neither live nor retired. Sequences follow WAL order, so the
+/// oldest retired identities are the ones that end earliest.
+fn compact_retired_records(
+    transaction: &mut Transaction<'_>,
+    writer: &FencedWriterIdentity,
+    floor: PgLsn,
+) -> Result<(), LogError> {
+    transaction
+        .execute(
+            "DELETE FROM calque_control.canonical_log_retired_record AS record
+              USING (
+                  SELECT original_sequence
+                    FROM calque_control.canonical_log_retired_record
+                   WHERE source_id = $1 AND source_epoch = $2
+                   ORDER BY original_sequence
+                   LIMIT $4
+              ) AS oldest
+              WHERE record.source_id = $1
+                AND record.source_epoch = $2
+                AND record.original_sequence = oldest.original_sequence
+                AND (record.transaction_identity::jsonb ->> 'endLsn')::pg_lsn <= $3::pg_lsn",
+            &[
+                &writer.source_id.as_str(),
+                &writer.source_epoch.as_str(),
+                &floor,
+                &COMPACTION_BATCH_ROWS,
+            ],
+        )
+        .map_err(postgres_log_error)?;
+    let updated = transaction
+        .execute(
+            "UPDATE calque_control.canonical_log_retention
+                SET retired_compacted_through_lsn
+                    = greatest(retired_compacted_through_lsn, $3::pg_lsn)
+              WHERE source_id = $1 AND source_epoch = $2",
+            &[
+                &writer.source_id.as_str(),
+                &writer.source_epoch.as_str(),
+                &floor,
+            ],
+        )
+        .map_err(postgres_log_error)?;
+    if updated != 1 {
+        return Err(LogError::PostgresHeadCorrupt);
+    }
+    Ok(())
+}
+
 fn ensure_postgres_retention_state(
     transaction: &mut Transaction<'_>,
     writer: &FencedWriterIdentity,
@@ -2558,9 +2700,15 @@ fn ensure_postgres_retention_state(
     Ok(())
 }
 
+/// Every log connection's `statement_timeout`. A request that hears nothing
+/// from the server for this long plus `postgres_connect::REPLY_MARGIN` fails
+/// the connection, so an append whose server stops answering returns.
+const LOG_STATEMENT_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn connect(connection_string: &str) -> Result<Client, LogError> {
     postgres_connect::Endpoint::parse(connection_string)
         .map_err(|_| LogError::PostgresUnavailable)?
+        .bound_replies(LOG_STATEMENT_TIMEOUT)
         .connect()
         .map_err(postgres_log_error)
 }
@@ -2720,6 +2868,7 @@ mod tests {
             transaction_identity: identity.to_owned(),
             entry_bytes: vec![0; bytes],
             entry_sha256: String::new(),
+            end_lsn: PgLsn::from(0),
         }
     }
 

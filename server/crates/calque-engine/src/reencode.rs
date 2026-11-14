@@ -762,7 +762,8 @@ async fn download(
         }
         file.write_all(&buffer[..read])?;
     }
-    file.sync_all()?;
+    // Not synced: this encode reads the copy back and hashes it, and nothing
+    // reads it after a crash.
     Ok(())
 }
 

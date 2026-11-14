@@ -68,9 +68,10 @@ pub use snapshot::{ArtifactBuilder, LocalSnapshotError, LocalSnapshotOutcome};
 /// here, from a `DatabaseUrl`.
 pub use snapshot_pipeline::CanonicalHeadSignal;
 pub use source::{
-    destroy_local_source, inspect_local_identity, inspect_local_source, prepare_local_source,
-    start_local_source_runtime, CdcStopRemedy, LocalSourceError, LocalSourceHealth,
-    LocalSourceRuntime, LocalSourceRuntimeConfig, PreparedLocalSource, LOCAL_DEVELOPMENT_SUBJECT,
+    destroy_local_source, inspect_local_identity, inspect_local_source, inspect_slot_wal_bound,
+    prepare_local_source, prepare_selected_local_source, start_local_source_runtime, CdcStopRemedy,
+    Destroyed, LocalSourceError, LocalSourceHealth, LocalSourceRuntime, LocalSourceRuntimeConfig,
+    PreparedLocalSource, SelectedColumns, LOCAL_DEVELOPMENT_SUBJECT,
 };
 pub use state::{LocalNames, LocalSecrets, LocalState, SecretToken, StateError, StateStore};
 pub use tenants::{

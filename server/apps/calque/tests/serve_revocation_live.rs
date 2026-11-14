@@ -263,7 +263,7 @@ impl Fixture {
             "protocol": { "manifest": 1, "artifact": 1, "changeStream": 1, "mutation": 1 },
             "sources": [{
                 "id": self.source_id(),
-                "connectionEnv": DATABASE_ENV,
+                "databaseUrlEnv": DATABASE_ENV,
                 "publication": self.publication(),
                 "slot": self.slot(),
             }],
@@ -1651,10 +1651,10 @@ fn serve_against_another_database_refuses_before_writing_a_fence_there() {
     );
 }
 
-/// A publication altered while serve runs stops CDC at the next reconnect,
-/// as a start that meets it refuses it. The stop's log line names the
-/// publication, and serve exits with the refusal and the remedy that start
-/// would print: restore the definition, then rerun serve.
+/// A publication altered while serve runs stops CDC within seconds, with no
+/// reconnect to notice it, as a start that meets it refuses it. The stop's log
+/// line names the publication, and serve exits with the refusal and the remedy
+/// that start would print: restore the definition, destroy, and rerun serve.
 #[test]
 #[ignore = "requires TEST_DATABASE_URL"]
 fn a_publication_altered_while_serving_stops_cdc_and_exits_naming_its_remedy() {
@@ -1672,22 +1672,12 @@ fn a_publication_altered_while_serving_stops_cdc_and_exits_naming_its_remedy() {
             fixture.relation(),
         ))
         .unwrap();
-    let terminated: Vec<bool> = admin
-        .query(
-            "SELECT pg_terminate_backend(active_pid, 5000) FROM pg_replication_slots
-              WHERE slot_name = $1 AND active_pid IS NOT NULL",
-            &[&fixture.slot()],
-        )
-        .unwrap()
-        .iter()
-        .map(|row| row.get(0))
-        .collect();
-    assert_eq!(terminated, [true], "the slot had no walsender to terminate");
 
     let drift = format!(
-        "the PostgreSQL publication {} no longer publishes exactly the enrolled tables, \
-         for insert, update, delete and truncate, without publish_via_partition_root, and without \
-         row filters or column lists.",
+        "the PostgreSQL publication {} was altered, or an enum its columns use gained or \
+         renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, \
+         update, delete and truncate, without publish_via_partition_root or row filters, with \
+         the column lists and enum values it had at enrollment.",
         fixture.publication(),
     );
     let deadline = Instant::now() + DELIVERY_TIMEOUT;
@@ -1710,6 +1700,8 @@ fn a_publication_altered_while_serving_stops_cdc_and_exits_naming_its_remedy() {
 
     let exited_cleanly = served.shutdown();
     let exit: Vec<String> = stderr_lines.iter().collect();
+    let state_dir = fixture.directory.path().join("state");
+    let state_dir = state_dir.display();
     fixture.drop_source();
 
     assert!(!exited_cleanly, "{exit:#?}");
@@ -1719,7 +1711,10 @@ fn a_publication_altered_while_serving_stops_cdc_and_exits_naming_its_remedy() {
             .filter(|line| line.starts_with("calque: "))
             .collect::<Vec<_>>(),
         [format!(
-            "calque: {drift} Restore that definition, then rerun serve."
+            "calque: {drift} Restore the publication's definition if it was altered, then run \
+             calque destroy --state-dir {state_dir} --database-url-env {DATABASE_ENV} --yes and \
+             rerun serve to prepare the working set anew, since the one it holds may no longer \
+             match PostgreSQL."
         )]
     );
 }

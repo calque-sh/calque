@@ -5,10 +5,11 @@
 # enrollment refuses a superuser outright with SUPERUSER_NOT_LEAST_PRIVILEGE
 # (source-control validates least privilege before anything is enrolled).
 #
-# REPLICATION is required for the logical slot. CREATE on the database is
-# required because the server installs its `calque_control` schema there, and
-# CREATE and USAGE on `public` because the application's tables live there and
-# `CREATE PUBLICATION ... FOR TABLE` requires ownership of every table named.
+# REPLICATION is required for the logical slot, and CREATE on the database
+# because the server installs its `calque_control` and `calque_internal`
+# schemas there. The role owns no table: the application's role creates the
+# tables and their publication and grants this one SELECT, plus INSERT,
+# UPDATE and DELETE when pages write through Calque (docs/self-host.md).
 #
 # The name and the password arrive in the environment, never in this file and
 # never on a command line: `docker-compose.selfhost.yml` refuses to start
@@ -27,7 +28,5 @@ psql --no-password --set ON_ERROR_STOP=1 \
 SELECT format('CREATE ROLE %I LOGIN PASSWORD %L REPLICATION NOSUPERUSER', :'role', :'password')
 \gexec
 SELECT format('GRANT CREATE ON DATABASE %I TO %I', current_database(), :'role')
-\gexec
-SELECT format('GRANT CREATE, USAGE ON SCHEMA public TO %I', :'role')
 \gexec
 SQL

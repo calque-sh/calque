@@ -89,8 +89,12 @@ function postgresType(value: unknown, path: string): string {
   return name;
 }
 
-function array(value: unknown, path: string): readonly unknown[] {
-  if (!Array.isArray(value) || value.length === 0)
+function array(
+  value: unknown,
+  path: string,
+  { allowEmpty = false }: { allowEmpty?: boolean } = {},
+): readonly unknown[] {
+  if (!Array.isArray(value) || (value.length === 0 && !allowEmpty))
     throw new ConfigError(path, "must be a non-empty array");
   for (let index = 0; index < value.length; index += 1)
     if (!Object.hasOwn(value, index))
@@ -113,16 +117,21 @@ function sorted<T extends { readonly id: string }>(values: readonly T[]): T[] {
 
 function source(value: unknown, path: string): SourceDefinition {
   const item = object(value, path);
-  exact(item, ["id", "connectionEnv", "publication", "slot"], path);
-  const connectionEnv = string(item.connectionEnv, `${path}.connectionEnv`);
-  if (!ENVIRONMENT_VARIABLE.test(connectionEnv))
+  if ("connectionEnv" in item)
     throw new ConfigError(
       `${path}.connectionEnv`,
+      "is now databaseUrlEnv; rename the field",
+    );
+  exact(item, ["id", "databaseUrlEnv", "publication", "slot"], path);
+  const databaseUrlEnv = string(item.databaseUrlEnv, `${path}.databaseUrlEnv`);
+  if (!ENVIRONMENT_VARIABLE.test(databaseUrlEnv))
+    throw new ConfigError(
+      `${path}.databaseUrlEnv`,
       "must name an environment variable, not contain a connection string",
     );
   return {
     id: id(item.id, `${path}.id`),
-    connectionEnv,
+    databaseUrlEnv,
     publication: postgresIdentifier(item.publication, `${path}.publication`),
     slot: postgresIdentifier(item.slot, `${path}.slot`),
   };
@@ -363,6 +372,7 @@ function command(
     const writableColumns = array(
       item.writableColumns,
       `${path}.writableColumns`,
+      { allowEmpty: true },
     )
       .map((column, index) =>
         postgresIdentifier(column, `${path}.writableColumns[${index}]`),
@@ -384,6 +394,11 @@ function command(
           `cannot mutate identity column ${column}`,
         );
     const commandId = id(item.id, `${path}.id`);
+    if (operations.includes("update") && writableColumns.length === 0)
+      throw new ConfigError(
+        `${path}.writableColumns`,
+        `command ${commandId} lists update, so it must name at least one writable column`,
+      );
     if (operations.includes("insert")) {
       const writable = new Set(writableColumns);
       const omitted = target.columns
@@ -443,13 +458,16 @@ export function compileConfig(
     ["manifest", "artifact", "changeStream", "mutation"],
     "$.protocol",
   );
-  if (protocol.manifest !== 1)
-    throw new ConfigError("$.protocol.manifest", "must equal 1");
+  for (const field of ["manifest", "artifact", "changeStream", "mutation"])
+    if (protocol[field] !== 1)
+      throw new ConfigError(`$.protocol.${field}`, "must equal 1");
   const sources = sorted(
     array(root.sources, "$.sources").map((value, index) =>
       source(value, `$.sources[${index}]`),
     ),
   );
+  if (sources.length !== 1)
+    throw new ConfigError("$.sources", "must hold exactly one source");
   unique(
     sources.map(({ id }) => id),
     "$.sources",
@@ -460,6 +478,8 @@ export function compileConfig(
       scope(value, `$.scopes[${index}]`),
     ),
   );
+  if (scopes.length !== 1)
+    throw new ConfigError("$.scopes", "must hold exactly one scope");
   unique(
     scopes.map(({ id }) => id),
     "$.scopes",
@@ -491,11 +511,6 @@ export function compileConfig(
       throw new ConfigError(
         "$.collections",
         `collection ${entry.id} references unknown scope ${entry.scope}`,
-      );
-    if (declaredScope.source !== entry.source)
-      throw new ConfigError(
-        "$.collections",
-        `collection ${entry.id} and scope ${entry.scope} use different sources`,
       );
   }
   checkPartitions(scopes, collections);

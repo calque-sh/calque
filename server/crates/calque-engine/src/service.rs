@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
@@ -32,12 +32,121 @@ const ALLOWED_REQUEST_HEADERS: &[&str] = &[
     "x-calque-artifact-profile",
 ];
 
+/// Distinct refused values logged per kind. A flood of different values stops
+/// at this bound, after one line saying so.
+const MAX_LOGGED_REFUSALS: usize = 32;
+/// Characters of a refused value that are kept and logged.
+const MAX_LOGGED_VALUE_CHARS: usize = 100;
+
+const HOST_REFUSAL_BODY: &str = "Host not served by this calque\n";
+const ORIGIN_REFUSAL_BODY: &str = "Origin not allowed\n";
+
+/// The refused values of one kind already logged, bounded in count and size.
+#[derive(Default)]
+struct RefusedValues {
+    seen: Mutex<(BTreeSet<String>, bool)>,
+}
+
+enum Refusal {
+    First,
+    Repeated,
+    FirstBeyondTheBound,
+}
+
+impl RefusedValues {
+    fn note(&self, value: &str) -> Refusal {
+        let value: String = value.chars().take(MAX_LOGGED_VALUE_CHARS).collect();
+        let (seen, capped) = &mut *self
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.contains(&value) {
+            Refusal::Repeated
+        } else if seen.len() < MAX_LOGGED_REFUSALS {
+            seen.insert(value);
+            Refusal::First
+        } else if std::mem::replace(capped, true) {
+            Refusal::Repeated
+        } else {
+            Refusal::FirstBeyondTheBound
+        }
+    }
+}
+
+/// How a refused `Host` or `Origin` is received: the value as text, with
+/// anything that is not printable escaped.
+fn received(value: Option<&HeaderValue>) -> String {
+    match value {
+        Some(value) => format!(
+            "\"{}\"",
+            String::from_utf8_lossy(value.as_bytes())
+                .chars()
+                .take(MAX_LOGGED_VALUE_CHARS)
+                .flat_map(char::escape_debug)
+                .collect::<String>()
+        ),
+        None => "missing".to_owned(),
+    }
+}
+
+#[derive(Clone, Default)]
+struct RefusedRequests {
+    hosts: Arc<RefusedValues>,
+    origins: Arc<RefusedValues>,
+}
+
+impl RefusedRequests {
+    fn host(&self, request: &Request, binding: &HttpBinding, flag: &str) {
+        let value = request.headers().get(header::HOST);
+        let received = received(value);
+        match self.hosts.note(&received) {
+            Refusal::First => tracing::warn!(
+                "refused a request whose Host is {received}: this listener answers only Host \"{}\". \
+                 Send that Host, or, with calque serve, set {flag} to the Host your proxy forwards",
+                binding.expected_host()
+            ),
+            Refusal::Repeated => {}
+            Refusal::FirstBeyondTheBound => tracing::warn!(
+                "refused requests with more than {MAX_LOGGED_REFUSALS} different Host values; \
+                 further ones are refused without a log line"
+            ),
+        }
+    }
+
+    fn origin(&self, request: &Request, allowed: &BTreeSet<String>) {
+        let received = received(request.headers().get(header::ORIGIN));
+        match self.origins.note(&received) {
+            Refusal::First => tracing::warn!(
+                "refused a request from Origin {received}: it is not an allowed origin ({}). \
+                 Add the page's origin, as scheme://host[:port] with no path, with --allow-origin",
+                allowed
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Refusal::Repeated => {}
+            Refusal::FirstBeyondTheBound => tracing::warn!(
+                "refused requests with more than {MAX_LOGGED_REFUSALS} different Origin values; \
+                 further ones are refused without a log line"
+            ),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct LocalHttpPolicy {
     binding: HttpBinding,
     origins: Arc<BTreeSet<String>>,
+    refused: RefusedRequests,
     health: LocalSourceHealth,
     request_permits: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct MetricsPolicy {
+    binding: HttpBinding,
+    refused: RefusedRequests,
 }
 
 pin_project! {
@@ -162,18 +271,24 @@ pub fn metrics_router(metrics: OperationsMetrics, binding: HttpBinding) -> Route
             }),
         )
         .layer(middleware::from_fn_with_state(
-            binding,
+            MetricsPolicy {
+                binding,
+                refused: RefusedRequests::default(),
+            },
             enforce_metrics_host,
         ))
 }
 
 async fn enforce_metrics_host(
-    axum::extract::State(binding): axum::extract::State<HttpBinding>,
+    axum::extract::State(policy): axum::extract::State<MetricsPolicy>,
     request: Request,
     next: Next,
 ) -> Response {
-    if !has_expected_host(&request, &binding) {
-        return empty_response(StatusCode::MISDIRECTED_REQUEST);
+    if !has_expected_host(&request, &policy.binding) {
+        policy
+            .refused
+            .host(&request, &policy.binding, "--metrics-expected-host");
+        return text_response(StatusCode::MISDIRECTED_REQUEST, HOST_REFUSAL_BODY);
     }
     next.run(request).await
 }
@@ -201,6 +316,7 @@ fn protect_local_router(
                 .map(|origin| origin.as_str().to_owned())
                 .collect(),
         ),
+        refused: RefusedRequests::default(),
         health,
         request_permits: Arc::new(Semaphore::new(max_inflight_requests)),
     };
@@ -216,12 +332,18 @@ async fn enforce_local_request(
     next: Next,
 ) -> Response {
     if !has_expected_host(&request, &policy.binding) {
-        return empty_response(StatusCode::MISDIRECTED_REQUEST);
+        policy
+            .refused
+            .host(&request, &policy.binding, "--expected-host");
+        return text_response(StatusCode::MISDIRECTED_REQUEST, HOST_REFUSAL_BODY);
     }
     let origin = match request.headers().get(header::ORIGIN) {
         Some(value) => match value.to_str() {
             Ok(value) if policy.origins.contains(value) => Some(value.to_owned()),
-            _ => return empty_response(StatusCode::FORBIDDEN),
+            _ => {
+                policy.refused.origin(&request, &policy.origins);
+                return text_response(StatusCode::FORBIDDEN, ORIGIN_REFUSAL_BODY);
+            }
         },
         None => None,
     };
@@ -334,6 +456,17 @@ fn cors_response(mut response: Response, origin: &str, preflight: bool) -> Respo
         );
     }
     response
+}
+
+fn text_response(status: StatusCode, body: &'static str) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .header("referrer-policy", "no-referrer")
+        .body(Body::from(body))
+        .expect("static local response")
 }
 
 fn empty_response(status: StatusCode) -> Response {
@@ -597,6 +730,204 @@ mod tests {
             router(true).oneshot(wrong_origin).await.unwrap().status(),
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    impl Captured {
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// Logs on this thread, which a current-thread test runtime shares with
+    /// the middleware it drives, until the guard drops.
+    fn capture_logs() -> (Captured, tracing::subscriber::DefaultGuard) {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        (captured, tracing::subscriber::set_default(subscriber))
+    }
+
+    async fn body_text(response: Response) -> String {
+        String::from_utf8(to_bytes(response.into_body(), 4096).await.unwrap().to_vec()).unwrap()
+    }
+
+    fn from_host(host: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .uri("/healthz")
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn from_origin(origin: &str) -> axum::http::Request<Body> {
+        let mut request = request("/healthz");
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn a_refused_host_or_origin_gets_a_short_text_body_that_hides_the_allow_list() {
+        let (_logs, _guard) = capture_logs();
+        let host = router(true)
+            .oneshot(from_host("evil.example"))
+            .await
+            .unwrap();
+        assert_eq!(host.status(), StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(
+            host.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain; charset=utf-8"))
+        );
+        assert_eq!(body_text(host).await, "Host not served by this calque\n");
+
+        let origin = router(true)
+            .oneshot(from_origin("https://evil.example"))
+            .await
+            .unwrap();
+        assert_eq!(origin.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_text(origin).await, "Origin not allowed\n");
+
+        let metrics = metrics_listener()
+            .oneshot(metrics_request("/metrics", "evil.example"))
+            .await
+            .unwrap();
+        assert_eq!(metrics.status(), StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(body_text(metrics).await, "Host not served by this calque\n");
+    }
+
+    /// The warning names what was received, what is expected and the flag
+    /// that sets it, once per distinct value.
+    #[tokio::test]
+    async fn a_refused_value_is_logged_once_with_what_is_expected_and_its_flag() {
+        let (logs, _guard) = capture_logs();
+        let router = router(true);
+        for _ in 0..3 {
+            router
+                .clone()
+                .oneshot(from_host("evil.example"))
+                .await
+                .unwrap();
+            router
+                .clone()
+                .oneshot(from_origin("https://evil.example"))
+                .await
+                .unwrap();
+        }
+        router
+            .clone()
+            .oneshot(from_host("other.example"))
+            .await
+            .unwrap();
+        let lines = logs.lines();
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(
+            lines[0].contains("Host is \"evil.example\"")
+                && lines[0].contains("answers only Host \"127.0.0.1:8787\"")
+                && lines[0].contains("--expected-host"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("Origin \"https://evil.example\"")
+                && lines[1].contains("http://127.0.0.1:5173")
+                && lines[1].contains("--allow-origin"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("Host is \"other.example\""),
+            "{}",
+            lines[2]
+        );
+
+        let (logs, _guard) = capture_logs();
+        metrics_listener()
+            .oneshot(metrics_request("/metrics", "evil.example"))
+            .await
+            .unwrap();
+        let lines = logs.lines();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(
+            lines[0].contains("answers only Host \"127.0.0.1:8788\"")
+                && lines[0].contains("--metrics-expected-host"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    /// A flood of different values grows neither memory nor the log without
+    /// bound: past the bound one line says so, and nothing more is written.
+    #[tokio::test]
+    async fn a_flood_of_different_refused_values_is_logged_to_a_bound() {
+        let (logs, _guard) = capture_logs();
+        let router = router(true);
+        let long = "h".repeat(10_000);
+        for index in 0..(MAX_LOGGED_REFUSALS * 3) {
+            router
+                .clone()
+                .oneshot(from_host(&format!("flood-{index}.example")))
+                .await
+                .unwrap();
+        }
+        router.clone().oneshot(from_host(&long)).await.unwrap();
+        let lines = logs.lines();
+        assert_eq!(lines.len(), MAX_LOGGED_REFUSALS + 1, "{}", lines.len());
+        assert!(lines.last().unwrap().contains("without a log line"));
+        assert!(lines.iter().all(|line| line.len() < 600));
+
+        let values = RefusedValues::default();
+        for index in 0..1_000 {
+            values.note(&format!("{index}{long}"));
+        }
+        let (seen, capped) = &*values.seen.lock().unwrap();
+        assert_eq!(seen.len(), MAX_LOGGED_REFUSALS);
+        assert!(*capped);
+        assert!(seen
+            .iter()
+            .all(|value| value.chars().count() <= MAX_LOGGED_VALUE_CHARS));
+    }
+
+    #[tokio::test]
+    async fn a_refused_origin_that_is_not_utf8_is_logged_lossily_on_one_line() {
+        let (logs, _guard) = capture_logs();
+        let mut refused = request("/healthz");
+        refused.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_bytes(b"https://a\xff.example").unwrap(),
+        );
+        router(true).oneshot(refused).await.unwrap();
+        let lines = logs.lines();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(lines[0].contains("Origin \"https://a"), "{}", lines[0]);
     }
 
     /// The shape `docker-compose.selfhost.yml` puts behind Caddy: a wildcard

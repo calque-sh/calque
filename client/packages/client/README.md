@@ -25,6 +25,35 @@ of it. By default it rejects a result over 1,000 rows or 4 MiB;
 16 MiB. `window(offset, count)` reads up to 10,000 consecutive rows from
 anywhere in a result of any size, together with the result's total row count.
 
+## Writes and errors
+
+`insert`, `update` and `delete` show the change on the page at once and send
+it to the server. The call resolves once the server has committed it. The row
+stays pending, as `client.mutationStatus(result.mutationId)` reports, until
+the change comes back from PostgreSQL, which is when every other page sees it.
+
+When no answer arrives, or the server answers that it is temporarily
+unavailable, the client sends the same write again under the same mutation
+id, up to four times: after 250 ms, 500 ms, 1 s and 2 s, or after the wait the
+server asked for. The server answers a write it already committed from its
+record of that id, so a resend never applies a write twice.
+
+A call that does not resolve rejects with a `MutationSubmissionError`. Its
+`code` says what happened, and its `recovery` what can help:
+
+| `code`                                 | What happened                                                                                                          | The change on the page        | What to do                                                                                                    |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `MUTATION_REJECTED`                    | The server found the input invalid, or the grant does not allow the write. Nothing committed.                          | Removed                       | Fix the input or the grant; the same write fails the same way.                                                |
+| `MUTATION_CONFLICT`                    | The write conflicts with the rows PostgreSQL holds. Nothing committed. `error.conflict.kind` names the rule broken.    | Removed                       | Show the current row and let the user decide.                                                                 |
+| `MUTATION_AMBIGUOUS`, recovery `retry` | No decision reached the page through every resend. The write may have committed.                                       | Kept                          | `client.retryMutation(error.mutationId)` sends it again. Its change arriving from PostgreSQL also settles it. |
+| `MUTATION_AMBIGUOUS`, recovery `none`  | The client can no longer resend it: it rebuilt after `reset()` or a revocation, or held more than 64 undecided writes. | Gone with the state it was on | The rebuilt rows show whether it landed.                                                                      |
+| `AUTH_FAILED`                          | The server refused the credentials, and the client stopped in `error`.                                                 | Kept until `reset()`          | Get a new grant from `auth`, then `reset()`.                                                                  |
+
+A write can also reject with a plain `SyncError` before anything is sent:
+`CANCELLED` with recovery `retry` when a `reset()` overtook it, so issuing it
+again is the retry, or the client's own error while its status is `error`,
+`locked` or `closed`.
+
 ## The grant verification key
 
 In production, create the client with `grantVerificationKey`: the
@@ -38,6 +67,21 @@ without it is refused at its next change request and rebuilds through `auth()`
 without emptying its subscriptions first. `createSyncClient` throws on a
 malformed key. [Revoking access](../../../docs/design/operations.md#revoking-access)
 has the backend's side.
+
+## Keeping a page open past its grant
+
+A plan ends one second before the grant that admitted it expires, so it lasts
+at most 15 minutes. Two thirds into a plan's life, the client calls `auth()` and asks the server to
+renew the plan for the rows it holds. The renewed plan downloads nothing: the
+page keeps its rows, its pending writes and its subscriptions, and its status
+stays `ready`. A renewal that fails on the network, on a server error, or on a
+grant that expires no later than the last one is sent again after 1, 5 and 15
+seconds and then every 30, until 5 seconds before the plan expires; then the
+page rebuilds from a fresh download, as it does without renewal.
+
+So `auth()` must return a fresh grant whenever the client asks. An `auth()`
+that caches its grant until it expires renews nothing, and its page downloads
+its working set again each time a grant runs out.
 
 ## Starting the load early
 
@@ -87,8 +131,9 @@ const client = createSyncClient({
 holding a string `endpoint` and `bearerToken`. `startedAuth(refresh)` returns
 an `auth` whose first call returns the rendered bearer, the one the started
 request sent, and whose every later call returns `refresh()`. The client calls
-`auth` again for each mutation and each reconnect, after the rendered grant
-may have expired, so `refresh` asks the backend for a current one. On a page
+`auth` again for each mutation, each reconnect and each plan renewal, after
+the rendered grant may have expired, so `refresh` asks the backend for a
+current one. On a page
 without a rendered connection, the first call returns `refresh()` too.
 
 `requiredTables` are the generated collections' source relations, as
@@ -168,6 +213,31 @@ own request. The HTML now also carries the plan's artifact URLs, which are
 capabilities, and stays `Cache-Control: no-store`. The backend's request
 delays the document's first byte by its own round trip to the Calque server,
 so it saves time only when the backend is close to that server.
+
+## Browsers
+
+The client does not look at the browser's name. Before it sends a request or
+starts a worker, it checks for each API it calls: `Response`,
+`ReadableStreamBYOBReader`, module workers (`new Worker(url, { type:
+"module" })`), `crypto.subtle` and `crypto.randomUUID` (both secure contexts
+only), `structuredClone`, `Promise.withResolvers` and
+`String.prototype.isWellFormed`. A browser that lacks one gets
+`UNSUPPORTED_BROWSER`, with the message naming it. The starter that
+`startBootstrap` and `BOOTSTRAP_START_SCRIPT` give a page makes the same checks
+and sends nothing in such a browser.
+
+The bootstrap request names the two brotli encodings only where WebAssembly
+compiles, which a Content-Security-Policy without `wasm-unsafe-eval` forbids.
+The server picks `zstd` only when the browser's own `Accept-Encoding` names
+it, and the identity encoding otherwise.
+
+On 2026-11-14 the browser suites of this package, `@calque/worker` and
+`@calque/react` passed in Playwright's Chromium 149, Firefox 151 and WebKit
+26.5, and the demo page's reload scenario (`scripts/demo-reload-e2e.ts`)
+passed against a `calque` built from the tree in Chromium 149 and Firefox 151.
+Firefox and WebKit have no memory, GC, long-task or stable-paint
+measurement, no real-device run and no alpha benchmark run, so the client
+claims none of that for them.
 
 ## Bundling
 

@@ -31,7 +31,10 @@ use crate::{guard::PostgresConnectionFamily, DatabaseUrl, StateStore};
 
 /// A unit of another version is refused by version, naming the fix, rather
 /// than as an `OracleMismatch` that reads like a corrupt backup.
-const RECOVERY_FORMAT_VERSION: u32 = 2;
+const RECOVERY_FORMAT_VERSION: u32 = 3;
+/// Version 2 predates the compaction watermark. Its unit restores
+/// with none recorded, as an in-place upgrade from its release leaves it.
+const OLDEST_READABLE_FORMAT_VERSION: u32 = 2;
 const COMPLETE_FILE: &str = "recovery.json";
 const CONTROL_DIRECTORY: &str = "control";
 const STATE_DIRECTORY: &str = "state";
@@ -48,6 +51,17 @@ struct ControlTable {
     name: &'static str,
     columns: &'static str,
     order_by: &'static str,
+}
+
+impl ControlTable {
+    /// The columns a unit of `format_version` carries for this table.
+    fn columns_in(&self, format_version: u32) -> &'static str {
+        if format_version < 3 && self.name == "canonical_log_retention" {
+            "source_id, source_epoch, minimum_retained_sequence, next_build_lease_token"
+        } else {
+            self.columns
+        }
+    }
 }
 
 /// The source's `calque_control` tables a unit carries and a restore replaces.
@@ -83,7 +97,7 @@ const CONTROL_TABLES: &[ControlTable] = &[
     },
     ControlTable {
         name: "canonical_log_retention",
-        columns: "source_id, source_epoch, minimum_retained_sequence, next_build_lease_token",
+        columns: "source_id, source_epoch, minimum_retained_sequence, next_build_lease_token, retired_compacted_through_lsn",
         order_by: "source_id",
     },
     ControlTable {
@@ -364,7 +378,6 @@ pub fn create_recovery_backup(
     require_regular_file(&catalog)?;
 
     let mut client = connect(database)?;
-    configure_recovery_connection(&mut client)?;
     let mut transaction = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
@@ -487,7 +500,6 @@ pub fn restore_recovery_backup(
 
     install_control_schema(database)?;
     let mut client = connect(database)?;
-    configure_recovery_connection(&mut client)?;
     require_restore_slot_continuity(
         &mut client,
         &state.names.slot_name,
@@ -512,8 +524,8 @@ pub fn restore_recovery_backup(
     }
     restore_control_from_directory(
         &mut transaction,
-        &source_id,
         &backup.join(CONTROL_DIRECTORY),
+        manifest.format_version,
     )?;
     advance_fence_sequence(&mut transaction, &source_id)?;
     // The object half goes back before the control rows commit, so a store
@@ -537,21 +549,20 @@ pub fn restore_recovery_backup(
         &mut transaction,
         database,
         target_state_root,
-        &manifest.oracle,
+        &manifest,
         objects,
     )?;
     transaction.commit()?;
     Ok(report)
 }
 
-pub(crate) fn verify_restored_recovery(
+fn verify_restored_recovery(
     database: &DatabaseUrl,
     state_root: &Path,
-    expected: &RecoveryOracle,
+    expected: &RecoveryManifest,
     objects: RecoveryObjects<'_>,
 ) -> Result<RecoveryReport, RecoveryError> {
     let mut client = connect(database)?;
-    configure_recovery_connection(&mut client)?;
     let mut transaction = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
@@ -562,12 +573,12 @@ pub(crate) fn verify_restored_recovery(
 }
 
 /// Checks a restored state directory and the source's control rows, as
-/// `transaction` reads them, against `expected`.
+/// `transaction` reads them, against the unit `expected` describes.
 fn verify_restored_in(
     transaction: &mut Transaction<'_>,
     database: &DatabaseUrl,
     state_root: &Path,
-    expected: &RecoveryOracle,
+    expected: &RecoveryManifest,
     objects: RecoveryObjects<'_>,
 ) -> Result<RecoveryReport, RecoveryError> {
     let state_store = StateStore::open_existing(state_root)?;
@@ -596,12 +607,16 @@ fn verify_restored_in(
         objects,
     )?;
 
-    let control_sha256 = hash_control_from_database(transaction, &state.names.source_id)?;
+    let control_sha256 =
+        hash_control_from_database(transaction, &state.names.source_id, expected.format_version)?;
     let catalog_sha256 = catalog_logical_sha256(&state_root.join(CATALOG_FILE))?;
     let state_sha256 = hash_named_files(state_root, STATE_FILES)?;
     let objects_sha256 = hash_objects(objects, state_root, &state_root.join(CATALOG_FILE))?;
     let oracle = assemble_oracle(control_sha256, catalog_sha256, state_sha256, objects_sha256);
-    if &oracle != expected {
+    if oracle != expected.oracle
+        || (expected.format_version < 3
+            && compaction_watermark_recorded(transaction, &state.names.source_id)?)
+    {
         return Err(RecoveryError::OracleMismatch);
     }
     Ok(RecoveryReport {
@@ -620,31 +635,52 @@ pub fn verify_restored_recovery_backup(
     objects: RecoveryObjects<'_>,
 ) -> Result<RecoveryReport, RecoveryError> {
     let manifest = read_manifest(backup)?;
-    verify_restored_recovery(database, state_root, &manifest.oracle, objects)
+    verify_restored_recovery(database, state_root, &manifest, objects)
+}
+
+/// Whether the source's log records a compaction watermark, which a unit that
+/// predates it cannot have restored.
+fn compaction_watermark_recorded(
+    transaction: &mut Transaction<'_>,
+    source_id: &SourceId,
+) -> Result<bool, RecoveryError> {
+    Ok(transaction
+        .query_one(
+            "SELECT EXISTS(
+                 SELECT 1 FROM calque_control.canonical_log_retention
+                  WHERE source_id = $1 AND retired_compacted_through_lsn IS NOT NULL)",
+            &[&source_id.as_str()],
+        )?
+        .get(0))
 }
 
 /// Installs the control schema the restored rows go into. It opens no log
 /// writer: the rows a restore replaces may be ones an earlier release wrote,
 /// and the restored log is judged when `serve` connects to it.
+/// Every recovery statement's `statement_timeout`. A request that hears
+/// nothing from the server for this long plus `postgres_connect::REPLY_MARGIN`
+/// fails the connection.
+const RECOVERY_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn connect(database: &DatabaseUrl) -> Result<Client, RecoveryError> {
-    Ok(database
+    let mut client = database
         .endpoint(PostgresConnectionFamily::Recovery)
         .map_err(crate::LocalSourceError::from)?
-        .connect()?)
+        .bound_replies(RECOVERY_STATEMENT_TIMEOUT)
+        .connect()?;
+    client.batch_execute(&format!(
+        "SET statement_timeout = {}; SET lock_timeout = '2s'; \
+         SET idle_in_transaction_session_timeout = '60s'",
+        RECOVERY_STATEMENT_TIMEOUT.as_millis()
+    ))?;
+    Ok(client)
 }
 
 fn install_control_schema(database: &DatabaseUrl) -> Result<(), RecoveryError> {
     drop(PostgresFenceStore::connect(database.expose())?);
     let mut client = connect(database)?;
-    configure_recovery_connection(&mut client)?;
     canonical_log::PostgresFencedCanonicalLog::install_schema(&mut client)?;
     Ok(())
-}
-
-fn configure_recovery_connection(client: &mut Client) -> Result<(), postgres::Error> {
-    client.batch_execute(
-        "SET statement_timeout = '30s'; SET lock_timeout = '2s'; SET idle_in_transaction_session_timeout = '60s'",
-    )
 }
 
 fn lock_and_require_stopped(
@@ -823,15 +859,16 @@ fn copy_control_to_directory(
 
 fn restore_control_from_directory(
     transaction: &mut Transaction<'_>,
-    _source_id: &SourceId,
     directory: &Path,
+    format_version: u32,
 ) -> Result<(), RecoveryError> {
     for table in CONTROL_TABLES {
         let path = directory.join(format!("{}.bin", table.name));
         require_regular_file(&path)?;
         let query = format!(
             "COPY calque_control.{} ({}) FROM STDIN WITH (FORMAT binary)",
-            table.name, table.columns
+            table.name,
+            table.columns_in(format_version)
         );
         let mut input = File::open(path)?;
         let mut writer = transaction.copy_in(&query)?;
@@ -1154,6 +1191,7 @@ fn hash_control_directory(directory: &Path) -> Result<String, RecoveryError> {
 fn hash_control_from_database(
     client: &mut impl GenericClient,
     source_id: &SourceId,
+    format_version: u32,
 ) -> Result<String, RecoveryError> {
     let quoted: String = client
         .query_one("SELECT quote_literal($1::text)", &[&source_id.as_str()])?
@@ -1164,7 +1202,10 @@ fn hash_control_from_database(
         hash_field(&mut digest, table.name.as_bytes());
         let query = format!(
             "COPY (SELECT {} FROM calque_control.{} WHERE source_id = {} ORDER BY {}) TO STDOUT WITH (FORMAT binary)",
-            table.columns, table.name, quoted, table.order_by
+            table.columns_in(format_version),
+            table.name,
+            quoted,
+            table.order_by
         );
         let mut reader = client.copy_out(&query)?;
         hash_reader(&mut digest, &mut reader)?;
@@ -1380,7 +1421,9 @@ fn read_manifest(root: &Path) -> Result<RecoveryManifest, RecoveryError> {
         return Err(RecoveryError::ManifestTooLarge);
     }
     let manifest: RecoveryManifest = serde_json::from_slice(&bytes)?;
-    if manifest.format_version != RECOVERY_FORMAT_VERSION {
+    if !(OLDEST_READABLE_FORMAT_VERSION..=RECOVERY_FORMAT_VERSION)
+        .contains(&manifest.format_version)
+    {
         return Err(RecoveryError::UnsupportedFormat(manifest.format_version));
     }
     Ok(manifest)
@@ -1528,7 +1571,7 @@ pub enum RecoveryError {
     OracleMismatch,
     #[error("recovery manifest exceeds its byte limit")]
     ManifestTooLarge,
-    #[error("recovery unit is format version {0}, and this build writes and reads version {}; a version 1 unit recorded its object oracle under a definition that no longer exists, so take a fresh unit from the deployment with calque backup rather than trying to restore this one", RECOVERY_FORMAT_VERSION)]
+    #[error("recovery unit is format version {0}, and this build reads versions {} to {}; restore it with the calque release that took it, or take a fresh unit with calque backup from a deployment running this build", OLDEST_READABLE_FORMAT_VERSION, RECOVERY_FORMAT_VERSION)]
     UnsupportedFormat(u32),
     #[error("recovery byte count overflowed")]
     SizeOverflow,
@@ -2202,7 +2245,7 @@ mod tests {
         // corrupt backup.
         assert_eq!(
             RecoveryError::UnsupportedFormat(1).to_string(),
-            "recovery unit is format version 1, and this build writes and reads version 2; a version 1 unit recorded its object oracle under a definition that no longer exists, so take a fresh unit from the deployment with calque backup rather than trying to restore this one"
+            "recovery unit is format version 1, and this build reads versions 2 to 3; restore it with the calque release that took it, or take a fresh unit with calque backup from a deployment running this build"
         );
         assert_eq!(
             RecoveryError::ActiveSourceLease.to_string(),
@@ -2432,6 +2475,15 @@ mod tests {
         /// Publishes this source's initial artifact on its state directory, as a
         /// process starting on it does.
         fn snapshot(&self) -> Result<crate::LocalSnapshotOutcome, crate::LocalSnapshotError> {
+            self.snapshot_through(self.database.clone())
+        }
+
+        /// `snapshot`, with the build's connections made through `database`
+        /// while the runtime keeps the one it started on.
+        fn snapshot_through(
+            &self,
+            database: DatabaseUrl,
+        ) -> Result<crate::LocalSnapshotOutcome, crate::LocalSnapshotError> {
             use tokio_util::sync::CancellationToken;
 
             let mut catalog = self.catalog();
@@ -2443,7 +2495,7 @@ mod tests {
                 .unwrap(),
             );
             let builder = crate::ArtifactBuilder {
-                database_url: self.database.clone(),
+                database_url: database,
                 state_root: self.root.clone(),
                 catalog_path: self.root.join(CATALOG_FILE),
                 store,
@@ -2777,6 +2829,110 @@ mod tests {
             .any(|(_, count)| *count > 0));
     }
 
+    /// A unit the previous release took has no compaction watermark. It
+    /// restores with none recorded, as upgrading that release in place leaves
+    /// the log, and its verification refuses a watermark it did not carry.
+    #[test]
+    #[ignore = "requires CALQUE_CONTROL_DATABASE_URL or CALQUE_DATABASE_URL"]
+    fn a_unit_from_before_the_compaction_watermark_restores_without_one() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_root = temporary.path().join("source");
+        let backup_root = temporary.path().join("backup");
+        let mut live = LiveSource::enrol(source_root.clone());
+        let database = live.database.clone();
+        let source_id = live.state.names.source_id.clone();
+        live.stop();
+        create_recovery_backup(
+            &database,
+            &source_root,
+            &backup_root,
+            RecoveryObjects::StateDirectory,
+        )
+        .unwrap();
+
+        // The unit as the previous release wrote it: four retention columns,
+        // format version 2, and the oracle over those files.
+        let mut control = Client::connect(&live.raw_database, postgres::NoTls).unwrap();
+        let retention = backup_root
+            .join(CONTROL_DIRECTORY)
+            .join("canonical_log_retention.bin");
+        fs::remove_file(&retention).unwrap();
+        let mut reader = control
+            .copy_out(&format!(
+                "COPY (SELECT source_id, source_epoch, minimum_retained_sequence, next_build_lease_token
+                         FROM calque_control.canonical_log_retention
+                        WHERE source_id = '{}' ORDER BY source_id) TO STDOUT WITH (FORMAT binary)",
+                source_id.as_str()
+            ))
+            .unwrap();
+        io::copy(&mut reader, &mut File::create(&retention).unwrap()).unwrap();
+        drop(reader);
+        let mut manifest = read_manifest(&backup_root).unwrap();
+        manifest.format_version = 2;
+        manifest.oracle =
+            recovery_oracle_from_backup(&backup_root, &source_id, &live.state.source_epoch)
+                .unwrap();
+        fs::write(
+            backup_root.join(COMPLETE_FILE),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let record_watermark = |control: &mut Client| {
+            let updated = control
+                .execute(
+                    "UPDATE calque_control.canonical_log_retention
+                        SET retired_compacted_through_lsn = durable.lsn
+                       FROM (SELECT durable_canonical_lsn::pg_lsn AS lsn
+                               FROM calque_control.source_slot_enrollment
+                              WHERE source_id = $1) AS durable
+                      WHERE source_id = $1",
+                    &[&source_id.as_str()],
+                )
+                .unwrap();
+            assert_eq!(updated, 1);
+        };
+        let watermark = |control: &mut Client| -> Option<String> {
+            control
+                .query_one(
+                    "SELECT retired_compacted_through_lsn::text
+                       FROM calque_control.canonical_log_retention WHERE source_id = $1",
+                    &[&source_id.as_str()],
+                )
+                .unwrap()
+                .get(0)
+        };
+        record_watermark(&mut control);
+        let restored_root = temporary.path().join("restored");
+        let restored = restore_recovery_backup(
+            &database,
+            &backup_root,
+            &restored_root,
+            ExistingSourceRows::ReplaceStopped,
+            RecoveryObjects::StateDirectory,
+        )
+        .unwrap();
+        assert_eq!(restored.oracle, manifest.oracle);
+        assert_eq!(watermark(&mut control), None);
+        verify_restored_recovery_backup(
+            &database,
+            &backup_root,
+            &restored_root,
+            RecoveryObjects::StateDirectory,
+        )
+        .unwrap();
+
+        record_watermark(&mut control);
+        let error = verify_restored_recovery_backup(
+            &database,
+            &backup_root,
+            &restored_root,
+            RecoveryObjects::StateDirectory,
+        )
+        .unwrap_err();
+        assert!(matches!(error, RecoveryError::OracleMismatch), "{error}");
+    }
+
     /// A unit whose manifest names another epoch or slot than the state
     /// directory it carries is refused before a restore writes anything. A
     /// retained floor past the log head fails verification, and a source whose
@@ -2893,6 +3049,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A build whose PostgreSQL freezes while the DDL guard waits for a table
+    /// lock fails once that connection's reply bound runs out, 33 s after
+    /// its statement began, and the error says the server stopped answering.
+    #[test]
+    #[ignore = "requires CALQUE_CONTROL_DATABASE_URL or CALQUE_DATABASE_URL"]
+    fn a_snapshot_whose_postgres_freezes_mid_preparation_fails_at_its_reply_bound() {
+        let temporary = tempfile::tempdir().unwrap();
+        let live = LiveSource::enrol_without_snapshot(temporary.path().join("source"));
+        let relay = postgres_connect::relay::SilenceableRelay::start(&live.raw_database);
+        let through = DatabaseUrl::parse(relay.url()).unwrap();
+        let mut ddl = Client::connect(&live.raw_database, postgres::NoTls).unwrap();
+        ddl.batch_execute(&format!(
+            "BEGIN; LOCK TABLE public.\"{}\" IN ACCESS EXCLUSIVE MODE",
+            live.table_name
+        ))
+        .unwrap();
+
+        let raw_database = live.raw_database.clone();
+        let live_table = live.table_name.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let building = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let outcome = live.snapshot_through(through);
+            let _ = sender.send((outcome, started.elapsed()));
+            live
+        });
+        let mut watcher = Client::connect(&raw_database, postgres::NoTls).unwrap();
+        let waiting = std::time::Instant::now();
+        while watcher
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity
+                  WHERE application_name = 'calque-snapshot' AND wait_event_type = 'Lock'",
+                &[],
+            )
+            .unwrap()
+            .get::<_, i64>(0)
+            == 0
+        {
+            assert!(
+                waiting.elapsed() < std::time::Duration::from_secs(20),
+                "the DDL guard never waited for the lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        relay.silence();
+        // The server goes on without the client for the 33 s the bound takes
+        // to run out. Ending the guard's backend and releasing the lock now
+        // leaves no transaction open for the other live tests, whose slot
+        // creation waits on every open transaction. Only this test's table
+        // picks the guard out from the other tests' snapshot backends.
+        watcher
+            .execute(
+                "SELECT pg_terminate_backend(l.pid) FROM pg_locks l
+                   JOIN pg_class c ON c.oid = l.relation
+                  WHERE c.relname = $1 AND l.pid <> pg_backend_pid()
+                    AND l.pid IN (SELECT pid FROM pg_stat_activity
+                                   WHERE application_name = 'calque-snapshot')",
+                &[&live_table],
+            )
+            .unwrap();
+        ddl.batch_execute("ROLLBACK").unwrap();
+
+        let received = receiver.recv_timeout(std::time::Duration::from_secs(50));
+        let (outcome, elapsed) =
+            received.expect("the build on a silent PostgreSQL had not returned after 50 s");
+        let live = building.join().unwrap();
+        let error = outcome.expect_err("a frozen PostgreSQL cannot publish");
+        assert!(
+            elapsed >= std::time::Duration::from_secs(30)
+                && elapsed < std::time::Duration::from_secs(40),
+            "the build returned after {elapsed:?}: {error:?}"
+        );
+        assert!(
+            matches!(&error, crate::LocalSnapshotError::ConnectionLost(cause)
+                if cause.contains("the server sent nothing while a reply was awaited")),
+            "{error:?}"
+        );
+        drop(live);
     }
 
     /// One S3-compatible store, from the same `CALQUE_S3_*` names `serve` and

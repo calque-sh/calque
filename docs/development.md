@@ -2,8 +2,7 @@
 
 Node has to be 26.12.1 or newer, 24.22.1 or newer on the 24 line, or 22.23.4 or
 newer on the 22 line: the releases with Node's October 2026 security fixes.
-The workspace uses Node's built-in zstd, and its tests run the grant issuer
-example, which needs Node to strip `.mts` types and to bundle OpenSSL 3.5.
+The workspace uses Node's built-in zstd.
 
 ## Building calque from source
 
@@ -41,9 +40,11 @@ without Rust or libpq on the host.
 # build, so run this first in every new worktree.
 pnpm install && pnpm -r build
 
-# Playwright's Chromium and Firefox are prerequisites of the gate's browser
-# suites; Firefox runs the test that the client refuses an unsupported browser.
-# Without them `pnpm verify` fails while launching Firefox.
+# Playwright's Chromium and Firefox are prerequisites of the gate: the
+# client, worker and React browser suites run in both. Without them
+# `pnpm verify` fails while launching a browser. `CALQUE_BROWSER=webkit`
+# (or `chromium`, `firefox`) runs a package's browser suite in that engine
+# alone, after `pnpm exec playwright install webkit`.
 pnpm exec playwright install chromium firefox
 
 # Complete local workspace gate. It inventories every Cargo and pnpm package,
@@ -159,7 +160,7 @@ locks the page whose application cannot renew it, while the page whose
 application renews it rebuilds without going blank.
 
 `pnpm record:incidents` regenerates `docs/assets/calque-incidents-100k.gif`, the
-README's recording of `pnpm incidents -- --rows 100k --dataset content-v1`. It
+README's recording of `pnpm incidents -- --dataset content-v1`. It
 drives the page in headless Chromium, commits a transaction through `psql`,
 and needs Docker, Rust and `ffmpeg`.
 
@@ -179,8 +180,7 @@ docker run --name calque-pg --rm -d \
   postgres:18 \
   -c wal_level=logical \
   -c max_replication_slots=10 \
-  -c max_wal_senders=10 \
-  -c timezone=UTC
+  -c max_wal_senders=10
 
 for attempt in $(seq 60); do
   pg_isready -h 127.0.0.1 -p 55432 -U postgres -d calque_dev >/dev/null && break
@@ -242,7 +242,7 @@ cargo run -p calque -- inspect --database-url-env CALQUE_DATABASE_URL \
   --source local --publication calque_demo \
   --table public.projects --table public.tasks > "$inspection"
 cargo run -p calque -- init --force --from-inspection "$inspection" \
-  --application-id demo --connection-env CALQUE_DATABASE_URL \
+  --application-id demo --database-url-env CALQUE_DATABASE_URL \
   --output client/packages/client/tests/demo/calque.config.json
 pnpm --filter @calque/config build
 pnpm exec calque-bindings \
@@ -383,8 +383,9 @@ SQL
 docker exec calque-pg-live psql -U postgres -d calque_verify \
   -c 'GRANT ALL ON SCHEMA public TO calque_test;'
 
-# Seven names read by different tests, all wanting the same connection string;
-# the script's header says which are required and which are alternates.
+# Seven names read by different tests, all wanting the same connection string,
+# and the superuser's URL for the one test that needs it; the script's header
+# says which are required and which are alternates.
 eval "$(scripts/live-postgres-suite.sh env 55433)"
 
 # blob-store is excluded: its two S3 conformance tests run through

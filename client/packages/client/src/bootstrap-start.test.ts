@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  onTestFinished,
+  vi,
+} from "vitest";
 
 import {
   acceptedArtifactEncodings,
@@ -9,8 +17,10 @@ import {
   type BootstrapStart,
   bootstrapUrl,
   brotliDecoderRuns,
+  DECODING_ARTIFACT_ENCODINGS,
   differingBootstrapParameter,
   discardStartedBootstrap,
+  missingBrowserFeature,
   renderedConnection,
   startBootstrap,
   startedAuth,
@@ -25,6 +35,10 @@ import {
   sealSyncClientOptions,
 } from "./client-options.js";
 import { artifactTransportProfile, requestBootstrapPlan } from "./transport.js";
+import {
+  stubBrowserFeatures,
+  stubWebAssemblyPolicy,
+} from "./browser.fixture.js";
 
 const MEMORY_BUDGET_BYTES = 32 * 1024 * 1024;
 
@@ -54,14 +68,65 @@ const REFUSED_ENDPOINTS = [
   "/\\sync.test/root",
 ];
 
-/** Browsers the client refuses, each made from the Chromium profile. */
-const OUTSIDE_PROFILE: readonly (readonly [string, () => void])[] = [
-  ["without Chromium's brand", () => vi.stubGlobal("navigator", {})],
+/** Removes `target[name]` until the test ends. */
+function withoutMethod(target: object, name: string): void {
+  const descriptor = Object.getOwnPropertyDescriptor(target, name);
+  if (!descriptor) throw new Error(`${name} is not defined here`);
+  Reflect.deleteProperty(target, name);
+  onTestFinished(() => {
+    Object.defineProperty(target, name, descriptor);
+  });
+}
+
+/** What a browser can lack of what the client calls, and what a refusal names. */
+const MISSING_FEATURES: readonly (readonly [string, () => void, string])[] = [
+  ["Response", () => vi.stubGlobal("Response", undefined), "Response"],
   [
-    "without BYOB stream readers",
+    "BYOB stream readers",
     () => vi.stubGlobal("ReadableStreamBYOBReader", undefined),
+    "ReadableStreamBYOBReader",
   ],
-  ["without Response", () => vi.stubGlobal("Response", undefined)],
+  [
+    "workers",
+    () => vi.stubGlobal("Worker", undefined),
+    'module workers (new Worker(url, { type: "module" }))',
+  ],
+  [
+    "module workers",
+    () =>
+      vi.stubGlobal(
+        "Worker",
+        vi.fn(function () {
+          throw new SyntaxError("not a URL");
+        }),
+      ),
+    'module workers (new Worker(url, { type: "module" }))',
+  ],
+  [
+    "Web Crypto digests",
+    () => vi.stubGlobal("crypto", { randomUUID: () => "id" }),
+    "crypto.subtle (secure contexts only)",
+  ],
+  [
+    "crypto.randomUUID",
+    () => vi.stubGlobal("crypto", { subtle: { digest: () => undefined } }),
+    "crypto.randomUUID (secure contexts only)",
+  ],
+  [
+    "structuredClone",
+    () => vi.stubGlobal("structuredClone", undefined),
+    "structuredClone",
+  ],
+  [
+    "Promise.withResolvers",
+    () => withoutMethod(Promise, "withResolvers"),
+    "Promise.withResolvers",
+  ],
+  [
+    "String.prototype.isWellFormed",
+    () => withoutMethod(String.prototype, "isWellFormed"),
+    "String.prototype.isWellFormed",
+  ],
 ];
 
 /** Endpoints `createSyncClient` accepts, each read as a directory. */
@@ -74,42 +139,21 @@ const ACCEPTED_ENDPOINTS = [
   "/_calque/",
 ];
 
-/**
- * A `WebAssembly` whose compile throws, as Chrome's does under a
- * Content-Security-Policy without `wasm-unsafe-eval`.
- */
-const REFUSING_WEBASSEMBLY = {
-  Module: function Module(): never {
-    throw new Error("Refused to compile or instantiate WebAssembly module");
-  },
-};
-
 /** Pages by whether the brotli decoder runs in them, and what each names. */
 const DECODER_PAGES = [
   [
-    "with workers and WebAssembly",
-    () => vi.stubGlobal("Worker", vi.fn()),
+    "where WebAssembly compiles",
+    () => undefined,
     ["packed-brotli-large-window", "brotli-large-window", "zstd", "identity"],
   ],
   [
-    "without workers",
-    () => vi.stubGlobal("Worker", undefined),
-    ["zstd", "identity"],
-  ],
-  [
     "whose policy forbids compiling WebAssembly",
-    () => {
-      vi.stubGlobal("Worker", vi.fn());
-      vi.stubGlobal("WebAssembly", REFUSING_WEBASSEMBLY);
-    },
+    stubWebAssemblyPolicy,
     ["zstd", "identity"],
   ],
   [
     "without WebAssembly",
-    () => {
-      vi.stubGlobal("Worker", vi.fn());
-      vi.stubGlobal("WebAssembly", undefined);
-    },
+    () => vi.stubGlobal("WebAssembly", undefined),
     ["zstd", "identity"],
   ],
 ] as const;
@@ -167,9 +211,7 @@ function parameters(): BootstrapParameters {
 
 describe("a bootstrap request the page starts", () => {
   beforeEach(() => {
-    vi.stubGlobal("navigator", {
-      userAgentData: { brands: [{ brand: "Chromium" }] },
-    });
+    stubBrowserFeatures();
     vi.stubGlobal("location", PAGE);
   });
 
@@ -214,6 +256,7 @@ describe("a bootstrap request the page starts", () => {
     expect(startedInit).toEqual(ownInit);
     expect(started.parameters).toEqual({
       ...parameters(),
+      acceptedEncodings: DECODING_ARTIFACT_ENCODINGS,
       clientHeapReserveBytes: options.clientHeapReserveBytes,
       deviceId: STORED_DEVICE,
     });
@@ -278,18 +321,21 @@ describe("a bootstrap request the page starts", () => {
     expect(takeStartedBootstrap()?.parameters.bearerToken).toBe("token");
   });
 
-  it.each(OUTSIDE_PROFILE)("starts nothing in a browser %s", (_, outside) => {
-    const fetcher = stubFetch();
-    outside();
-    startBootstrap({
-      endpoint: "https://sync.test/root",
-      bearerToken: "token",
-      requiredTables: [],
-      memoryBudgetBytes: MEMORY_BUDGET_BYTES,
-    });
-    expect(fetcher).not.toHaveBeenCalled();
-    expect(takeStartedBootstrap()).toBeUndefined();
-  });
+  it.each(MISSING_FEATURES)(
+    "starts nothing in a browser without %s",
+    (_, outside) => {
+      const fetcher = stubFetch();
+      outside();
+      startBootstrap({
+        endpoint: "https://sync.test/root",
+        bearerToken: "token",
+        requiredTables: [],
+        memoryBudgetBytes: MEMORY_BUDGET_BYTES,
+      });
+      expect(fetcher).not.toHaveBeenCalled();
+      expect(takeStartedBootstrap()).toBeUndefined();
+    },
+  );
 
   it.each(REFUSED_ENDPOINTS)(
     "sends no token to %j, an endpoint createSyncClient refuses",
@@ -466,18 +512,52 @@ describe("a bootstrap request the page starts", () => {
   });
 });
 
+describe("the browser APIs the client needs", () => {
+  beforeEach(() => {
+    stubBrowserFeatures();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("are all present in a browser that has every one", () => {
+    expect(missingBrowserFeature()).toBeUndefined();
+    expect(artifactTransportProfile().name).toBe("chromium-native-artifact-v1");
+  });
+
+  it.each(MISSING_FEATURES)(
+    "refuse a browser without %s, naming the API, before any request",
+    (_, outside, named) => {
+      const fetcher = stubFetch();
+      outside();
+      expect(missingBrowserFeature()).toBe(named);
+      expect(() => artifactTransportProfile()).toThrow(
+        expect.objectContaining({
+          code: "UNSUPPORTED_BROWSER",
+          recovery: "none",
+          message: `this browser lacks ${named}, which Calque needs`,
+        }),
+      );
+      expect(fetcher).not.toHaveBeenCalled();
+    },
+  );
+
+  it("do not include the Chromium brand, so another engine is not refused by name", () => {
+    vi.stubGlobal("navigator", {
+      userAgent: "Mozilla/5.0 (rv:151.0) Gecko/20100101 Firefox/151.0",
+    });
+    expect(missingBrowserFeature()).toBeUndefined();
+  });
+});
+
 describe("the encodings a bootstrap request names", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it("are zstd and identity in a runtime without workers, which is this one", () => {
-    expect(brotliDecoderRuns()).toBe(false);
-    expect(acceptedArtifactEncodings()).toEqual(["zstd", "identity"]);
-  });
-
   it.each(DECODER_PAGES)(
-    "name the two brotli encodings first only where the decoder worker can run: a page %s",
+    "name the two brotli encodings first only where the decoder module can compile: a page %s",
     (_page, stub, encodings) => {
       stub();
       expect(brotliDecoderRuns()).toBe(encodings.length === 4);
@@ -561,9 +641,7 @@ describe("a plan the backend rendered into the page", () => {
   } satisfies BootstrapStart;
 
   beforeEach(() => {
-    vi.stubGlobal("navigator", {
-      userAgentData: { brands: [{ brand: "Chromium" }] },
-    });
+    stubBrowserFeatures();
     vi.stubGlobal("location", PAGE);
     performance.clearMarks();
   });
@@ -656,9 +734,7 @@ describe("the connection the backend rendered into the page", () => {
   }
 
   beforeEach(() => {
-    vi.stubGlobal("navigator", {
-      userAgentData: { brands: [{ brand: "Chromium" }] },
-    });
+    stubBrowserFeatures();
   });
 
   afterEach(() => {
@@ -807,9 +883,7 @@ describe("the starter a page inlines in its head", () => {
   const INSTANCE_ID = "00000000-0000-4000-8000-000000000000";
 
   beforeEach(() => {
-    vi.stubGlobal("navigator", {
-      userAgentData: { brands: [{ brand: "Chromium" }] },
-    });
+    stubBrowserFeatures();
     vi.spyOn(globalThis.crypto, "randomUUID").mockReturnValue(INSTANCE_ID);
     vi.stubGlobal("location", PAGE);
     stubStorage(STORED_DEVICE);
@@ -1053,14 +1127,17 @@ describe("the starter a page inlines in its head", () => {
     memoryBudgetBytes: MEMORY_BUDGET_BYTES,
   };
 
-  it.each(OUTSIDE_PROFILE)("sends nothing in a browser %s", (_, outside) => {
-    page(rendered(start));
-    const fetcher = stubFetch();
-    outside();
-    runScript();
-    expect(fetcher).not.toHaveBeenCalled();
-    expect(takeStartedBootstrap()).toBeUndefined();
-  });
+  it.each(MISSING_FEATURES)(
+    "sends nothing in a browser without %s",
+    (_, outside) => {
+      page(rendered(start));
+      const fetcher = stubFetch();
+      outside();
+      runScript();
+      expect(fetcher).not.toHaveBeenCalled();
+      expect(takeStartedBootstrap()).toBeUndefined();
+    },
+  );
 
   it("sends nothing while the slot is full", () => {
     page(rendered(start));

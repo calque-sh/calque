@@ -13,9 +13,11 @@
 #       role and database inside it (idempotent; safe to rerun).
 #
 #   scripts/live-postgres-suite.sh env <port>
-#       Print the seven `export` lines the suite reads (eval or source them):
+#       Print the eight `export` lines the suite reads (eval or source them):
 #       five names some test requires, plus DATABASE_URL and
-#       CALQUE_DATABASE_URL, alternates a test falls back from.
+#       CALQUE_DATABASE_URL, alternates a test falls back from, plus
+#       CALQUE_SUPERUSER_DATABASE_URL, the image's superuser, for the one test
+#       that needs what only a superuser may create.
 #       Under GitHub Actions the same names are appended to $GITHUB_ENV.
 #
 #   scripts/live-postgres-suite.sh run <port> [test-harness args...]
@@ -40,7 +42,9 @@
 # would hide an uncovered provider behind a green run.
 #
 # Tunables (all optional): CALQUE_LIVEPG_ROLE, CALQUE_LIVEPG_PASSWORD,
-# CALQUE_LIVEPG_DATABASE, CALQUE_LIVEPG_HOST, CALQUE_LIVEPG_SUPERUSER.
+# CALQUE_LIVEPG_DATABASE, CALQUE_LIVEPG_HOST, CALQUE_LIVEPG_SUPERUSER,
+# CALQUE_LIVEPG_SUPERUSER_PASSWORD (default `postgres`, the image's
+# POSTGRES_PASSWORD in CI and in docs/development.md).
 set -eu
 
 role=${CALQUE_LIVEPG_ROLE:-calque_test}
@@ -48,6 +52,7 @@ password=${CALQUE_LIVEPG_PASSWORD:-calque_test}
 database=${CALQUE_LIVEPG_DATABASE:-calque_verify}
 host=${CALQUE_LIVEPG_HOST:-127.0.0.1}
 superuser=${CALQUE_LIVEPG_SUPERUSER:-postgres}
+superuser_password=${CALQUE_LIVEPG_SUPERUSER_PASSWORD:-postgres}
 
 # All of these want the same connection string, and no single one covers the
 # suite. Five are each required by some ignored test, which fails rather than
@@ -78,6 +83,12 @@ require_port() {
 
 database_url() {
   printf 'postgresql://%s:%s@%s:%s/%s' "$role" "$password" "$host" "$1" "$database"
+}
+
+# Only a superuser may create a `FOR TABLES IN SCHEMA` publication, and the
+# test that checks Calque follows one reads this name alone.
+superuser_url() {
+  printf 'postgresql://%s:%s@%s:%s/%s' "$superuser" "$superuser_password" "$host" "$1" "$database"
 }
 
 # psql inside the container, as the bootstrap superuser. Using the container's
@@ -207,11 +218,17 @@ print_env() {
       printf '%s=%s\n' "$name" "$url" >>"$GITHUB_ENV"
     fi
   done
+  printf "export CALQUE_SUPERUSER_DATABASE_URL='%s'\n" "$(superuser_url "$1")"
+  if [ -n "${GITHUB_ENV:-}" ]; then
+    printf 'CALQUE_SUPERUSER_DATABASE_URL=%s\n' "$(superuser_url "$1")" >>"$GITHUB_ENV"
+  fi
 }
 
 run() {
   require_port "${1:-}"
   url=$(database_url "$1")
+  CALQUE_SUPERUSER_DATABASE_URL=$(superuser_url "$1")
+  export CALQUE_SUPERUSER_DATABASE_URL
   shift
   for name in $env_names; do
     export "$name=$url"

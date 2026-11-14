@@ -52,6 +52,7 @@ import {
   BOOTSTRAP_START_SCRIPT_SHA256,
 } from "./bootstrap-start-script.js";
 import { calque, type CalquePluginOptions } from "./vite.js";
+import { stubBrowserFeatures } from "./browser.fixture.js";
 
 const PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const PAGE_ROOT = fileURLToPath(new URL("../tests/vite-page", import.meta.url));
@@ -161,9 +162,7 @@ function startChunkOf(output: Output): Rolldown.OutputChunk {
 async function requestsSentBy(run: () => unknown): Promise<unknown[][]> {
   const fetcher = vi.fn<typeof fetch>(() => new Promise(() => undefined));
   vi.stubGlobal("fetch", fetcher);
-  vi.stubGlobal("navigator", {
-    userAgentData: { brands: [{ brand: "Chromium" }] },
-  });
+  stubBrowserFeatures();
   vi.stubGlobal("document", {
     getElementById: (id: string) =>
       id === "calque-connection"
@@ -799,6 +798,27 @@ describe("the bindings calque() renders", () => {
       expect(lines.filter((line) => line.startsWith("info "))).toEqual([
         "info calque: wrote calque.generated.ts and calque.start.generated.ts",
       ]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("renders a configuration saved again within 50 ms of the last change, which the watcher does not report", async () => {
+    const root = pageRoot(INCIDENT.config);
+    const config = join(root, "calque.config.json");
+    const out = join(root, "calque.generated.ts");
+    const { logger } = recorder();
+    const server = await served(root, logger);
+    try {
+      await watching(server, config);
+      writeFileSync(config, QUICKSTART.config);
+      await expect
+        .poll(() => rendered(out), { interval: 1, timeout: 10_000 })
+        .toEqual(renderOf(QUICKSTART));
+      writeFileSync(config, INCIDENT.config);
+      await expect
+        .poll(() => rendered(out), { timeout: 2_000 })
+        .toEqual(renderOf(INCIDENT));
     } finally {
       await server.close();
     }

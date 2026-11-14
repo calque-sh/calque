@@ -580,6 +580,11 @@ fn now_unix_micros() -> Result<i64, LocalBackendError> {
         .map_err(|_| LocalBackendError::Clock)
 }
 
+/// Microseconds since the Unix epoch, for the `calque::delivery` debug log.
+pub(crate) fn delivery_stamp() -> u64 {
+    now_unix_micros().map_or(0, |now| u64::try_from(now).unwrap_or(0))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LocalBackendError {
     #[error("local backend configuration is invalid")]

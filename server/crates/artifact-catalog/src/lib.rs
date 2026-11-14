@@ -5,9 +5,14 @@
 //! SQLite transaction records `VERIFIED` and crosses the `PUBLISHED` visibility
 //! boundary.
 
+mod write_queue;
+
 use std::{
     collections::BTreeMap,
+    ops::Deref,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 
 use artifact_contract::{ArtifactCacheKey, ManifestError, ValidatedArtifactManifest};
@@ -16,6 +21,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use sync_types::{ArtifactId, ObjectId, PlanId};
 use thiserror::Error;
 use uuid::Uuid;
+use write_queue::{Turn, WriteQueue};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS artifacts (
@@ -221,8 +227,38 @@ pub struct AuditEntry {
     pub reason: String,
 }
 
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a writer stays in this process's queue. Every turn ahead of it is
+/// one short transaction, so a long wait is a long queue and not a stuck
+/// writer, and giving up would fail a build that was about to write.
+const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct SqliteArtifactCatalog {
     connection: Connection,
+    writers: Arc<WriteQueue>,
+    turn_timeout: Duration,
+}
+
+/// A write transaction that keeps this process's turn on the catalog until
+/// it commits or rolls back.
+struct WriteTransaction<'connection> {
+    transaction: Transaction<'connection>,
+    _turn: Turn,
+}
+
+impl<'connection> Deref for WriteTransaction<'connection> {
+    type Target = Transaction<'connection>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.transaction
+    }
+}
+
+impl WriteTransaction<'_> {
+    fn commit(self) -> Result<()> {
+        self.transaction.commit()?;
+        Ok(())
+    }
 }
 
 impl SqliteArtifactCatalog {
@@ -237,7 +273,7 @@ impl SqliteArtifactCatalog {
             std::fs::create_dir_all(parent)?;
         }
         let mut connection = Connection::open(&path)?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mode: String =
@@ -245,19 +281,48 @@ impl SqliteArtifactCatalog {
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(CatalogError::JournalMode(mode));
         }
-        install_schema(&mut connection, &path)?;
-        Ok(Self { connection })
+        let writers = WriteQueue::for_path(&path)?;
+        {
+            let _turn = writers
+                .take_turn(DEFAULT_TURN_TIMEOUT)
+                .ok_or(CatalogError::WriterBusy(DEFAULT_TURN_TIMEOUT))?;
+            install_schema(&mut connection, &path)?;
+        }
+        Ok(Self {
+            connection,
+            writers,
+            turn_timeout: DEFAULT_TURN_TIMEOUT,
+        })
     }
 
-    /// Bounds waits for another catalog writer. Production defaults to five
-    /// seconds; tests and deployment composition may select a smaller finite
-    /// bound, but zero would make publication races spuriously fail.
-    pub fn set_busy_timeout(&self, timeout: std::time::Duration) -> Result<()> {
+    /// Bounds waits for another catalog writer, in this process and in
+    /// SQLite. Production waits five seconds for another process and sixty
+    /// in this process's queue; tests and deployment composition may select
+    /// a smaller finite bound, but zero would make publication races
+    /// spuriously fail.
+    pub fn set_busy_timeout(&mut self, timeout: Duration) -> Result<()> {
         if timeout.is_zero() {
             return Err(CatalogError::InvalidBusyTimeout);
         }
         self.connection.busy_timeout(timeout)?;
+        self.turn_timeout = timeout;
         Ok(())
+    }
+
+    /// Begins a write once every writer in this process that asked earlier
+    /// has finished.
+    fn write(&mut self) -> Result<WriteTransaction<'_>> {
+        let turn = self
+            .writers
+            .take_turn(self.turn_timeout)
+            .ok_or(CatalogError::WriterBusy(self.turn_timeout))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Ok(WriteTransaction {
+            transaction,
+            _turn: turn,
+        })
     }
 
     /// Executes the same bounded catalog read that bootstrap depends on.
@@ -291,9 +356,7 @@ impl SqliteArtifactCatalog {
         let objects = manifest_objects(manifest)?;
         let token = Uuid::new_v4().to_string();
 
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let exists: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM artifacts WHERE artifact_id = ?1)",
             [artifact_id.as_str()],
@@ -389,9 +452,7 @@ impl SqliteArtifactCatalog {
         let artifact = &manifest.manifest().artifact_id;
         let expected_manifest = serde_json::to_vec(manifest.manifest())?;
         let token = Uuid::new_v4().to_string();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let row = load_build_row(&transaction, artifact)?;
         reject_abandoned_build(&transaction, artifact)?;
         let stored_manifest: Vec<u8> = transaction.query_row(
@@ -477,9 +538,7 @@ impl SqliteArtifactCatalog {
         let expires = now_ms
             .checked_add(lease_duration_ms)
             .ok_or(CatalogError::TimestampOverflow)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let row = load_build_row(&transaction, &lease.artifact_id)?;
         validate_lease(&row, lease, now_ms)?;
         transaction.execute(
@@ -521,9 +580,7 @@ impl SqliteArtifactCatalog {
         let expires_ms = not_before_ms
             .checked_add(cleanup_lease_duration_ms)
             .ok_or(CatalogError::TimestampOverflow)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let row = load_build_row(&transaction, &lease.artifact_id)?;
         if let Some(abandonment) = load_build_abandonment(&transaction, &lease.artifact_id)? {
             if abandonment.abandoned_build_token == lease.token
@@ -603,9 +660,7 @@ impl SqliteArtifactCatalog {
         if cleanup_owner.is_empty() || cleanup_lease_duration_ms <= 0 {
             return Err(CatalogError::InvalidBuildCleanup);
         }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let row = load_build_row(&transaction, artifact)?;
         if !active_build_state(row.state) {
             return Err(CatalogError::ArtifactIsNotBuilding(row.state));
@@ -691,9 +746,7 @@ impl SqliteArtifactCatalog {
         S: BlobStore + ?Sized,
         F: FnMut(&ObjectId, usize) -> Result<()>,
     {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let artifact_exists: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM artifacts WHERE artifact_id = ?1)",
             [lease.artifact_id.as_str()],
@@ -786,9 +839,7 @@ impl SqliteArtifactCatalog {
             .checked_add(lease_duration_ms)
             .ok_or(CatalogError::TimestampOverflow)?;
         let token = Uuid::new_v4().to_string();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let row = load_build_row(&transaction, artifact)?;
         reject_abandoned_build(&transaction, artifact)?;
         if !matches!(
@@ -884,9 +935,7 @@ impl SqliteArtifactCatalog {
         // Keep the immediate transaction open across object verification. GC
         // and publication state transitions using this catalog therefore
         // cannot delete or retire an object between HEAD and visibility.
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let row = load_build_row(&transaction, &lease.artifact_id)?;
         let already_published = row.state == ArtifactState::Published;
         if !already_published {
@@ -1079,9 +1128,7 @@ impl SqliteArtifactCatalog {
         store: &S,
         now_ms: i64,
     ) -> Result<ValidatedArtifactManifest> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let row = load_build_row(&transaction, artifact)?;
         if row.state != ArtifactState::Published {
             return Err(CatalogError::ArtifactIsNotPublished(row.state));
@@ -1144,9 +1191,7 @@ impl SqliteArtifactCatalog {
         if unique.len() != artifacts.len() {
             return Err(CatalogError::DuplicatePlanArtifact);
         }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         transaction.execute(
             "DELETE FROM artifact_plan_leases WHERE expires_ms <= ?1",
             [now_ms],
@@ -1222,9 +1267,7 @@ impl SqliteArtifactCatalog {
         let mut deleted = Vec::new();
         for candidate in candidates {
             let artifact = ArtifactId::new(candidate)?;
-            let transaction = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let transaction = self.write()?;
             let row = load_build_row(&transaction, &artifact)?;
             if row.state != ArtifactState::Retired
                 || pinned_by_plan(&transaction, &artifact, now_ms)?
@@ -1268,9 +1311,7 @@ impl SqliteArtifactCatalog {
         if reason.is_empty() {
             return Err(CatalogError::EmptyReason);
         }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let row = load_build_row(&transaction, artifact)?;
         match row.state {
             ArtifactState::Retired => {
@@ -1330,9 +1371,7 @@ impl SqliteArtifactCatalog {
         store: &S,
         now_ms: i64,
     ) -> Result<Option<u64>> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let row = load_build_row(&transaction, artifact)?;
         if row.state != ArtifactState::Retired {
             return Err(CatalogError::InvalidTransition {
@@ -1409,9 +1448,7 @@ impl SqliteArtifactCatalog {
         now_ms: i64,
         reason: &str,
     ) -> Result<u64> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let row = load_build_row(&transaction, &lease.artifact_id)?;
         validate_lease(&row, lease, now_ms)?;
         if row.state == next {
@@ -1458,9 +1495,7 @@ impl SqliteArtifactCatalog {
         if reason.is_empty() {
             return Err(CatalogError::EmptyReason);
         }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let row = load_build_row(&transaction, artifact)?;
         let pinned_until: Option<i64> = transaction.query_row(
             "SELECT max(expires_ms) FROM artifact_plan_leases \
@@ -1917,6 +1952,8 @@ fn sqlite_i64(value: u64, field: &'static str) -> Result<i64> {
 pub enum CatalogError {
     #[error("artifact catalog busy timeout must be positive")]
     InvalidBusyTimeout,
+    #[error("another artifact catalog writer in this process held its turn past {0:?}")]
+    WriterBusy(Duration),
     #[error("artifact catalog I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("artifact catalog SQLite operation failed: {0}")]
@@ -2398,6 +2435,123 @@ mod tests {
                 .unwrap()
                 .is_none());
         }
+    }
+
+    /// Deletes each object only after `delay`, as a busy disk would.
+    struct SlowDeleteStore<'a> {
+        inner: &'a LocalFilesystemBlobStore,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait]
+    impl BlobStore for SlowDeleteStore<'_> {
+        async fn put_if_absent(
+            &self,
+            object: &ObjectId,
+            body: ByteStream,
+            metadata: &ObjectMetadata,
+        ) -> blob_store::Result<PutOutcome> {
+            self.inner.put_if_absent(object, body, metadata).await
+        }
+
+        async fn head(&self, object: &ObjectId) -> blob_store::Result<Option<ObjectMetadata>> {
+            self.inner.head(object).await
+        }
+
+        async fn get(&self, object: &ObjectId) -> blob_store::Result<Option<ByteStream>> {
+            self.inner.get(object).await
+        }
+
+        async fn delete(&self, object: &ObjectId) -> blob_store::Result<()> {
+            std::thread::sleep(self.delay);
+            self.inner.delete(object).await
+        }
+    }
+
+    fn retired_artifacts(
+        catalog: &mut SqliteArtifactCatalog,
+        store: &LocalFilesystemBlobStore,
+        count: usize,
+    ) -> (ArtifactId, Vec<ArtifactId>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let live = published_artifact(catalog, store, b"a warm tenant", "artifact-live")
+                .await
+                .manifest()
+                .artifact_id
+                .clone();
+            let mut retired = Vec::new();
+            for index in 0..count {
+                let bytes = format!("evicted tenant {index}");
+                let artifact_id = format!("artifact-evicted-{index}");
+                let manifest =
+                    published_artifact(catalog, store, bytes.as_bytes(), &artifact_id).await;
+                let artifact = manifest.manifest().artifact_id.clone();
+                catalog.retire(&artifact, 2_000, "evicted").unwrap();
+                retired.push(artifact);
+            }
+            (live, retired)
+        })
+    }
+
+    /// Deleting retired artifacts one after another takes the catalog's
+    /// write lock once for each. A plan pinning its artifact on another
+    /// connection meanwhile waits for the deletion in progress, not for the
+    /// last: SQLite's busy handler retries on a timer, and alone it lets the
+    /// deleting connection begin again before the waiting one ever wakes.
+    #[test]
+    fn a_plan_waits_for_one_retired_deletion_not_for_the_whole_sweep() {
+        const RETIRED: usize = 24;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.sqlite3");
+        let store = LocalFilesystemBlobStore::open(directory.path().join("blobs"), 1024).unwrap();
+        let mut sweeper = SqliteArtifactCatalog::open(&path).unwrap();
+        let (live, retired) = retired_artifacts(&mut sweeper, &store, RETIRED);
+        let mut planner = SqliteArtifactCatalog::open(&path).unwrap();
+        let deleted = AtomicUsize::new(0);
+
+        let (before, after) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let slow = SlowDeleteStore {
+                    inner: &store,
+                    delay: std::time::Duration::from_millis(10),
+                };
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                for artifact in &retired {
+                    let objects = runtime
+                        .block_on(sweeper.delete_retired_artifact(artifact, &slow, 3_000))
+                        .unwrap();
+                    assert!(objects.is_some());
+                    deleted.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            while deleted.load(Ordering::SeqCst) < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let before = deleted.load(Ordering::SeqCst);
+            planner
+                .pin_published_for_plan(
+                    &PlanId::new("plan-1").unwrap(),
+                    std::slice::from_ref(&live),
+                    10_000,
+                    3_000,
+                )
+                .unwrap();
+            (before, deleted.load(Ordering::SeqCst))
+        });
+
+        assert!(
+            after <= before + 2,
+            "the plan was pinned after {after} of {RETIRED} deletions, having asked after {before}"
+        );
+        assert_eq!(
+            sweeper.artifacts_in_state(ArtifactState::Retired).unwrap(),
+            Vec::<ArtifactId>::new()
+        );
     }
 
     #[tokio::test]

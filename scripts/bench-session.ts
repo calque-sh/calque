@@ -278,13 +278,53 @@ export function clockCheck(
  * the page's time origin. Frame stamps are wall-clock and map through the
  * offset read at the document request, so a probe late in the session moves
  * that offset by how far this has moved since load, and trusts the mapping
- * only while this holds still during the probe; differences, not readings,
- * are used, since the page's time origin may carry its own rounding.
+ * only while this holds still until the probe's match; differences, not
+ * readings, are used, since the page's time origin may carry its own rounding.
  */
 export function readWallDriftMs(page: Page): Promise<number> {
   return page.evaluate(
     () => Date.now() - (performance.timeOrigin + performance.now()),
   );
+}
+
+/**
+ * The wall drift read again each time a new frame changes the grid. A probe's
+ * value depends on its frames up to the match, so the clock may move during
+ * the hold window after it: what counts is the first reading taken after the
+ * match frame arrived. macOS slews its wall clock by up to a few milliseconds
+ * a second, which a hold window of seconds can carry past the probe's limit.
+ */
+export class DriftAtChanges {
+  readonly #readings: { readonly atMs: number; readonly driftMs: number }[] =
+    [];
+  #seen: number;
+
+  constructor(
+    private readonly read: () => Promise<number>,
+    framesBefore: readonly HashedFrame[],
+    private readonly now: () => number = hrtimeMs,
+  ) {
+    this.#seen = framesBefore.length;
+  }
+
+  async observe(frames: readonly HashedFrame[]): Promise<void> {
+    const from = Math.max(this.#seen, 1);
+    const changed = frames
+      .slice(from)
+      .some((frame, i) => frame.grid !== frames[from + i - 1]?.grid);
+    this.#seen = frames.length;
+    if (!changed) return;
+    const atMs = this.now();
+    this.#readings.push({ atMs, driftMs: await this.read() });
+  }
+
+  /** The first reading taken after a frame received at `receivedMs`, or null. */
+  after(receivedMs: number): number | null {
+    return (
+      this.#readings.find((reading) => reading.atMs >= receivedMs)?.driftMs ??
+      null
+    );
+  }
 }
 
 /**

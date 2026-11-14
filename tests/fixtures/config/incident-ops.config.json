@@ -9,7 +9,7 @@
   "sources": [
     {
       "id": "primary",
-      "connectionEnv": "INCIDENT_DATABASE_URL",
+      "databaseUrlEnv": "INCIDENT_DATABASE_URL",
       "publication": "calque_incident",
       "slot": "calque_incident_slot"
     }

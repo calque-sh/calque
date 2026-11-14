@@ -1199,6 +1199,7 @@ mod tests {
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                unlisted_columns: Vec::new(),
                 columns: vec![
                     ColumnInspection {
                         attribute_number: 1,
@@ -1211,6 +1212,7 @@ mod tests {
                         primary_key_ordinal: Some(1),
                         generated: false,
                         nondeterministic_collation: false,
+                        carried_as: None,
                     },
                     ColumnInspection {
                         attribute_number: 2,
@@ -1223,6 +1225,7 @@ mod tests {
                         primary_key_ordinal: None,
                         generated: false,
                         nondeterministic_collation: false,
+                        carried_as: None,
                     },
                 ],
             },

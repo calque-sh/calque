@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * `pnpm incidents`: the incident-operations page over the deterministic
- * 1M-row fixture, served by the `calque` binary.
+ * `pnpm incidents`: the incident-operations page over the benchmark's
+ * 100k-row cut of the deterministic fixture, served by the `calque` binary.
  *
  * It starts a disposable PostgreSQL 18 in its own compose project
  * (`<checkout>-incidents`, so the `pnpm demo` harnesses that recreate the
@@ -13,9 +13,7 @@
  *
  * `--fresh` removes calque's local state first, so the working set is
  * prepared from PostgreSQL again. `--no-open` skips Chrome. `--dataset
- * content-v1` seeds v1's rows with realistic content instead. `--rows 100k`
- * seeds the benchmark's 100k-row cut of either dataset in place of the whole
- * fixture.
+ * content-v1` seeds v1's rows with realistic content instead.
  * `CALQUE_INCIDENTS_POSTGRES_PORT`, `CALQUE_INCIDENTS_PORT` and
  * `CALQUE_INCIDENTS_UI_PORT` choose the ports.
  */
@@ -31,7 +29,6 @@ import {
   evaluateValidationReport,
   FIXTURE_DATABASE_ENV,
   psqlArguments,
-  seedFixture,
 } from "./bench-fixture.ts";
 import {
   benchSeedSql,
@@ -156,15 +153,12 @@ export function incidentsDatasetVersion(dataset: IncidentsDataset): string {
   return dataset === "content-v1" ? CONTENT_DATASET_VERSION : DATASET_VERSION;
 }
 
-/** How much of the dataset `pnpm incidents` seeds: the whole fixture, or the benchmark's cut. */
-export type IncidentsRows = "1m" | "100k";
-
 /** The rows in the benchmark's cut, the one sentinel per table included. */
 export const CUT_ROWS: number =
   SEED_ORDER.reduce((sum, table) => sum + BENCH_ROW_COUNTS[table], 0) +
   SEED_ORDER.length;
 
-/** The schema comment that marks a source as holding the cut, not the whole fixture. */
+/** The schema comment that marks a source as holding the cut. */
 export function cutSchemaMarker(dataset: IncidentsDataset): string {
   return `${incidentsDatasetVersion(dataset)} (100k cut)`;
 }
@@ -180,18 +174,11 @@ export function cutSchemaMarker(dataset: IncidentsDataset): string {
 export function holdsSeededDataset(
   sql: (statement: string) => string,
   dataset: IncidentsDataset = "v1",
-  rows: IncidentsRows = "1m",
 ): boolean {
   if (sql(metadataPresentSql).trim() !== "t") return false;
   if (!isSeededDataset(sql(seededDatasetSql))) return false;
   if (sql(issueTagsRekeyedSql).trim() !== "0") return false;
-  const marker =
-    rows === "100k"
-      ? cutSchemaMarker(dataset)
-      : dataset === "content-v1"
-        ? CONTENT_DATASET_VERSION
-        : "";
-  return sql(schemaMarkerSql).trim() === marker;
+  return sql(schemaMarkerSql).trim() === cutSchemaMarker(dataset);
 }
 
 /** The PostgreSQL system the source runs on. */
@@ -224,7 +211,6 @@ interface IncidentsOptions {
   readonly open: boolean;
   readonly fresh: boolean;
   readonly dataset: IncidentsDataset;
-  readonly rows: IncidentsRows;
 }
 
 export function parseIncidentsArguments(
@@ -232,10 +218,9 @@ export function parseIncidentsArguments(
 ): IncidentsOptions {
   const rest = arguments_[0] === "--" ? arguments_.slice(1) : arguments_;
   const usage = new Error(
-    "usage: pnpm incidents [--] [--no-open] [--fresh] [--dataset v1|content-v1] [--rows 1m|100k]",
+    "usage: pnpm incidents [--] [--no-open] [--fresh] [--dataset v1|content-v1]",
   );
   let dataset: IncidentsDataset | undefined;
-  let rows: IncidentsRows | undefined;
   for (let index = 0; index < rest.length; index += 1) {
     const argument = rest[index];
     if (argument === "--dataset") {
@@ -243,12 +228,6 @@ export function parseIncidentsArguments(
       if (dataset !== undefined || (value !== "v1" && value !== "content-v1"))
         throw usage;
       dataset = value;
-      index += 1;
-    } else if (argument === "--rows") {
-      const value = rest[index + 1];
-      if (rows !== undefined || (value !== "1m" && value !== "100k"))
-        throw usage;
-      rows = value;
       index += 1;
     } else if (argument !== "--no-open" && argument !== "--fresh") {
       throw usage;
@@ -258,7 +237,6 @@ export function parseIncidentsArguments(
     open: !rest.includes("--no-open"),
     fresh: rest.includes("--fresh"),
     dataset: dataset ?? "v1",
-    rows: rows ?? "1m",
   };
 }
 
@@ -328,7 +306,7 @@ async function main(): Promise<void> {
     const sql = (statement: string) =>
       composePsql(statement, composeEnvironment);
     const datasetVersion = incidentsDatasetVersion(options.dataset);
-    const seeded = holdsSeededDataset(sql, options.dataset, options.rows);
+    const seeded = holdsSeededDataset(sql, options.dataset);
     if (!seeded || options.fresh) {
       // Whatever calque prepared belongs to the rows it read; a reseed or a
       // fresh run removes it first, with its slot and publication when they
@@ -339,9 +317,7 @@ async function main(): Promise<void> {
       process.stdout.write(`Fixture already seeded (${datasetVersion}).\n`);
     } else {
       heading(
-        options.rows === "100k"
-          ? `Seeding the ${CUT_ROWS.toLocaleString("en-US")}-row cut (${datasetVersion})`
-          : `Seeding the 1M-row fixture (${datasetVersion})`,
+        `Seeding the ${CUT_ROWS.toLocaleString("en-US")}-row cut (${datasetVersion})`,
       );
       const started = performance.now();
       const seedEnvironment = {
@@ -362,7 +338,7 @@ async function main(): Promise<void> {
             chunks,
           ),
       };
-      if (options.rows === "100k" && options.dataset === "content-v1") {
+      if (options.dataset === "content-v1") {
         await seedContentFixture(
           seedEnvironment,
           contentSeams,
@@ -373,10 +349,7 @@ async function main(): Promise<void> {
         sql(
           `COMMENT ON SCHEMA incidents IS '${cutSchemaMarker("content-v1")}';`,
         );
-      } else if (options.rows === "100k") seedCut(seams.runSql);
-      else if (options.dataset === "content-v1")
-        await seedContentFixture(seedEnvironment, contentSeams);
-      else seedFixture(seedEnvironment, seams);
+      } else seedCut(seams.runSql);
       process.stdout.write(
         `Seeded the fixture in ${formatSeconds(performance.now() - started)} s.\n`,
       );

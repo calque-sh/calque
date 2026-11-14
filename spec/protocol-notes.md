@@ -65,6 +65,18 @@ Rules:
   `sourceSchema` and `sourceTable` it was resolved from. Generated bindings
   therefore name relations, not wire ids, and an application build is bound
   to no one database identity or timeline.
+- A bootstrap request that renews a plan carries
+  `residentStateProof`, the `nextResidentStateProof` of the plan in force;
+  `residentTables`, the wire ids of the tables the client holds; and
+  `residentCursor`, the cursor through which it has applied every change to
+  them. `residentTables` without the proof, or with `residentCursor` absent,
+  and `residentCursor` without `residentTables`, are invalid requests, and so
+  is a cursor this source did not sign for its epoch or one earlier than the
+  proof's cursor. A cursor outside the retained log, or a proof whose cache
+  key is not the one the bearer's scope gives now, is answered `409`
+  `RESNAPSHOT_REQUIRED`. A plan that renews every table it requires names no
+  artifact, and its `residentCursor`, `activationCursor` and change stream's
+  `fromCursorExclusive` and `throughCursorInclusive` are the claimed cursor.
 
 Recommended starting limits:
 

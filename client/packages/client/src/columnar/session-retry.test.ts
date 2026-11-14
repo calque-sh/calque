@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { eq } from "../facade/predicates.js";
 import { plan, until, makeClient, settled } from "./session.fixture.js";
+import { stubBrowserFeatures } from "../browser.fixture.js";
 
 /** The bootstrap's answer while the artifact it would plan is being published. */
 function preparing(retryAfterSeconds: number): Response {
@@ -24,9 +25,7 @@ function preparing(retryAfterSeconds: number): Response {
 
 describe("direct-columnar session", () => {
   beforeEach(() => {
-    vi.stubGlobal("navigator", {
-      userAgentData: { brands: [{ brand: "Chromium" }] },
-    });
+    stubBrowserFeatures();
   });
 
   afterEach(() => {

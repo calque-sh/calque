@@ -121,7 +121,10 @@ where
         process_id,
         secret_key,
     );
-    let connection = Connection::new(stream.inner, stream.delayed, parameters, receiver);
+    #[allow(unused_mut)]
+    let mut connection = Connection::new(stream.inner, stream.delayed, parameters, receiver);
+    #[cfg(feature = "runtime")]
+    connection.set_reply_timeout(config.reply_timeout);
 
     Ok((client, connection))
 }

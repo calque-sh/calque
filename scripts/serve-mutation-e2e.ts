@@ -107,6 +107,7 @@ declare global {
 const runId = randomUUID().replaceAll("-", "").slice(0, 12);
 const workDirectory = join(root, "target/serve-mutation-e2e", runId);
 const pageRoot = join(root, "target/client-serve-mutation");
+const calqueGrantBin = join(root, "client/packages/grant/bin/calque-grant.js");
 const postgresPort = process.env.CALQUE_SERVE_E2E_POSTGRES_PORT ?? "55491";
 const container = "calque-servee2e-pg18";
 const keepContainer = process.env.CALQUE_SERVE_E2E_KEEP_CONTAINER === "1";
@@ -370,11 +371,11 @@ async function main(): Promise<RunOutcome> {
       "utf8",
     ),
   ) as {
-    sources: { connectionEnv: string; slot: string; publication: string }[];
+    sources: { databaseUrlEnv: string; slot: string; publication: string }[];
   };
   const [source] = manifest.sources;
   if (!source) throw new Error("the binding fixture declares no source");
-  source.connectionEnv = DATABASE_ENV;
+  source.databaseUrlEnv = DATABASE_ENV;
   source.slot = runSlot;
   source.publication = runPublication;
   writeFileSync(configPath, `${JSON.stringify(manifest, null, 2)}\n`);
@@ -387,7 +388,7 @@ async function main(): Promise<RunOutcome> {
 
   // Two grants from one key file, so one `serve` verifies both.
   // `calque-dev-grant` creates the key file and mints the capable one, naming
-  // only `tasks=update`. The Node issuer example mints the other, with no
+  // only `tasks=update`. `calque-grant mint` mints the other, with no
   // command, so the reader page loading at all shows `calque serve` verifying
   // a token no Rust code signed.
   const keyFile = join(workDirectory, "grant-key.pk8");
@@ -427,17 +428,14 @@ async function main(): Promise<RunOutcome> {
     "serve-mutation-writer",
   );
   const readOnly = mint(
-    [
-      process.execPath,
-      join(root, "client/examples/grant-issuer/mint-grant.mts"),
-    ],
+    [process.execPath, calqueGrantBin, "mint"],
     [],
     "serve-mutation-reader",
   );
   assert.deepEqual(
     readOnly.verificationKeyEnvironment,
     capable.verificationKeyEnvironment,
-    "the Node issuer must print the verification key calque-dev-grant printed for the same key file",
+    "calque-grant must print the verification key calque-dev-grant printed for the same key file",
   );
   assert.deepEqual(
     capable.commands,

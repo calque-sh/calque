@@ -43,7 +43,7 @@ describe("the quickstart dev server", () => {
   it("serves grant.json as it is on disk at each request", async () => {
     const missing = await fetch(new URL("grant.json", base));
     expect(missing.status).toBe(404);
-    expect(await missing.text()).toContain("calque-dev-grant");
+    expect(await missing.text()).toContain("calque-grant mint");
 
     for (const token of ["first", "second"]) {
       await writeFile(join(directory, "grant.json"), JSON.stringify({ token }));

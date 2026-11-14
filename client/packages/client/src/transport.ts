@@ -6,12 +6,13 @@ import { CONTROL_CHARACTER, MAX_ARTIFACT_CHUNK_BYTES } from "./limits.js";
 import { timeoutSignal } from "./abort-signal.js";
 import {
   acceptedArtifactEncodings,
+  ARTIFACT_TRANSPORT_PROFILE,
   type ArtifactEncodings,
   BOOTSTRAP_PROTOCOL_VERSION,
   bootstrapInit,
   bootstrapUrl,
-  CHROMIUM_NATIVE_ARTIFACT_PROFILE,
-  chromiumNativeArtifactProfile,
+  missingBrowserFeature,
+  type ResidentState,
 } from "./bootstrap-start.js";
 import { networkError, responseError, SyncError } from "./error.js";
 import {
@@ -56,7 +57,7 @@ const READABLE_ARTIFACT_ENCODINGS = Object.freeze([
 ] as const);
 
 export interface ArtifactTransportProfile {
-  readonly name: typeof CHROMIUM_NATIVE_ARTIFACT_PROFILE;
+  readonly name: typeof ARTIFACT_TRANSPORT_PROFILE;
   /** What the bootstrap request names. */
   readonly acceptedEncodings: ArtifactEncodings;
   /** What a plan's selected representation may be. */
@@ -64,15 +65,16 @@ export interface ArtifactTransportProfile {
 }
 
 export function artifactTransportProfile(): ArtifactTransportProfile {
-  if (!chromiumNativeArtifactProfile())
+  const missing = missingBrowserFeature();
+  if (missing !== undefined)
     throw new SyncError(
       "UNSUPPORTED_BROWSER",
       "client",
       "none",
-      "this browser does not report the Chromium brand; Calque runs only in Chromium-based browsers",
+      `this browser lacks ${missing}, which Calque needs`,
     );
   return {
-    name: CHROMIUM_NATIVE_ARTIFACT_PROFILE,
+    name: ARTIFACT_TRANSPORT_PROFILE,
     acceptedEncodings: acceptedArtifactEncodings(),
     readableEncodings: READABLE_ARTIFACT_ENCODINGS,
   };
@@ -89,6 +91,8 @@ interface BootstrapRequest {
   readonly clientInstanceId: string;
   readonly deviceId: string;
   readonly signal?: AbortSignal | undefined;
+  /** What a renewal presents; absent for a plan that installs an artifact. */
+  readonly resident?: ResidentState | undefined;
 }
 
 /**
@@ -115,6 +119,7 @@ export function requestBootstrapPlan(
         },
         request.clientInstanceId,
         request.signal,
+        request.resident,
       ),
     );
   } catch (error) {
@@ -349,7 +354,20 @@ async function bootstrapRefusal(response: Response): Promise<SyncError> {
   const message = `bootstrap failed with HTTP ${status}${code === undefined ? "" : ` ${code}`}`;
   if (status === 400 || status === 413 || status === 422)
     return new SyncError("SERVER_ERROR", "sync", "none", message);
+  if (status === 409) return new BootstrapConflictError(message);
   return responseError(status, "sync", message);
+}
+
+/**
+ * A bootstrap the server answered `409`: the state the request named, such as
+ * the resident state a renewal presents, no longer holds there. A fresh
+ * bootstrap may succeed later; the same renewal will not.
+ */
+export class BootstrapConflictError extends SyncError {
+  constructor(message: string) {
+    super("SERVER_ERROR", "sync", "retry", message);
+    this.name = "BootstrapConflictError";
+  }
 }
 
 /** The `code` a refusal body names, or nothing when it names none. */
@@ -737,7 +755,7 @@ export async function submitMutationBatch(
     throw new MutationSubmissionError(
       mutationId,
       "MUTATION_AMBIGUOUS",
-      "mutation submission did not receive an HTTP response; retry the same mutation ID",
+      "mutation submission did not receive an HTTP response; retryMutation resends it",
       { cause: networkError(error, "mutation", "mutation request failed") },
     );
   }
@@ -764,7 +782,7 @@ export async function submitMutationBatch(
           ? "this deployment serves no mutation route for these credentials"
           : definitive
             ? "mutation request was rejected"
-            : "mutation submission failed; retry the same mutation ID",
+            : "mutation submission failed; retryMutation resends it",
     );
   }
   let bytes: Uint8Array<ArrayBuffer>;
@@ -778,7 +796,7 @@ export async function submitMutationBatch(
     throw new MutationSubmissionError(
       mutationId,
       "MUTATION_AMBIGUOUS",
-      "mutation response could not be read; retry the same mutation ID",
+      "mutation response could not be read; retryMutation resends it",
       { cause: error },
     );
   } finally {
@@ -792,7 +810,7 @@ export async function submitMutationBatch(
     throw new MutationSubmissionError(
       mutationId,
       "MUTATION_AMBIGUOUS",
-      "mutation response was invalid; retry the same mutation ID",
+      "mutation response was invalid; retryMutation resends it",
       { cause: error },
     );
   }
@@ -840,7 +858,7 @@ export function mutationOutcomeResult(
         throw new MutationSubmissionError(
           outcome.mutationId,
           "MUTATION_AMBIGUOUS",
-          "conflict mutation outcome omitted conflict details; retry the same mutation ID",
+          "conflict mutation outcome omitted conflict details; retryMutation resends it",
         );
       return freezeMutationResult({
         mutationId: outcome.mutationId,
@@ -857,7 +875,7 @@ export function mutationOutcomeResult(
         throw new MutationSubmissionError(
           outcome.mutationId,
           "MUTATION_AMBIGUOUS",
-          "retryable mutation outcome omitted its retry delay; retry the same mutation ID",
+          "retryable mutation outcome omitted its retry delay; retryMutation resends it",
         );
       return freezeMutationResult({
         mutationId: outcome.mutationId,

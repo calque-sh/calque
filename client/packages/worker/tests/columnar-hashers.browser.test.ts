@@ -1,5 +1,5 @@
 /**
- * An artifact reaching the engine worker through hasher workers, in Chromium,
+ * An artifact reaching the engine worker through hasher workers, in the browser,
  * with every worker the real one: the hashers run `columnar-hasher-entry.ts`
  * and the engine worker `columnar-worker-entry.ts`.
  *

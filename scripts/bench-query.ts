@@ -21,6 +21,7 @@ import {
 import { probeInvalidity } from "./bench-samples.ts";
 import type { Verdict } from "./bench-results.ts";
 import {
+  DriftAtChanges,
   HOLD_MARGIN_MS,
   readWallDriftMs,
   type Session,
@@ -203,6 +204,10 @@ export async function queryPage(
     const wallShiftMs = (await readWallDriftMs(page)) - driftAtLoadMs;
     session.network.wallShiftMs = wallShiftMs;
     const signalsBefore = capture.signals.length;
+    const drift = new DriftAtChanges(
+      () => readWallDriftMs(page),
+      capture.prefix(),
+    );
     rereadHostSleep();
     const calledAtMs = hrtimeMs();
     await page.selectOption("select[data-control=level]", QUERY_VIEW.level);
@@ -213,7 +218,7 @@ export async function queryPage(
         (globalThis as unknown as Record<string, number | null>)[name] ?? null,
       INPUT_STAMP,
     );
-    const offset = session.network.frameOffsetSeconds();
+    const offset = session.network.monotonicMinusEpochSeconds;
     const inputAtMs =
       stamp === null || offset === null
         ? null
@@ -223,6 +228,7 @@ export async function queryPage(
     let matchSeenAt: number | null = null;
     for (;;) {
       await delay(20);
+      await drift.observe(capture.prefix());
       const now = hrtimeMs();
       const frames = capture.prefix();
       if (reference === null) {
@@ -254,8 +260,14 @@ export async function queryPage(
       fromMs,
       signals,
     });
+    const match = window.find(
+      (frame) => frame.timestampMs === judgement.matchMs,
+    );
     const wallDriftMs =
-      (await readWallDriftMs(page)) - driftAtLoadMs - wallShiftMs;
+      ((match && drift.after(match.receivedMs)) ??
+        (await readWallDriftMs(page))) -
+      driftAtLoadMs -
+      wallShiftMs;
     const frameClock = frameClockCheck(window);
     let grid = await readGridView(page);
     const gridBy = hrtimeMs() + GRID_READ_TIMEOUT_MS;

@@ -22,6 +22,10 @@ import {
   submitMutationBatch,
   type ArtifactTransportProfile,
 } from "./transport.js";
+import {
+  stubBrowserFeatures,
+  stubWebAssemblyPolicy,
+} from "./browser.fixture.js";
 
 const COLUMNAR_VECTOR = new URL(
   "../../../../spec/bootstrap-plan.direct-columnar.example.json",
@@ -315,23 +319,21 @@ describe("fetchArtifact", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it.each([
+  it.each<readonly [string, () => void, readonly string[]]>([
     [
-      "names them in the request where the decoder worker can run",
-      () => vi.stubGlobal("Worker", vi.fn()),
+      "names them in the request where WebAssembly compiles",
+      () => undefined,
       ["packed-brotli-large-window", "brotli-large-window", "zstd", "identity"],
     ],
     [
-      "names neither where it cannot",
-      () => vi.stubGlobal("Worker", undefined),
+      "names neither where a policy forbids compiling it",
+      stubWebAssemblyPolicy,
       ["zstd", "identity"],
     ],
-  ] as const)(
+  ])(
     "reads both brotli encodings in a plan and %s",
     (_case, stub, accepted) => {
-      vi.stubGlobal("navigator", {
-        userAgentData: { brands: [{ brand: "Chromium" }] },
-      });
+      stubBrowserFeatures();
       stub();
       try {
         const profile = artifactTransportProfile();
@@ -713,8 +715,7 @@ describe("submitMutationBatch", () => {
       code: "MUTATION_AMBIGUOUS",
       recovery: "retry",
       mutationId: "m-1",
-      message:
-        "mutation response could not be read; retry the same mutation ID",
+      message: "mutation response could not be read; retryMutation resends it",
     };
     const cut = new ReadableStream<Uint8Array>({
       pull(controller) {
@@ -729,7 +730,7 @@ describe("submitMutationBatch", () => {
       code: "MUTATION_AMBIGUOUS",
       recovery: "retry",
       mutationId: "m-1",
-      message: "mutation response was invalid; retry the same mutation ID",
+      message: "mutation response was invalid; retryMutation resends it",
     };
     await expect(
       submit(new Response(Uint8Array.of(0xff, 0xff, 0xff))),

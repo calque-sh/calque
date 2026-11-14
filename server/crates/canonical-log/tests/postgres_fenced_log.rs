@@ -6,8 +6,14 @@ use canonical_log::{
     SnapshotBuildRetention, TransactionKey, CONTROL_SCHEMA_BOOTSTRAP_LOCK_KEY,
 };
 use postgres::{Client, NoTls};
+use postgres_connect::relay::SilenceableRelay;
 use sha2::{Digest, Sha256};
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 use sync_protocol::{
     change::{cell_value, CellValue as WireCellValue, ColumnValue as WireColumnValue, PrimaryKey},
     encode_primary_key, PRIMARY_KEY_CODEC_VERSION,
@@ -398,6 +404,55 @@ fn a_group_appends_in_order_in_one_commit_with_its_checkpoint() {
     assert_eq!((head, writers, checkpoint.as_str()), (7, 3, "0/70"));
     assert_eq!(records.last(), Some(&(7, 7)));
 
+    remove_source(&mut control, &source_id);
+}
+
+/// An append whose server stops answering mid-statement fails once the log
+/// connection's reply bound runs out, where it used to wait on the socket
+/// without end and hold the ingest loop with it.
+#[test]
+#[ignore = "requires CALQUE_CONTROL_DATABASE_URL"]
+fn an_append_whose_server_stops_answering_fails_once_the_reply_bound_runs_out() {
+    let url =
+        std::env::var("CALQUE_CONTROL_DATABASE_URL").expect("live control-store database URL");
+    let relay = SilenceableRelay::start(&url);
+    let source_id = unique_source_id();
+    let epoch = SourceEpoch::new("epoch-1").unwrap();
+    let mut control = Client::connect(&url, NoTls).unwrap();
+    let datastore = PostgresDatastoreIdentity::inspect(&mut control).unwrap();
+    install_active_writer_fence(&mut control, &source_id, &epoch);
+    install_slot_enrollment(&mut control, &source_id, &epoch);
+    let log = PostgresFencedCanonicalLog::connect(
+        relay.url(),
+        FencedWriterIdentity::new(source_id.clone(), epoch.clone(), 1, datastore).unwrap(),
+        state_dir(),
+    )
+    .unwrap();
+    log.append_group(barriers(&epoch, &[1]), Some(0x10))
+        .unwrap();
+
+    relay.silence();
+    let (sender, receiver) = mpsc::channel();
+    let appending = epoch.clone();
+    thread::spawn(move || {
+        let started = Instant::now();
+        let result = log
+            .append_group(barriers(&appending, &[2]), Some(0x20))
+            .map(|_| ());
+        let _ = sender.send((result, started.elapsed()));
+    });
+    let (result, elapsed) = receiver
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the append on a silent socket had not returned after 15 s");
+    assert!(
+        matches!(result, Err(LogError::PostgresUnavailable)),
+        "{result:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(8),
+        "the append returned after {elapsed:?}"
+    );
+    assert_eq!(durable_state(&mut control, &source_id).0, 1);
     remove_source(&mut control, &source_id);
 }
 
@@ -1613,4 +1668,252 @@ fn a_log_an_earlier_release_wrote_is_refused_at_connect_and_on_read() {
 
     drop(log);
     remove_source(&mut control, &source_id);
+}
+
+/// `value` as PostgreSQL writes an LSN.
+fn lsn(value: u64) -> String {
+    format!("{:X}/{:X}", value >> 32, value & 0xFFFF_FFFF)
+}
+
+/// The barrier at `sequence`, ending at `end_lsn`.
+fn barrier_ending_at(epoch: &SourceEpoch, sequence: u64, end_lsn: u64) -> CanonicalBarrier {
+    let mut barrier = barrier(epoch, sequence);
+    barrier.key.end_lsn = lsn(end_lsn);
+    barrier
+}
+
+/// A logical slot of the test database, dropped with the guard so a failed
+/// test does not leave it holding WAL.
+struct LogicalSlot {
+    url: String,
+    name: String,
+}
+
+impl LogicalSlot {
+    fn create(url: &str, control: &mut Client) -> Self {
+        let name = format!(
+            "calque_compaction_{}_{}",
+            std::process::id(),
+            next_id_ordinal()
+        );
+        control
+            .execute(
+                "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
+                &[&name],
+            )
+            .unwrap();
+        Self {
+            url: url.to_owned(),
+            name,
+        }
+    }
+
+    fn confirmed_flush(&self, control: &mut Client) -> u64 {
+        u64::from(
+            control
+                .query_one(
+                    "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = $1",
+                    &[&self.name],
+                )
+                .unwrap()
+                .get::<_, postgres::types::PgLsn>(0),
+        )
+    }
+}
+
+impl Drop for LogicalSlot {
+    fn drop(&mut self) {
+        if let Ok(mut client) = Client::connect(&self.url, NoTls) {
+            let _ = client.execute("SELECT pg_drop_replication_slot($1)", &[&self.name]);
+        }
+    }
+}
+
+fn retired_sequences(control: &mut Client, source_id: &SourceId) -> Vec<i64> {
+    control
+        .query(
+            "SELECT original_sequence FROM calque_control.canonical_log_retired_record
+              WHERE source_id = $1 ORDER BY original_sequence",
+            &[&source_id.as_str()],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+fn compacted_through(control: &mut Client, source_id: &SourceId) -> Option<String> {
+    control
+        .query_one(
+            "SELECT retired_compacted_through_lsn::text
+               FROM calque_control.canonical_log_retention WHERE source_id = $1",
+            &[&source_id.as_str()],
+        )
+        .unwrap()
+        .get(0)
+}
+
+/// A trimmed entry keeps its identity only while PostgreSQL could send its
+/// transaction again: while it ends after the source slot's confirmed flush
+/// or after the log's durable checkpoint. A trim under a lost fence, or one
+/// that cannot see the enrolled slot, forgets nothing; a later one forgets the
+/// backlog; and an entry the log forgot is refused if it ever comes again
+/// rather than appended a second time.
+#[test]
+#[ignore = "requires CALQUE_CONTROL_DATABASE_URL"]
+fn a_trim_forgets_the_retired_identities_postgresql_cannot_send_again() {
+    let url =
+        std::env::var("CALQUE_CONTROL_DATABASE_URL").expect("live control-store database URL");
+    let source_id = unique_source_id();
+    let epoch = SourceEpoch::new("epoch-1").unwrap();
+    let mut control = Client::connect(&url, NoTls).unwrap();
+    let datastore = PostgresDatastoreIdentity::inspect(&mut control).unwrap();
+    install_active_writer_fence(&mut control, &source_id, &epoch);
+    install_slot_enrollment(&mut control, &source_id, &epoch);
+    let slot = LogicalSlot::create(&url, &mut control);
+    let set_durable = |control: &mut Client, durable: u64| {
+        control
+            .execute(
+                "UPDATE calque_control.source_slot_enrollment
+                    SET slot_name = $2, database_name = current_database(),
+                        system_identifier = (
+                            SELECT system_identifier::text FROM pg_control_system()
+                        ),
+                        durable_canonical_lsn = $3
+                  WHERE source_id = $1",
+                &[&source_id.as_str(), &slot.name, &lsn(durable)],
+            )
+            .unwrap();
+    };
+    let set_lease = |control: &mut Client, interval: &str| {
+        control
+            .execute(
+                &format!(
+                    "UPDATE calque_control.source_fence_lease
+                        SET expires_at = clock_timestamp() + interval '{interval}'
+                      WHERE source_id = $1"
+                ),
+                &[&source_id.as_str()],
+            )
+            .unwrap();
+    };
+    let flushed = slot.confirmed_flush(&mut control);
+    let mut log = PostgresFencedCanonicalLog::connect(
+        &url,
+        FencedWriterIdentity::new(source_id.clone(), epoch.clone(), 1, datastore).unwrap(),
+        state_dir(),
+    )
+    .unwrap();
+    let ends = [
+        flushed - 2,
+        flushed - 1,
+        flushed + 1,
+        flushed + 2,
+        flushed + 3,
+    ];
+    for (sequence, end) in (1..).zip(&ends[..4]) {
+        log.append_barrier(barrier_ending_at(&epoch, sequence, *end))
+            .unwrap();
+    }
+    let position = |sequence| sync_types::CursorPosition {
+        source_epoch: epoch.clone(),
+        sequence,
+    };
+
+    // The checkpoint is past the slot's confirmed flush, which binds.
+    set_durable(&mut control, flushed + 1);
+    set_lease(&mut control, "-1 second");
+    log.retain_from(5).unwrap();
+    assert_eq!(retired_sequences(&mut control, &source_id), [1, 2, 3, 4]);
+    assert_eq!(compacted_through(&mut control, &source_id), None);
+    set_lease(&mut control, "5 minutes");
+    // A slot of that name on another cluster says nothing about this one.
+    control
+        .execute(
+            "UPDATE calque_control.source_slot_enrollment
+                SET system_identifier = 'another-cluster' WHERE source_id = $1",
+            &[&source_id.as_str()],
+        )
+        .unwrap();
+    log.retain_from(5).unwrap();
+    assert_eq!(retired_sequences(&mut control, &source_id), [1, 2, 3, 4]);
+    assert_eq!(compacted_through(&mut control, &source_id), None);
+    set_durable(&mut control, flushed + 1);
+    log.retain_from(5).unwrap();
+    assert_eq!(retired_sequences(&mut control, &source_id), [3, 4]);
+    assert_eq!(
+        compacted_through(&mut control, &source_id),
+        Some(lsn(flushed))
+    );
+    assert!(matches!(
+        log.append_barrier(barrier_ending_at(&epoch, 2, ends[1])),
+        Err(LogError::ReplayBehindCompaction)
+    ));
+    assert_eq!(
+        log.append_barrier(barrier_ending_at(&epoch, 3, ends[2]))
+            .unwrap(),
+        AppendOutcome::AlreadyPresent(position(3))
+    );
+    assert!(matches!(
+        log.append_group(
+            vec![
+                CanonicalEntry::Barrier(barrier_ending_at(&epoch, 5, ends[4])),
+                CanonicalEntry::Barrier(barrier_ending_at(&epoch, 1, ends[0])),
+            ],
+            None,
+        ),
+        Err(LogError::ReplayBehindCompaction)
+    ));
+    assert_eq!(log.head().unwrap(), position(4));
+    assert_eq!(
+        log.append_barrier(barrier_ending_at(&epoch, 5, ends[4]))
+            .unwrap(),
+        AppendOutcome::Appended(position(5))
+    );
+
+    // The slot moves past the checkpoint, which binds now. The entry trimmed
+    // after the checkpoint keeps its identity.
+    control
+        .execute(
+            "SELECT pg_replication_slot_advance($1, $2::text::pg_lsn)",
+            &[&slot.name, &lsn(flushed + 3)],
+        )
+        .unwrap();
+    assert!(slot.confirmed_flush(&mut control) >= flushed + 3);
+    set_durable(&mut control, flushed + 2);
+    log.retain_from(6).unwrap();
+    assert_eq!(retired_sequences(&mut control, &source_id), [5]);
+    assert_eq!(
+        compacted_through(&mut control, &source_id),
+        Some(lsn(flushed + 2))
+    );
+    assert!(matches!(
+        log.append_barrier(barrier_ending_at(&epoch, 4, ends[3])),
+        Err(LogError::ReplayBehindCompaction)
+    ));
+    assert_eq!(
+        log.append_barrier(barrier_ending_at(&epoch, 5, ends[4]))
+            .unwrap(),
+        AppendOutcome::AlreadyPresent(position(5))
+    );
+
+    drop(log);
+    let mut cleanup = control.transaction().unwrap();
+    for table in [
+        "canonical_log_retired_record",
+        "canonical_log_record",
+        "canonical_log_head",
+        "canonical_log_retention",
+        "source_slot_enrollment",
+        "canonical_log_writer_fence",
+        "source_fence_lease",
+    ] {
+        cleanup
+            .execute(
+                &format!("DELETE FROM calque_control.{table} WHERE source_id = $1"),
+                &[&source_id.as_str()],
+            )
+            .unwrap();
+    }
+    cleanup.commit().unwrap();
 }

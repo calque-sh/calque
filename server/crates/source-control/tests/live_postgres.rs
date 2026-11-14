@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, env};
 use postgres::{Client, NoTls};
 use source_control::{
     inspect_source, validate_enrollment, EnrollmentRequirements, QualifiedTable, SchemaRegistry,
-    SchemaRegistryError,
+    SchemaRegistryError, UnlistedColumn,
 };
 
 #[test]
@@ -49,7 +49,7 @@ fn inspects_a_live_logical_replication_source() {
                FOR TABLE public.calque_enrollment_tasks (id, title)
                WHERE (id IS NOT NULL);",
         )
-        .expect("replace publication with unsupported projections");
+        .expect("replace publication with a row filter and a column list");
     let filtered = inspect_source(
         &mut client,
         "calque_enrollment_test",
@@ -70,8 +70,28 @@ fn inspects_a_live_logical_replication_source() {
         .iter()
         .map(|diagnostic| diagnostic.code.as_str())
         .collect();
-    assert!(diagnostic_codes.contains("PUBLICATION_ROW_FILTER_UNSUPPORTED"));
-    assert!(diagnostic_codes.contains("PUBLICATION_COLUMN_LIST_UNSUPPORTED"));
+    assert_eq!(
+        diagnostic_codes,
+        BTreeSet::from(["PUBLICATION_ROW_FILTER_UNSUPPORTED"])
+    );
+    let projected = &filtered.tables[0];
+    assert_eq!(
+        projected
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id", "title"]
+    );
+    assert_eq!(
+        projected.unlisted_columns,
+        [UnlistedColumn {
+            name: "updated_at".to_owned(),
+            primary_key: false,
+            required_on_insert: true,
+        }]
+    );
+    assert!(projected.insert_needs_unlisted_column());
     assert!(matches!(
         registry.verify_live(&mut client),
         Err(SchemaRegistryError::EnrollmentNotReady(_))
@@ -216,10 +236,14 @@ fn inspects_several_tables_each_with_its_own_catalog_facts() {
                title_length int4 GENERATED ALWAYS AS (length(title)) STORED
              );
              ALTER TABLE public.calque_inspect_a DROP COLUMN dropped;
+             CREATE DOMAIN calque_inspect_schema.stamp AS int8 NOT NULL DEFAULT 0;
+             CREATE DOMAIN calque_inspect_schema.strict AS text NOT NULL;
              CREATE TABLE calque_inspect_schema.calque_inspect_b (
                region text,
                number int8,
                note varchar(20),
+               stamp calque_inspect_schema.stamp,
+               strict calque_inspect_schema.strict,
                PRIMARY KEY (number, region)
              );
              CREATE TABLE public.calque_inspect_b (other bool);
@@ -342,7 +366,6 @@ fn inspects_several_tables_each_with_its_own_catalog_facts() {
             vec![
                 (1, "region", "text", -1, false, Some(2), false),
                 (2, "number", "int8", -1, false, Some(1), false),
-                (3, "note", "varchar", 24, true, None, false),
             ],
             vec![
                 (1, "id", "uuid", -1, false, Some(1), false),
@@ -353,6 +376,31 @@ fn inspects_several_tables_each_with_its_own_catalog_facts() {
             vec![],
         ]
     );
+    // A domain's default fills a column an insert leaves out; a domain's
+    // NOT NULL without one makes the column required.
+    assert_eq!(
+        snapshot.tables[0].unlisted_columns,
+        [
+            UnlistedColumn {
+                name: "note".to_owned(),
+                primary_key: false,
+                required_on_insert: false,
+            },
+            UnlistedColumn {
+                name: "stamp".to_owned(),
+                primary_key: false,
+                required_on_insert: false,
+            },
+            UnlistedColumn {
+                name: "strict".to_owned(),
+                primary_key: false,
+                required_on_insert: true,
+            },
+        ]
+    );
+    assert!(snapshot.tables[1..]
+        .iter()
+        .all(|inspection| inspection.unlisted_columns.is_empty()));
 
     client
         .batch_execute(

@@ -299,6 +299,10 @@ pub struct BootstrapRequest {
     pub resident_state_proof: Option<String>,
     /// Exact client-resident subset authenticated by `resident_state_proof`.
     pub resident_tables: BTreeSet<TableId>,
+    /// The cursor through which the client has applied every change to its
+    /// resident tables, signed by this source and never before the proof's.
+    /// Required with `resident_tables`.
+    pub resident_cursor: Option<OpaqueCursor>,
     pub authorization: AuthorizedBootstrapScope,
     pub cached_artifact_hints: BTreeSet<ArtifactId>,
     pub accepted_encodings: Vec<RepresentationEncoding>,
@@ -628,22 +632,31 @@ impl BootstrapPlanner {
             return Err(BootstrapError::ResidentClaimOutsideProof);
         }
         let resident_tables = request.resident_tables.clone();
-        let resident_cursor = (!resident_tables.is_empty())
-            .then(|| resident_state.as_ref().map(|state| state.cursor.clone()))
-            .flatten();
-        let resident_position = resident_cursor
-            .as_ref()
-            .map(|cursor| {
-                source
-                    .cursor_codec()
-                    .decode_for_epoch(cursor, source.source_epoch())
-            })
-            .transpose()
-            .map_err(BootstrapError::ResidentCursor)?;
-        if let Some(position) = &resident_position {
-            validate_cursor_window(position, minimum_retained, head.sequence)
-                .map_err(BootstrapError::ResidentCursorWindow)?;
-        }
+        // The proof's cursor is where this deployment last saw the client
+        // hold its tables for this scope, so the client's own cursor may
+        // stand there or later, never earlier.
+        let (resident_cursor, resident_position) = match &resident_state {
+            Some(state) if !resident_tables.is_empty() => {
+                let cursor = request
+                    .resident_cursor
+                    .clone()
+                    .ok_or(BootstrapError::ResidentCursorMissing)?;
+                let decode = |cursor| {
+                    source
+                        .cursor_codec()
+                        .decode_for_epoch(cursor, source.source_epoch())
+                        .map_err(BootstrapError::ResidentCursor)
+                };
+                let position = decode(&cursor)?;
+                if position.sequence < decode(&state.cursor)?.sequence {
+                    return Err(BootstrapError::ResidentCursorBeforeProof);
+                }
+                validate_cursor_window(&position, minimum_retained, head.sequence)
+                    .map_err(BootstrapError::ResidentCursorWindow)?;
+                (Some(cursor), Some(position))
+            }
+            _ => (None, None),
+        };
         let registry_tables: BTreeSet<_> = source
             .registry_binding()
             .tables()
@@ -775,14 +788,19 @@ impl BootstrapPlanner {
         }
         let catch_up_start = catch_up_start.ok_or(BootstrapError::NoCatchUpStart)?;
         // The scope's state where its catch-up starts is its state at the
-        // head when nothing it reads committed in between.
+        // head when nothing it reads committed in between. A plan that
+        // installs no artifact continues the client's own state, which is
+        // whole where its catch-up starts.
         let unchanged = request.unchanged.is_some_and(|unchanged| {
             unchanged.last_change <= catch_up_start.sequence && head.sequence <= unchanged.through
         });
-        let activation_cursor =
-            source
-                .cursor_codec()
-                .encode(if unchanged { &catch_up_start } else { &head });
+        let activation_cursor = source
+            .cursor_codec()
+            .encode(if unchanged || selected.is_empty() {
+                &catch_up_start
+            } else {
+                &head
+            });
         log.acquire_plan_retention_lease(
             plan_id.clone(),
             catch_up_start.sequence.saturating_add(1),
@@ -1346,7 +1364,9 @@ fn compute_memory(
             .checked_add(candidate.manifest.manifest().memory.estimated_peak_bytes)
             .ok_or(BootstrapError::MemoryOverflow)?;
     }
-    if estimated > budget.safe_budget_bytes {
+    // A plan that installs nothing asks for no memory the client does not
+    // already hold.
+    if !selected.is_empty() && estimated > budget.safe_budget_bytes {
         return Err(BootstrapError::MemoryCapacityExceeded {
             required: estimated,
             available: budget.safe_budget_bytes,
@@ -1553,6 +1573,10 @@ pub enum BootstrapError {
     ResidentClaimOutsideProof,
     #[error("resident cursor is unusable: {0}")]
     ResidentCursorWindow(CursorWindowError),
+    #[error("resident tables are named without the cursor they stand at")]
+    ResidentCursorMissing,
+    #[error("resident cursor stands before the resident-state proof's cursor")]
+    ResidentCursorBeforeProof,
     #[error("published artifact {artifact} has an invalid snapshot cursor: {source}")]
     ArtifactCursor {
         artifact: ArtifactId,
@@ -1833,6 +1857,7 @@ mod tests {
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                unlisted_columns: Vec::new(),
                 columns: vec![
                     ColumnInspection {
                         attribute_number: 1,
@@ -1845,6 +1870,7 @@ mod tests {
                         primary_key_ordinal: Some(1),
                         generated: false,
                         nondeterministic_collation: false,
+                        carried_as: None,
                     },
                     ColumnInspection {
                         attribute_number: 2,
@@ -1857,6 +1883,7 @@ mod tests {
                         primary_key_ordinal: None,
                         generated: false,
                         nondeterministic_collation: false,
+                        carried_as: None,
                     },
                 ],
             }],
@@ -2218,10 +2245,13 @@ mod tests {
         let resident_tables = resident_state_proof
             .as_ref()
             .map_or_else(BTreeSet::new, |_| BTreeSet::from([table.clone()]));
+        // A client that holds its tables where the proof says it does.
+        let resident_cursor = resident_state_proof.as_deref().and_then(proof_cursor);
         BootstrapRequest {
             required_tables: BTreeSet::from([table.clone()]),
             resident_state_proof,
             resident_tables,
+            resident_cursor,
             authorization: AuthorizedBootstrapScope::new(
                 DeliveryPrincipal::new("user-1").unwrap(),
                 source,
@@ -2250,6 +2280,15 @@ mod tests {
             max_change_batch_bytes: 4 * 1024 * 1024,
             unchanged: None,
         }
+    }
+
+    /// The cursor a proof carries, read without checking its signature.
+    fn proof_cursor(proof: &str) -> Option<OpaqueCursor> {
+        let (payload, _) = proof.split_once('.')?;
+        let payload = URL_SAFE_NO_PAD.decode(payload).ok()?;
+        serde_json::from_slice::<ResidentStatePayload>(&payload)
+            .ok()
+            .map(|payload| payload.cursor)
     }
 
     fn unbounded_memory() -> ClientMemoryBudget {
@@ -3002,6 +3041,172 @@ mod tests {
                 "removed: {removed}"
             );
         }
+    }
+
+    /// A page renews its plan from where it stands: a plan that installs no
+    /// artifact starts and activates at the client's own cursor, leases the
+    /// log from there, and refuses a cursor this source did not sign for its
+    /// epoch, one before the proof's, and one outside the retained log.
+    #[tokio::test]
+    async fn a_renewal_continues_from_the_client_s_own_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let (source, table, scope) = activated_source_with_scope();
+        let mut log = canonical_log(&directory.path().join("log"), &source);
+        let advance = |log: &mut FileCanonicalLog, to: u64| {
+            while log.head().sequence < to {
+                let next = log.head().sequence + 1;
+                log.append_barrier(CanonicalBarrier {
+                    key: TransactionKey {
+                        source_epoch: source.source_epoch().clone(),
+                        end_lsn: format!("0/{:X}", next * 16 + 16),
+                        postgres_xid: u32::try_from(next).unwrap(),
+                    },
+                    build_id: "renewal-test".to_owned(),
+                    nonce: format!("nonce-{next}"),
+                    message_lsn: format!("0/{:X}", next * 16 + 15),
+                    commit_lsn: format!("0/{:X}", next * 16 + 16),
+                    commit_time_unix_micros: next,
+                })
+                .unwrap();
+            }
+        };
+        let cursor = |sequence| {
+            source.cursor_codec().encode(&CursorPosition {
+                source_epoch: source.source_epoch().clone(),
+                sequence,
+            })
+        };
+        let cut = cursor(log.head().sequence);
+        let artifact_bytes = b"artifact the page first loaded";
+        let manifest = manifest_for_scope(&source, &table, cut, artifact_bytes, &scope);
+        let mut catalog =
+            SqliteArtifactCatalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let store = LocalFilesystemBlobStore::open(directory.path().join("objects"), 1024).unwrap();
+        publish(&mut catalog, &store, &manifest, artifact_bytes).await;
+        let resolver = SameOriginProxyResolver::new("https://sync.test/").unwrap();
+        let resident_proofs = ResidentStateProofCodec::new([8_u8; 32]).unwrap();
+        advance(&mut log, 4);
+
+        let mut first = request(&source, &scope, &table, None);
+        first.plan_ttl = StdDuration::from_secs(60);
+        let first = BootstrapPlanner::plan(
+            &mut catalog,
+            &store,
+            &resolver,
+            &source,
+            &mut log,
+            &resident_proofs,
+            first,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.artifacts.len(), 1);
+        assert_eq!(first.activation_cursor, cursor(4));
+        advance(&mut log, 7);
+
+        let renewal = |claimed: Option<OpaqueCursor>| {
+            let mut renewal = request(
+                &source,
+                &scope,
+                &table,
+                Some(first.next_resident_state_proof.clone()),
+            );
+            renewal.resident_cursor = claimed;
+            renewal
+        };
+        let renewed = BootstrapPlanner::plan(
+            &mut catalog,
+            &store,
+            &resolver,
+            &source,
+            &mut log,
+            &resident_proofs,
+            renewal(Some(cursor(6))),
+        )
+        .await
+        .unwrap();
+        assert!(renewed.artifacts.is_empty());
+        assert_eq!(renewed.resident_cursor, Some(cursor(6)));
+        assert_eq!(renewed.change_stream.from_cursor_exclusive, cursor(6));
+        assert_eq!(renewed.change_stream.through_cursor_inclusive, cursor(6));
+        assert_eq!(renewed.activation_cursor, cursor(6));
+        let proof = resident_proofs
+            .decode(
+                &renewed.next_resident_state_proof,
+                &authorized_cache_key(&source, &scope, DECODER_PROFILE),
+            )
+            .unwrap();
+        assert_eq!(proof.cursor, cursor(6));
+
+        let forged = CursorCodec::new([9_u8; 32])
+            .unwrap()
+            .encode(&CursorPosition {
+                source_epoch: source.source_epoch().clone(),
+                sequence: 6,
+            });
+        let other_epoch = source.cursor_codec().encode(&CursorPosition {
+            source_epoch: SourceEpoch::new("another-epoch").unwrap(),
+            sequence: 6,
+        });
+        for (claimed, refused) in [
+            (None, "missing"),
+            (Some(forged), "forged"),
+            (Some(other_epoch), "another epoch"),
+            (Some(cursor(3)), "before the proof"),
+            (Some(cursor(8)), "past the head"),
+        ] {
+            let error = BootstrapPlanner::plan(
+                &mut catalog,
+                &store,
+                &resolver,
+                &source,
+                &mut log,
+                &resident_proofs,
+                renewal(claimed),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    (refused, &error),
+                    ("missing", BootstrapError::ResidentCursorMissing)
+                        | (
+                            "forged" | "another epoch",
+                            BootstrapError::ResidentCursor(_)
+                        )
+                        | (
+                            "before the proof",
+                            BootstrapError::ResidentCursorBeforeProof
+                        )
+                        | (
+                            "past the head",
+                            BootstrapError::ResidentCursorWindow(CursorWindowError::BeyondHead)
+                        )
+                ),
+                "{refused}: {error}"
+            );
+        }
+
+        // Once the first plan has expired, only the renewed plan's lease
+        // holds the log, from just after the cursor it renewed at.
+        let after_first = system_time_millis().unwrap() + 120_000;
+        log.retain_from_at(u64::MAX, after_first).unwrap();
+        assert_eq!(log.minimum_retained().sequence, 7);
+        assert!(matches!(
+            BootstrapPlanner::plan(
+                &mut catalog,
+                &store,
+                &resolver,
+                &source,
+                &mut log,
+                &resident_proofs,
+                renewal(Some(cursor(5))),
+            )
+            .await,
+            Err(BootstrapError::ResidentCursorWindow(
+                CursorWindowError::BeforeRetention
+            ))
+        ));
     }
 
     /// A resident-state proof is bound to the whole artifact cache key, and the

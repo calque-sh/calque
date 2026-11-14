@@ -144,6 +144,9 @@ pub struct S3BlobStore {
     client: Client,
     config: S3BlobStoreConfig,
     staging: PathBuf,
+    /// Where requests go, for the errors that name it: the endpoint's scheme,
+    /// host and port, never its credentials, path or query.
+    endpoint_label: String,
 }
 
 /// One S3-compatible endpoint and the static credentials used to reach it, so
@@ -180,6 +183,7 @@ impl S3BlobStore {
                 "access key id and secret access key must not be empty",
             ));
         }
+        let endpoint_label = endpoint_label(endpoint.endpoint_url.as_deref(), &endpoint.region);
         let mut builder = aws_sdk_s3::Config::builder()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new(endpoint.region))
@@ -194,7 +198,9 @@ impl S3BlobStore {
         if let Some(url) = endpoint.endpoint_url {
             builder = builder.endpoint_url(url);
         }
-        Self::open(Client::from_conf(builder.build()), config)
+        let mut store = Self::open(Client::from_conf(builder.build()), config)?;
+        store.endpoint_label = endpoint_label;
+        Ok(store)
     }
 
     pub fn open(client: Client, config: S3BlobStoreConfig) -> Result<Self> {
@@ -209,7 +215,23 @@ impl S3BlobStore {
             client,
             config,
             staging,
+            endpoint_label: "its configured endpoint".to_owned(),
         })
+    }
+
+    /// `error` with the bucket and endpoint a provider failure was made
+    /// against.
+    fn located(&self, error: StorageError) -> StorageError {
+        match error {
+            error @ (StorageError::Provider { .. } | StorageError::MultipartCleanup { .. }) => {
+                StorageError::ProviderAt {
+                    bucket: self.config.bucket.clone(),
+                    endpoint: self.endpoint_label.clone(),
+                    source: Box::new(error),
+                }
+            }
+            error => error,
+        }
     }
 
     pub fn object_key(&self, object: &ObjectId) -> String {
@@ -547,6 +569,42 @@ impl BlobStore for S3BlobStore {
         body: ByteStream,
         expected: &ObjectMetadata,
     ) -> Result<PutOutcome> {
+        self.put_if_absent_unlocated(object, body, expected)
+            .await
+            .map_err(|error| self.located(error))
+    }
+
+    async fn head(&self, object: &ObjectId) -> Result<Option<ObjectMetadata>> {
+        self.head_key(&self.object_key(object), object)
+            .await
+            .map_err(|error| self.located(error))
+    }
+
+    async fn get(&self, object: &ObjectId) -> Result<Option<ByteStream>> {
+        self.get_unlocated(object)
+            .await
+            .map_err(|error| self.located(error))
+    }
+
+    async fn delete(&self, object: &ObjectId) -> Result<()> {
+        self.client
+            .delete_object()
+            .bucket(&self.config.bucket)
+            .key(self.object_key(object))
+            .send()
+            .await
+            .map_err(|error| self.located(provider_error("delete-object", &error)))?;
+        Ok(())
+    }
+}
+
+impl S3BlobStore {
+    async fn put_if_absent_unlocated(
+        &self,
+        object: &ObjectId,
+        body: ByteStream,
+        expected: &ObjectMetadata,
+    ) -> Result<PutOutcome> {
         let staged = self.stage_body(body, expected).await?;
         let key = self.object_key(object);
         if expected.bytes < self.config.multipart_threshold_bytes
@@ -559,11 +617,7 @@ impl BlobStore for S3BlobStore {
         }
     }
 
-    async fn head(&self, object: &ObjectId) -> Result<Option<ObjectMetadata>> {
-        self.head_key(&self.object_key(object), object).await
-    }
-
-    async fn get(&self, object: &ObjectId) -> Result<Option<ByteStream>> {
+    async fn get_unlocated(&self, object: &ObjectId) -> Result<Option<ByteStream>> {
         let key = self.object_key(object);
         match self
             .client
@@ -586,17 +640,6 @@ impl BlobStore for S3BlobStore {
             Err(error) if get_not_found(&error) => Ok(None),
             Err(error) => Err(provider_error("get-object", &error)),
         }
-    }
-
-    async fn delete(&self, object: &ObjectId) -> Result<()> {
-        self.client
-            .delete_object()
-            .bucket(&self.config.bucket)
-            .key(self.object_key(object))
-            .send()
-            .await
-            .map_err(|error| provider_error("delete-object", &error))?;
-        Ok(())
     }
 }
 
@@ -1047,6 +1090,23 @@ fn sanitized_code(code: Option<&str>) -> String {
     }
 }
 
+/// Where requests go, without anything a URL can carry that is secret: the
+/// scheme, host and port of `endpoint_url`, or the AWS region when there is
+/// none.
+fn endpoint_label(endpoint_url: Option<&str>, region: &str) -> String {
+    let Some(url) = endpoint_url else {
+        return format!("AWS S3 in region {region}");
+    };
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    if scheme.is_empty() {
+        host.to_owned()
+    } else {
+        format!("{scheme}://{host}")
+    }
+}
+
 fn provider_error<E, R>(operation: &'static str, error: &SdkError<E, R>) -> StorageError
 where
     E: ProvideErrorMetadata,
@@ -1355,6 +1415,58 @@ mod tests {
             ObjectId::new("test/multipart-boundaries").unwrap(),
             metadata(bytes),
         )
+    }
+
+    #[test]
+    fn the_endpoint_label_drops_credentials_paths_and_queries() {
+        assert_eq!(
+            endpoint_label(None, "eu-west-3"),
+            "AWS S3 in region eu-west-3"
+        );
+        assert_eq!(
+            endpoint_label(
+                Some("https://key:secret@minio.internal:9000/base?token=t#f"),
+                "r"
+            ),
+            "https://minio.internal:9000"
+        );
+        assert_eq!(endpoint_label(Some("minio:9000"), "r"), "minio:9000");
+    }
+
+    #[tokio::test]
+    async fn a_provider_failure_names_the_bucket_and_endpoint_but_no_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let store = S3BlobStore::connect(
+            S3Endpoint {
+                region: "us-east-1".to_owned(),
+                endpoint_url: Some("http://user:urlsecret@127.0.0.1:1/path".to_owned()),
+                force_path_style: true,
+                access_key_id: "AKIAEXAMPLEKEY".to_owned(),
+                secret_access_key: "examplesecretvalue".to_owned(),
+                session_token: Some("exampletoken".to_owned()),
+            },
+            S3BlobStoreConfig::new("reports", "", root.path(), 1024).unwrap(),
+        )
+        .unwrap();
+        let error = store
+            .head(&ObjectId::new("test/unreachable").unwrap())
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.starts_with("S3 head-object failed (")
+                && text.ends_with(", using bucket reports at http://127.0.0.1:1"),
+            "{text}"
+        );
+        for secret in [
+            "AKIAEXAMPLEKEY",
+            "examplesecretvalue",
+            "exampletoken",
+            "urlsecret",
+            "/path",
+        ] {
+            assert!(!text.contains(secret), "{text}");
+        }
     }
 
     #[test]

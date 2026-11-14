@@ -1,6 +1,6 @@
 {
   "name": "@calque/client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Calque's browser client: syncs complete, authorized PostgreSQL collections and queries them locally through typed facades.",
   "license": "Apache-2.0",
   "repository": {
@@ -34,7 +34,7 @@
     }
   },
   "engines": {
-    "node": ">=22.15.0"
+    "node": "^22.23.4 || ^24.22.1 || >=26.12.1"
   },
   "type": "module",
   "exports": {

@@ -326,7 +326,7 @@ impl Fixture {
             "protocol": { "manifest": 1, "artifact": 1, "changeStream": 1, "mutation": 1 },
             "sources": [{
                 "id": self.source_id(),
-                "connectionEnv": DATABASE_ENV,
+                "databaseUrlEnv": DATABASE_ENV,
                 "publication": self.publication(),
                 "slot": self.slot(),
             }],
@@ -497,13 +497,18 @@ impl Serving {
             .collect()
     }
 
-    /// How many log lines so far contain every one of `parts`.
+    /// How many log lines so far contain every one of `parts`. Each line is
+    /// read with a space after it, so a part such as `tenant=4 ` also matches
+    /// the field that ends a line.
     fn logged(&self, parts: &[&str]) -> usize {
         self.stderr
             .lock()
             .unwrap()
             .iter()
-            .filter(|line| parts.iter().all(|part| line.contains(part)))
+            .filter(|line| {
+                let line = format!("{line} ");
+                parts.iter().all(|part| line.contains(part))
+            })
             .count()
     }
 }
@@ -1184,6 +1189,15 @@ fn each_tenant_is_built_on_its_first_request_and_holds_and_receives_only_its_row
         serving.logged(&["tenant build started", &format!("tenant={SMALL_TENANT} ")]),
         1,
         "one build served both requests"
+    );
+    assert_eq!(
+        serving.logged(&[
+            "tenant build started",
+            &format!("tenant={SMALL_TENANT} "),
+            "class=Normal"
+        ]),
+        1,
+        "a build a page waits on runs at normal priority"
     );
     assert_eq!(small.rows(&priorities), 3);
     assert_eq!(small.rows(&projects), 3);
@@ -1967,6 +1981,80 @@ fn an_evict_during_a_build_drops_the_build_and_its_result() {
     serving.shutdown();
 }
 
+/// A warm order's build runs in the background class until a page waits on
+/// it, and from its next stage at normal priority, where the host lets a
+/// lowered thread rise.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn a_page_that_waits_on_a_warm_order_s_build_moves_it_up_to_normal_priority() {
+    let _exclusive = exclusive();
+    let fixture = Fixture::new("raisebuild");
+    fixture.seed();
+    let serving = serve(&fixture);
+    let port = serving.port;
+    let tenant = format!("tenant={WARMED_TENANT} ");
+    let rises = std::thread::spawn(|| {
+        background_thread::lower_current_thread().unwrap();
+        background_thread::set_current_thread_class(background_thread::Class::Normal).is_ok()
+    })
+    .join()
+    .unwrap();
+    let raised = if rises {
+        "class=Normal"
+    } else {
+        "class=Background"
+    };
+
+    let mut held = hold_builds(&fixture);
+    let warmed = tenant_order(port, &fixture.order(TenantAction::Warm, WARMED_TENANT));
+    assert_eq!(warmed.status, 200, "{}", warmed.text());
+    let deadline = Instant::now() + DELIVERY_TIMEOUT;
+    while serving.logged(&["tenant build started", &tenant]) == 0 {
+        assert!(Instant::now() < deadline, "the warm order started no build");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        serving.logged(&["tenant build started", &tenant, "class=Background"]),
+        1,
+        "{:#?}",
+        serving.tenant_lines()
+    );
+    let waits = "a page waits on the tenant's build";
+    let grant = fixture.tenant_grant(WARMED_TENANT, 1);
+    let plan = std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| bootstrap(&fixture, port, &grant));
+        let deadline = Instant::now() + DELIVERY_TIMEOUT;
+        while serving.logged(&[waits, &tenant]) == 0 {
+            assert!(Instant::now() < deadline, "{:#?}", serving.tenant_lines());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The held build cannot finish before the page waits on it.
+        held.batch_execute("COMMIT").unwrap();
+        waiting.join().unwrap().0
+    });
+    assert_only_tenant(port, &plan, Some(WARMED_TENANT));
+    assert_eq!(serving.logged(&["tenant build started", &tenant]), 1);
+
+    // Each stage the build entered before the page waited ran in the
+    // background class, and each one after it in the class it was raised to.
+    let lines = serving.tenant_lines();
+    let waited = lines.iter().position(|line| line.contains(waits)).unwrap();
+    let stage =
+        |line: &&String| line.contains("tenant build stage entered") && line.contains(&tenant);
+    assert!(
+        lines[..waited]
+            .iter()
+            .filter(stage)
+            .all(|line| line.contains("class=Background")),
+        "{lines:#?}"
+    );
+    let after = lines[waited..].iter().filter(stage).collect::<Vec<_>>();
+    assert!(!after.is_empty(), "{lines:#?}");
+    assert!(after.iter().all(|line| line.contains(raised)), "{lines:#?}");
+
+    serving.shutdown();
+}
+
 /// The plan cap bounds a cache of verified plans, not the plans served: a
 /// plan the cache dropped is rebuilt from its token, for its own tenant.
 #[test]
@@ -2339,6 +2427,117 @@ fn a_warm_tenant_is_refreshed_by_the_re_cut_rule_and_the_tail_gauges_follow_it()
     settled();
     assert!(gauge(metrics_port, "canonical_log_tail_bytes") >= threshold);
     assert_eq!(builds(&serving), 0, "the restored cut was not replaced");
+
+    serving.shutdown();
+}
+
+/// A renewal of `held`, a plan's JSON, presenting its proof and its tables at
+/// `cursor` under `grant`.
+fn renewal_response(
+    fixture: &Fixture,
+    port: u16,
+    grant: &str,
+    held: &Value,
+    cursor: &str,
+) -> HttpResponse {
+    let document = serde_json::json!({
+        "protocolVersion": 1,
+        "requiredTables": fixture.relations(),
+        "residentStateProof": held["nextResidentStateProof"],
+        "residentTables": held["requiredTables"],
+        "residentCursor": cursor,
+        "cachedArtifactHints": [],
+        "acceptedEncodings": ["zstd", "identity"],
+        "memoryBudgetBytes": 1_073_741_824_u64,
+        "clientHeapReserveBytes": 67_108_864_u64,
+        "clientInstanceId": "tenants-live",
+        "deviceId": "tenants-live-device",
+    });
+    http(
+        port,
+        "POST",
+        "/v1/bootstrap",
+        &[
+            ("authorization", format!("Bearer {grant}")),
+            ("content-type", "application/json".to_owned()),
+            ("accept", "application/json".to_owned()),
+            ("accept-encoding", "identity".to_owned()),
+            ("x-calque-artifact-profile", ARTIFACT_PROFILE.to_owned()),
+        ],
+        Some(serde_json::to_vec(&document).unwrap().as_slice()),
+    )
+}
+
+/// A page renews its tenant's plan with the proof of the plan it holds. The
+/// renewal installs nothing, opens nothing and builds nothing, the renewed
+/// plan carries the tenant's changes on from the page's cursor, and another
+/// tenant's grant cannot renew the page's rows.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn a_page_renews_its_tenant_s_plan_without_opening_or_building_it() {
+    let _exclusive = exclusive();
+    let fixture = Fixture::new("renewal");
+    fixture.seed();
+    let serving = serve(&fixture);
+    let port = serving.port;
+    let grant = fixture.tenant_grant(SMALL_TENANT, 1);
+    bootstrap(&fixture, port, &grant);
+    let response = bootstrap_response(&fixture, port, &grant);
+    assert_eq!(response.status, 200, "{}", response.text());
+    let held = response.json();
+    let plan = Plan::parse(&held);
+    let (_, cursor) = drain(port, &plan, &plan.activation_cursor);
+    let tenant = format!("tenant={SMALL_TENANT} ");
+    let opened = serving.logged(&["tenant opened", &tenant]);
+    let built = serving.logged(&["tenant build started", &tenant]);
+
+    let renewal = renewal_response(
+        &fixture,
+        port,
+        &fixture.tenant_grant(SMALL_TENANT, 1),
+        &held,
+        &cursor,
+    );
+    assert_eq!(renewal.status, 200, "{}", renewal.text());
+    let renewed = renewal.json();
+    assert_eq!(renewed["artifacts"], serde_json::json!([]), "{renewed}");
+    assert_eq!(renewed["activationCursor"], cursor.as_str(), "{renewed}");
+    assert_eq!(serving.logged(&["tenant opened", &tenant]), opened);
+    assert_eq!(serving.logged(&["tenant build started", &tenant]), built);
+    assert!(
+        tenant_state(&fixture, port, SMALL_TENANT)["lastOpenedUnixSeconds"].is_u64(),
+        "a renewal keeps its tenant in use"
+    );
+
+    let renewed = Plan {
+        plan_id: renewed["planId"].as_str().unwrap().to_owned(),
+        scope_token: renewed["authorization"]["scopeToken"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .to_vec(),
+        activation_cursor: cursor.clone(),
+        ..plan
+    };
+    fixture.execute(&format!(
+        "INSERT INTO {tasks} VALUES (1, 200, 1, 'tenant-1-only after renewal', false);",
+        tasks = fixture.table("tasks"),
+    ));
+    wait_for(port, &renewed, &cursor, "tenant-1-only after renewal");
+
+    let foreign = renewal_response(
+        &fixture,
+        port,
+        &fixture.tenant_grant(OTHER_TENANT, 1),
+        &held,
+        &cursor,
+    );
+    assert_eq!(foreign.status, 409, "{}", foreign.text());
+    assert!(
+        foreign.text().contains("RESNAPSHOT_REQUIRED"),
+        "{}",
+        foreign.text()
+    );
 
     serving.shutdown();
 }

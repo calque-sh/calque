@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { QUERY_VIEW } from "./bench-oracle.ts";
 import { queryInvalidity, queryProblems } from "./bench-query.ts";
-import { wireByPurpose } from "./bench-results.ts";
+import { aboveWireMs, wireByPurpose } from "./bench-results.ts";
 
 const expected = { rows: 5, ids: ["e9", "e7", "e5", "e3", "e1"] };
 
@@ -136,4 +136,27 @@ test("wire bytes are filed by the route a request asked", () => {
   );
   // A page with its plan rendered in asks no bootstrap.
   assert.equal(wireByPurpose([request(`${origin}/`, 9_000)]).plan, 0);
+});
+
+test("above the wire is the paint minus the time the bytes need on the link", () => {
+  const sample = {
+    verdict: "PASS",
+    valueMs: 747.5,
+    totalBytes: 7_725_000,
+  } as const;
+  // 7,725,000 bytes are 61,800,000 bits: 618 ms at 100 Mbit/s.
+  assert.equal(aboveWireMs(sample, 100), 129.5);
+  assert.equal(aboveWireMs(sample, 50), 747.5 - 1_236);
+});
+
+test("above the wire is null without a passed sample, a link rate or bytes", () => {
+  const sample = {
+    verdict: "PASS",
+    valueMs: 747.5,
+    totalBytes: 7_725_000,
+  } as const;
+  assert.equal(aboveWireMs({ ...sample, verdict: "DNC" }, 100), null);
+  assert.equal(aboveWireMs({ ...sample, valueMs: null }, 100), null);
+  assert.equal(aboveWireMs(sample, null), null);
+  assert.equal(aboveWireMs({ ...sample, totalBytes: 0 }, 100), null);
 });

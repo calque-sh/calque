@@ -17,8 +17,12 @@
  */
 
 export const BOOTSTRAP_PROTOCOL_VERSION = 1;
-export const CHROMIUM_NATIVE_ARTIFACT_PROFILE = "chromium-native-artifact-v1";
-/** What a page that can run the decoder worker names, best first. */
+/**
+ * The profile name the server's bootstrap endpoint requires; it predates the
+ * client's feature detection and names no browser engine.
+ */
+export const ARTIFACT_TRANSPORT_PROFILE = "chromium-native-artifact-v1";
+/** What a page where the brotli decoder compiles names, best first. */
 export const DECODING_ARTIFACT_ENCODINGS = Object.freeze([
   "packed-brotli-large-window",
   "brotli-large-window",
@@ -157,7 +161,7 @@ type Slot = Record<typeof STARTED_BOOTSTRAP_SLOT, unknown>;
 export function startBootstrap(start: BootstrapStart): void {
   if (
     (globalThis as unknown as Slot)[STARTED_BOOTSTRAP_SLOT] !== undefined ||
-    !chromiumNativeArtifactProfile()
+    missingBrowserFeature() !== undefined
   )
     return;
   const page = globalThis.document as Document | undefined;
@@ -223,7 +227,7 @@ export function requestedParameters(
   const memoryBudgetBytes =
     start.memoryBudgetBytes ?? DEFAULT_MEMORY_BUDGET_BYTES;
   return {
-    transportProfile: CHROMIUM_NATIVE_ARTIFACT_PROFILE,
+    transportProfile: ARTIFACT_TRANSPORT_PROFILE,
     protocolVersion: BOOTSTRAP_PROTOCOL_VERSION,
     requiredTables: [...start.requiredTables].sort(),
     acceptedEncodings,
@@ -385,11 +389,26 @@ export function bootstrapUrl(endpoint: URL): URL {
   return new URL("v1/bootstrap", directory);
 }
 
-/** The request both paths send, so the two cannot drift apart. */
+/**
+ * The tables a mount holds, the cursor through which it has applied every
+ * change to them, and the proof of the plan that last renewed or installed
+ * them: what a renewal presents instead of asking for an artifact.
+ */
+export interface ResidentState {
+  readonly proof: string;
+  readonly tables: readonly string[];
+  readonly cursor: string;
+}
+
+/**
+ * The request every path sends, so they cannot drift apart. Only a renewal
+ * names resident state.
+ */
 export function bootstrapInit(
   parameters: Omit<BootstrapParameters, "url">,
   clientInstanceId: string,
   signal?: AbortSignal,
+  resident?: ResidentState,
 ): RequestInit & { readonly headers: Readonly<Record<string, string>> } {
   return {
     method: "POST",
@@ -408,38 +427,83 @@ export function bootstrapInit(
       clientHeapReserveBytes: parameters.clientHeapReserveBytes,
       clientInstanceId,
       deviceId: parameters.deviceId,
+      ...(resident
+        ? {
+            residentStateProof: resident.proof,
+            residentTables: resident.tables,
+            residentCursor: resident.cursor,
+          }
+        : {}),
     }),
     ...(signal ? { signal } : {}),
   };
 }
 
-/** Whether this browser is the tested Chromium native-decode profile. */
-export function chromiumNativeArtifactProfile(): boolean {
-  const navigatorValue = globalThis.navigator as
-    | (Navigator & {
-        readonly userAgentData?: {
-          readonly brands: readonly { readonly brand: string }[];
-        };
-      })
-    | undefined;
-  return (
-    navigatorValue?.userAgentData?.brands.some(
-      ({ brand }) => brand === "Chromium",
-    ) === true &&
-    typeof globalThis.ReadableStreamBYOBReader === "function" &&
-    typeof globalThis.Response === "function"
-  );
+/**
+ * Whether `new Worker(url, { type: "module" })` is understood: a browser reads
+ * the options' `type` before it parses the URL, so an unparsable URL starts no
+ * worker, and the getter has run only in a browser that knows module workers.
+ */
+function moduleWorkersExist(): boolean {
+  if (typeof globalThis.Worker !== "function") return false;
+  let read = false;
+  try {
+    new globalThis.Worker("http://[", {
+      get type(): WorkerType {
+        read = true;
+        return "module";
+      },
+    });
+  } catch {
+    // The URL is the reason, whichever browser this is.
+  }
+  return read;
+}
+
+/** The browser APIs the client calls, each with the name a refusal gives it. */
+const REQUIRED_BROWSER_FEATURES: readonly (readonly [string, () => boolean])[] =
+  [
+    ["Response", () => typeof globalThis.Response === "function"],
+    [
+      "ReadableStreamBYOBReader",
+      () => typeof globalThis.ReadableStreamBYOBReader === "function",
+    ],
+    [
+      'module workers (new Worker(url, { type: "module" }))',
+      moduleWorkersExist,
+    ],
+    [
+      "crypto.subtle (secure contexts only)",
+      () => typeof globalThis.crypto?.subtle?.digest === "function",
+    ],
+    [
+      "crypto.randomUUID (secure contexts only)",
+      () => typeof globalThis.crypto?.randomUUID === "function",
+    ],
+    ["structuredClone", () => typeof globalThis.structuredClone === "function"],
+    [
+      "Promise.withResolvers",
+      () => typeof Promise.withResolvers === "function",
+    ],
+    [
+      "String.prototype.isWellFormed",
+      () => typeof String.prototype.isWellFormed === "function",
+    ],
+  ];
+
+/** The first API the client needs that this browser lacks, by name. */
+export function missingBrowserFeature(): string | undefined {
+  return REQUIRED_BROWSER_FEATURES.find(([, present]) => !present())?.[0];
 }
 
 /**
- * Whether this page can run the brotli decoder: it has workers, and
- * WebAssembly compiles here, which a Content-Security-Policy without
- * `wasm-unsafe-eval` refuses. The page's inline starter makes the same two
- * checks, so both name the same list. A worker under a stricter policy than
- * its page is not detected.
+ * Whether WebAssembly compiles here, which a Content-Security-Policy without
+ * `wasm-unsafe-eval` refuses. The decoder worker needs it for the brotli
+ * encodings; a browser lacking workers never gets this far. The page's inline
+ * starter makes the same check, so both name the same list. A worker under a
+ * stricter policy than its page is not detected.
  */
 export function brotliDecoderRuns(): boolean {
-  if (typeof globalThis.Worker !== "function") return false;
   try {
     return (
       new WebAssembly.Module(new Uint8Array(EMPTY_WASM_MODULE)) instanceof

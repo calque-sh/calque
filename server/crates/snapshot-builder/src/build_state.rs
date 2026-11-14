@@ -246,7 +246,7 @@ pub(crate) fn copy_progress(
 /// schema generation instead of producing a stale artifact.
 pub(crate) async fn revalidate_registry_after_cut(
     registry: &SchemaRegistry,
-    mut endpoint: postgres_connect::Endpoint,
+    endpoint: postgres_connect::Endpoint,
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<(), SnapshotBuildStateError> {
@@ -254,13 +254,7 @@ pub(crate) async fn revalidate_registry_after_cut(
     if operation_timeout.is_zero() {
         return Err(SnapshotBuildStateError::RegistryRevalidationTimeout);
     }
-    let config = endpoint.config_mut();
-    config.connect_timeout(operation_timeout);
-    config.options(format!(
-        "-c statement_timeout={} -c lock_timeout={}",
-        operation_timeout.as_millis().min(i32::MAX as u128),
-        operation_timeout.as_millis().min(i32::MAX as u128),
-    ));
+    let endpoint = revalidation_endpoint(endpoint, operation_timeout);
     let revalidation_registry = registry.clone();
     let revalidation = tokio::task::spawn_blocking(move || {
         let mut client = endpoint
@@ -281,6 +275,23 @@ pub(crate) async fn revalidate_registry_after_cut(
         return Err(SnapshotBuildStateError::RegistryRevalidationCancelled);
     }
     Ok(())
+}
+
+/// `endpoint` as the revalidation connects: every wait ends at
+/// `operation_timeout`, and a server that stops answering fails the connection
+/// a reply margin later instead of holding the build.
+fn revalidation_endpoint(
+    mut endpoint: postgres_connect::Endpoint,
+    operation_timeout: Duration,
+) -> postgres_connect::Endpoint {
+    endpoint.config_mut().connect_timeout(operation_timeout);
+    endpoint.bound_replies(operation_timeout);
+    endpoint.append_options(&format!(
+        "-c statement_timeout={} -c lock_timeout={}",
+        operation_timeout.as_millis().min(i32::MAX as u128),
+        operation_timeout.as_millis().min(i32::MAX as u128),
+    ));
+    endpoint
 }
 
 async fn run_copy_workload(
@@ -549,4 +560,25 @@ pub enum SnapshotBuildStateError {
     RollForward(#[from] SnapshotRollForwardError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_revalidation_connection_bounds_its_replies_past_its_statement_timeout() {
+        let endpoint =
+            postgres_connect::Endpoint::parse("postgresql://user@127.0.0.1/app").unwrap();
+        let endpoint = revalidation_endpoint(endpoint, Duration::from_secs(15));
+        assert_eq!(
+            endpoint.config().get_reply_timeout(),
+            Some(&(Duration::from_secs(15) + postgres_connect::REPLY_MARGIN))
+        );
+        assert!(endpoint
+            .config()
+            .get_options()
+            .unwrap()
+            .contains("-c statement_timeout=15000 -c lock_timeout=15000"));
+    }
 }

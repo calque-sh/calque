@@ -12,13 +12,16 @@ use std::{
 use canonical_log::PostgresDatastoreIdentity;
 use pg_walstream::{parse_lsn, PgReplicationConnection, PgReplicationShutdownHandle};
 use postgres::{error::SqlState, Client, Row};
-use source_control::{ActivatedSource, SchemaRegistryBinding, SourceIdentity};
+use source_control::{
+    ActivatedSource, QualifiedTable, SchemaRegistryBinding, SourceIdentity, ROLE_MAY_REPLICATE,
+};
 use sync_types::{SourceEpoch, SourceId};
 use thiserror::Error;
 
 use crate::{
     inspect_owned_publication, ActivationEvidence, ActiveLease, FenceAuthority, FenceError,
     OwnedPublication, PostgresFenceStore, PostgresRefusal, ProvisionalLease, RenewalClock,
+    PUBLICATION_CHECK_INTERVAL,
 };
 
 const SLOT_INACTIVE_POLL_ATTEMPTS: usize = 100;
@@ -26,7 +29,8 @@ const SLOT_INACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PGOUTPUT_PROFILE_V1: &str = "v1-no-streaming";
 // Every source-controller statement runs under these, except slot creation's
 // wait for open transactions.
-const CONTROLLER_TIMEOUTS: &str = "SET statement_timeout = '2s'; SET lock_timeout = '1s';";
+const CONTROLLER_STATEMENT_TIMEOUT: Duration = Duration::from_secs(2);
+const CONTROLLER_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long creating a slot waits for open transactions to end, unless
 /// `SlotProvisioningConfig::with_open_transaction_wait` says otherwise.
 ///
@@ -58,6 +62,16 @@ impl SlotProvisioningConfig {
         self.open_transaction_wait = wait;
         self
     }
+
+    /// Slot creation's `lock_timeout` and `statement_timeout`, both the wait.
+    /// Zero would disable them, and they must fit PostgreSQL's 32-bit
+    /// millisecond range.
+    fn creation_wait(&self) -> Duration {
+        self.open_transaction_wait.clamp(
+            Duration::from_millis(1),
+            Duration::from_millis(i32::MAX as u64),
+        )
+    }
 }
 
 /// Durable one-shot binding between an activated source epoch and its
@@ -76,6 +90,13 @@ pub struct SlotEnrollment {
     pub(crate) pgoutput_profile: String,
     pub(crate) initial_lsn_text: String,
     pub(crate) durable_canonical_lsn_text: String,
+    /// The log's compaction watermark: it forgot every transaction ending at
+    /// or before it, and must not be sent them again.
+    pub(crate) retired_compacted_through_lsn_text: Option<String>,
+    /// The publication's fingerprint when the slot was made, which every
+    /// session requires unchanged; `None` for an enrollment made before
+    /// enrollments recorded it, until the next session records it.
+    pub(crate) publication_fingerprint: Option<String>,
 }
 
 impl SlotEnrollment {
@@ -103,6 +124,13 @@ impl SlotEnrollment {
         parse_lsn(&self.durable_canonical_lsn_text).map_err(|_| SourceRuntimeError::InvalidSlotLsn)
     }
 
+    pub fn retired_compacted_through_lsn(&self) -> Result<Option<u64>, SourceRuntimeError> {
+        self.retired_compacted_through_lsn_text
+            .as_deref()
+            .map(|lsn| parse_lsn(lsn).map_err(|_| SourceRuntimeError::InvalidSlotLsn))
+            .transpose()
+    }
+
     pub(crate) fn from_control_row(row: postgres::Row) -> Result<Self, FenceError> {
         let timeline_id: i64 = row.get(6);
         let previous_timeline_id: i64 = row.get(7);
@@ -122,6 +150,8 @@ impl SlotEnrollment {
             pgoutput_profile: row.get(8),
             initial_lsn_text: row.get(9),
             durable_canonical_lsn_text: row.get(10),
+            retired_compacted_through_lsn_text: None,
+            publication_fingerprint: row.get(11),
         })
     }
 }
@@ -167,6 +197,8 @@ pub struct ActiveSourceSession {
 struct SessionWatchdog {
     stop: mpsc::Sender<()>,
     join: Option<thread::JoinHandle<()>>,
+    publication_stop: mpsc::Sender<()>,
+    publication_join: Option<thread::JoinHandle<()>>,
     failed: Arc<AtomicBool>,
 }
 
@@ -227,7 +259,8 @@ impl ActiveSourceSession {
         self.lease.revoke();
         self.replication.take();
         self.io_runtime.take();
-        let mut controller = connect_source_controller(&self.source_connection)?;
+        let mut controller =
+            connect_source_controller(&self.source_connection, CONTROLLER_STATEMENT_TIMEOUT)?;
         wait_for_inactive_slot(&mut controller, &self.expected_source, &self.slot.slot_name)?;
         self.authority.release_revoked_active(&self.lease)?;
         Ok(())
@@ -246,7 +279,11 @@ impl ActiveSourceSession {
             return;
         };
         let _ = watchdog.stop.send(());
-        if let Some(join) = watchdog.join.take() {
+        let _ = watchdog.publication_stop.send(());
+        for join in [watchdog.join.take(), watchdog.publication_join.take()]
+            .into_iter()
+            .flatten()
+        {
             let _ = join.join();
         }
     }
@@ -274,17 +311,18 @@ pub fn provision_persistent_slot(
     }
     let binding = activated_source.registry_binding();
     let expected_source = binding.source_identity();
-    let mut controller = connect_source_controller(source_connection)?;
+    let mut controller = connect_source_controller(source_connection, config.creation_wait())?;
     verify_regular_source(&mut controller, expected_source)?;
-    verify_publication(&mut controller, binding)?;
+    let publication = verify_publication(&mut controller, binding)?;
     if inspect_slot(&mut controller, &config.slot_name)?.is_some() {
-        return Err(SourceRuntimeError::SlotAlreadyExists);
+        return Err(SourceRuntimeError::SlotAlreadyExists {
+            slot_name: config.slot_name.clone(),
+        });
     }
     while_renewing(authority, provisional, || {
         create_slot(&mut controller, config)
     })?;
-    let slot = inspect_slot(&mut controller, &config.slot_name)?
-        .ok_or(SourceRuntimeError::SlotMissingReseedRequired)?;
+    let slot = existing_slot(&mut controller, &config.slot_name)?;
     validate_slot(&slot, expected_source)?;
     let initial_lsn_text = format_lsn(slot.confirmed_flush_lsn);
     let enrollment = SlotEnrollment {
@@ -299,6 +337,8 @@ pub fn provision_persistent_slot(
         pgoutput_profile: PGOUTPUT_PROFILE_V1.to_owned(),
         initial_lsn_text: initial_lsn_text.clone(),
         durable_canonical_lsn_text: initial_lsn_text,
+        retired_compacted_through_lsn_text: None,
+        publication_fingerprint: Some(publication.fingerprint),
     };
     authority.record_slot_enrollment(provisional, &enrollment)?;
     Ok(enrollment)
@@ -396,7 +436,16 @@ where
         on_shutdown_handle,
     );
     provisional_watchdog.stop();
-    let (replication, io_runtime, slot, backend_pid, claim, flushed_lsn) = match prepared {
+    let PreparedSession {
+        replication,
+        io_runtime,
+        slot,
+        backend_pid,
+        claim,
+        flushed_lsn,
+        fingerprint,
+        wal_sender_timeout,
+    } = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             authority.release_after_failure(&provisional);
@@ -437,12 +486,15 @@ where
         expected_source.clone(),
         slot.slot_name.clone(),
         backend_pid,
+        PublicationWatch::new(activated_source.registry_binding(), fingerprint),
     ) {
         Ok(watchdog) => watchdog,
         Err(error) => {
             lease.revoke();
             drop(replication);
-            if let Ok(mut controller) = connect_source_controller(source_connection) {
+            if let Ok(mut controller) =
+                connect_source_controller(source_connection, CONTROLLER_STATEMENT_TIMEOUT)
+            {
                 let _ = wait_for_inactive_slot(&mut controller, &expected_source, &slot.slot_name);
             }
             if let Err(error) = authority.release_revoked_active(&lease) {
@@ -451,8 +503,11 @@ where
             return Err(error);
         }
     };
-    let ingest_state =
-        crate::persistent_ingest::PersistentIngestState::new(slot.confirmed_flush_lsn, flushed_lsn);
+    let ingest_state = crate::persistent_ingest::PersistentIngestState::new(
+        slot.confirmed_flush_lsn,
+        flushed_lsn,
+        wal_sender_timeout,
+    );
     Ok(ActiveSourceSession {
         replication: Some(replication),
         io_runtime: Some(io_runtime),
@@ -470,6 +525,20 @@ where
     })
 }
 
+/// A session's replication stream, started on the slot it claimed, before the
+/// lease is active. `fingerprint` is the publication's as the session checked
+/// it, and `wal_sender_timeout` its walsender's.
+struct PreparedSession {
+    replication: PgReplicationConnection,
+    io_runtime: tokio::runtime::Runtime,
+    slot: SlotMetadata,
+    backend_pid: i32,
+    claim: crate::DurableLogWriterClaim,
+    flushed_lsn: u64,
+    fingerprint: String,
+    wal_sender_timeout: Duration,
+}
+
 fn prepare_source_session<F>(
     authority: &FenceAuthority<PostgresFenceStore>,
     provisional: &ProvisionalLease,
@@ -478,27 +547,24 @@ fn prepare_source_session<F>(
     activated_source: &ActivatedSource,
     enrollment: &SlotEnrollment,
     on_shutdown_handle: F,
-) -> Result<
-    (
-        PgReplicationConnection,
-        tokio::runtime::Runtime,
-        SlotMetadata,
-        i32,
-        crate::DurableLogWriterClaim,
-        u64,
-    ),
-    SourceRuntimeError,
->
+) -> Result<PreparedSession, SourceRuntimeError>
 where
     F: FnOnce(PgReplicationShutdownHandle),
 {
     let binding = activated_source.registry_binding();
     let expected_source = binding.source_identity();
-    let mut controller = connect_source_controller(source_connection)?;
+    let mut controller =
+        connect_source_controller(source_connection, CONTROLLER_STATEMENT_TIMEOUT)?;
     verify_regular_source(&mut controller, expected_source)?;
-    let quoted_publication = verify_publication(&mut controller, binding)?;
-    let mut slot = inspect_slot(&mut controller, &enrollment.slot_name)?
-        .ok_or(SourceRuntimeError::SlotMissingReseedRequired)?;
+    let publication = verify_publication(&mut controller, binding)?;
+    match &enrollment.publication_fingerprint {
+        Some(enrolled) if *enrolled != publication.fingerprint => {
+            return Err(SourceRuntimeError::PublicationDrift);
+        }
+        Some(_) => {}
+        None => authority.adopt_publication_fingerprint(provisional, &publication.fingerprint)?,
+    }
+    let mut slot = existing_slot(&mut controller, &enrollment.slot_name)?;
     validate_slot(&slot, expected_source)?;
     if slot.confirmed_flush_lsn > enrollment.durable_canonical_lsn()? {
         return Err(SourceRuntimeError::SlotAheadOfCanonicalTruth {
@@ -526,17 +592,23 @@ where
     on_shutdown_handle(shutdown_handle);
     let flushed_lsn = verify_replication_source(&mut replication, expected_source)?;
     let backend_pid = replication_backend_pid(&mut replication)?;
+    let wal_sender_timeout = replication_wal_sender_timeout(&mut replication)?;
     authority.bind_backend(provisional, backend_pid)?;
 
     let options = activated_source
         .pgoutput_profile()
-        .start_replication_options(&quoted_publication)
+        .start_replication_options(&publication.quoted_name)
         .map_err(|_| SourceRuntimeError::UnsupportedPgoutputProfile)?;
+    // PostgreSQL writes the slot to disk only now and then, so a crash can
+    // take it back past what the log acknowledged and a trim then forgot.
+    // Everything up to the watermark is logged, so streaming starts after it.
+    let start_lsn = slot
+        .confirmed_flush_lsn
+        .max(enrollment.retired_compacted_through_lsn()?.unwrap_or(0));
     replication
-        .start_replication(&enrollment.slot_name, slot.confirmed_flush_lsn, &options)
+        .start_replication(&enrollment.slot_name, start_lsn, &options)
         .map_err(replication_error)?;
-    let claimed = inspect_slot(&mut controller, &enrollment.slot_name)?
-        .ok_or(SourceRuntimeError::SlotMissingReseedRequired)?;
+    let claimed = existing_slot(&mut controller, &enrollment.slot_name)?;
     validate_slot(&claimed, expected_source)?;
     if claimed.active_pid != Some(backend_pid) {
         return Err(SourceRuntimeError::SlotBackendBindingMismatch {
@@ -546,14 +618,17 @@ where
     }
     drop(io_guard);
     slot = claimed;
-    Ok((
+    slot.confirmed_flush_lsn = slot.confirmed_flush_lsn.max(start_lsn);
+    Ok(PreparedSession {
         replication,
         io_runtime,
         slot,
         backend_pid,
         claim,
         flushed_lsn,
-    ))
+        fingerprint: publication.fingerprint,
+        wal_sender_timeout,
+    })
 }
 
 /// Creates the slot, waiting up to `config.open_transaction_wait` for open
@@ -562,22 +637,17 @@ where
 /// PostgreSQL starts a new logical slot's decoding only after the transactions
 /// holding a transaction id, in any database on the server, have ended: those
 /// open when creation begins, then those open once they have. It waits for
-/// each on that transaction's lock, so `lock_timeout` ends the wait.
+/// each on that transaction's lock, and `lock_timeout` restarts with each, so
+/// `statement_timeout` bounds the waits together and `lock_timeout` only ends
+/// a single one at the same bound.
 fn create_slot(
     controller: &mut Client,
     config: &SlotProvisioningConfig,
 ) -> Result<(), SourceRuntimeError> {
-    // Zero would disable `lock_timeout`, and both settings must fit
-    // PostgreSQL's 32-bit millisecond range; `statement_timeout` sits a second
-    // past it, because the wait counts against both.
-    let wait_millis = config
-        .open_transaction_wait
-        .as_millis()
-        .clamp(1, i32::MAX as u128 - 1_000);
+    let wait = config.creation_wait().as_millis();
     controller
         .batch_execute(&format!(
-            "SET lock_timeout = {wait_millis}; SET statement_timeout = {};",
-            wait_millis + 1_000
+            "SET lock_timeout = {wait}; SET statement_timeout = {wait};"
         ))
         .map_err(source_error)?;
     let created = controller.query_one(
@@ -588,11 +658,14 @@ fn create_slot(
         &[&config.slot_name],
     );
     controller
-        .batch_execute(CONTROLLER_TIMEOUTS)
+        .batch_execute(&controller_timeouts())
         .map_err(source_error)?;
     match created {
         Ok(_) => Ok(()),
-        Err(error) if error.code() == Some(&SqlState::LOCK_NOT_AVAILABLE) => {
+        Err(error)
+            if error.code() == Some(&SqlState::LOCK_NOT_AVAILABLE)
+                || error.code() == Some(&SqlState::QUERY_CANCELED) =>
+        {
             Err(SourceRuntimeError::SlotCreationWaitedForOpenTransactions {
                 slot_name: config.slot_name.clone(),
                 waited: config.open_transaction_wait,
@@ -701,25 +774,89 @@ fn verify_replication_source(
     Ok(flushed_lsn)
 }
 
-/// Checks the publication against its enrolled definition, as a start does,
-/// and returns its quoted name. A publication altered while a session ran is
-/// refused here, at the next reconnect.
+/// The publication as a session found it: its name as an SQL identifier and
+/// its fingerprint.
+struct VerifiedPublication {
+    quoted_name: String,
+    fingerprint: String,
+}
+
+/// Checks the publication against its enrolled definition, as a start does.
 fn verify_publication(
     client: &mut Client,
     binding: &SchemaRegistryBinding,
-) -> Result<String, SourceRuntimeError> {
-    let tables = binding
-        .tables()
-        .iter()
-        .map(|(_, table)| table.clone())
-        .collect::<BTreeSet<_>>();
-    match inspect_owned_publication(client, &binding.publication().name, &tables)
-        .map_err(source_error)?
+) -> Result<VerifiedPublication, SourceRuntimeError> {
+    match inspect_owned_publication(
+        client,
+        &binding.publication().name,
+        &enrolled_tables(binding),
+    )
+    .map_err(source_error)?
     {
         OwnedPublication::Missing => Err(SourceRuntimeError::PublicationMissing),
         OwnedPublication::Drifted => Err(SourceRuntimeError::PublicationDrift),
-        OwnedPublication::Matches { quoted_name } => Ok(quoted_name),
+        OwnedPublication::Matches {
+            quoted_name,
+            fingerprint,
+        } => Ok(VerifiedPublication {
+            quoted_name,
+            fingerprint,
+        }),
     }
+}
+
+fn enrolled_tables(binding: &SchemaRegistryBinding) -> BTreeSet<QualifiedTable> {
+    binding
+        .tables()
+        .iter()
+        .map(|(_, table)| table.clone())
+        .collect()
+}
+
+/// What a session's publication check compares: the fingerprint the session
+/// opened on, and the definition it requires.
+struct PublicationWatch {
+    name: String,
+    tables: BTreeSet<QualifiedTable>,
+    fingerprint: String,
+}
+
+impl PublicationWatch {
+    fn new(binding: &SchemaRegistryBinding, fingerprint: String) -> Self {
+        Self {
+            name: binding.publication().name.clone(),
+            tables: enrolled_tables(binding),
+            fingerprint,
+        }
+    }
+
+    /// Whether the publication is gone or changed since the session opened.
+    /// A failed read changes nothing: the session's own connections fail on
+    /// what makes it fail.
+    fn changed(&self, controller: &mut Option<Client>, source_connection: &str) -> bool {
+        if controller.is_none() {
+            *controller =
+                connect_source_controller(source_connection, CONTROLLER_STATEMENT_TIMEOUT).ok();
+        }
+        let Some(client) = controller.as_mut() else {
+            return false;
+        };
+        match inspect_owned_publication(client, &self.name, &self.tables) {
+            Ok(OwnedPublication::Matches { fingerprint, .. }) => fingerprint != self.fingerprint,
+            Ok(OwnedPublication::Missing | OwnedPublication::Drifted) => true,
+            Err(_) => {
+                *controller = None;
+                false
+            }
+        }
+    }
+}
+
+/// The slot named `slot_name`, which an enrolled source must still have.
+fn existing_slot(client: &mut Client, slot_name: &str) -> Result<SlotMetadata, SourceRuntimeError> {
+    inspect_slot(client, slot_name)?.ok_or_else(|| SourceRuntimeError::SlotMissing {
+        slot_name: slot_name.to_owned(),
+    })
 }
 
 fn inspect_slot(
@@ -778,7 +915,13 @@ fn validate_slot(
         return Err(SourceRuntimeError::UnexpectedSlotMetadata);
     }
     if slot.wal_status.as_deref() == Some("lost") || slot.invalidation_reason.is_some() {
-        return Err(SourceRuntimeError::SlotLostReseedRequired);
+        return Err(SourceRuntimeError::SlotLost {
+            slot_name: slot.slot_name.clone(),
+            reason: slot.invalidation_reason.clone().map_or_else(
+                || "its WAL status is lost".to_owned(),
+                |reason| format!("reason {reason}"),
+            ),
+        });
     }
     Ok(())
 }
@@ -803,8 +946,7 @@ fn wait_for_inactive_slot(
     slot_name: &str,
 ) -> Result<SlotMetadata, SourceRuntimeError> {
     for _ in 0..SLOT_INACTIVE_POLL_ATTEMPTS {
-        let slot = inspect_slot(client, slot_name)?
-            .ok_or(SourceRuntimeError::SlotMissingReseedRequired)?;
+        let slot = existing_slot(client, slot_name)?;
         validate_slot(&slot, expected_source)?;
         if slot.active_pid.is_none() {
             return Ok(slot);
@@ -833,6 +975,34 @@ impl RenewalClock for WatchdogClock<'_> {
     }
 }
 
+/// Ends a session from one of its watchdogs: the lease goes first, so no
+/// append is valid after this, then the walsender, so a read blocked on it
+/// returns.
+struct SessionKill {
+    lease: ActiveLease,
+    failed: Arc<AtomicBool>,
+    source_connection: String,
+    expected_source: SourceIdentity,
+    slot_name: String,
+    backend_pid: i32,
+}
+
+impl SessionKill {
+    fn kill(&self) {
+        // Local authority disappears before the best-effort server-side kill.
+        // Even a stuck/failed controller cannot make append valid because the
+        // PostgreSQL log adapter also checks the active, unexpired lease row.
+        self.lease.revoke();
+        self.failed.store(true, Ordering::Release);
+        let _ = revoke_exact_source_backend(
+            &self.source_connection,
+            &self.expected_source,
+            &self.slot_name,
+            self.backend_pid,
+        );
+    }
+}
+
 fn start_session_watchdog(
     authority: Arc<FenceAuthority<PostgresFenceStore>>,
     lease: ActiveLease,
@@ -840,37 +1010,62 @@ fn start_session_watchdog(
     expected_source: SourceIdentity,
     slot_name: String,
     backend_pid: i32,
+    publication: PublicationWatch,
 ) -> Result<SessionWatchdog, SourceRuntimeError> {
-    let (stop, receiver) = mpsc::channel();
     let failed = Arc::new(AtomicBool::new(false));
-    let thread_failed = Arc::clone(&failed);
-    let thread_lease = lease.clone();
+    let kill = Arc::new(SessionKill {
+        lease: lease.clone(),
+        failed: Arc::clone(&failed),
+        source_connection,
+        expected_source,
+        slot_name,
+        backend_pid,
+    });
+    let (stop, receiver) = mpsc::channel();
+    let renewal_kill = Arc::clone(&kill);
     let join = thread::Builder::new()
         .name(format!("calque-source-watchdog-{backend_pid}"))
         .spawn(move || {
             let mut clock = WatchdogClock { stop: &receiver };
             if authority
-                .keep_active_renewed(&thread_lease, &mut clock)
+                .keep_active_renewed(&renewal_kill.lease, &mut clock)
                 .is_err()
             {
-                // Local authority disappears before the best-effort
-                // server-side kill. Even a stuck/failed controller cannot make
-                // append valid because the PostgreSQL log adapter also checks
-                // the active, unexpired lease row.
-                thread_lease.revoke();
-                thread_failed.store(true, Ordering::Release);
-                let _ = revoke_exact_source_backend(
-                    &source_connection,
-                    &expected_source,
-                    &slot_name,
-                    backend_pid,
-                );
+                renewal_kill.kill();
             }
         })
         .map_err(|_| SourceRuntimeError::WatchdogUnavailable)?;
+    let (publication_stop, publication_receiver) = mpsc::channel::<()>();
+    let publication_join = thread::Builder::new()
+        .name(format!("calque-publication-watch-{backend_pid}"))
+        .spawn(move || {
+            let mut controller = None;
+            while let Err(mpsc::RecvTimeoutError::Timeout) =
+                publication_receiver.recv_timeout(PUBLICATION_CHECK_INTERVAL)
+            {
+                if publication.changed(&mut controller, &kill.source_connection) {
+                    tracing::warn!(
+                        publication = %publication.name,
+                        "the publication changed while CDC streamed from it; stopping the session"
+                    );
+                    kill.kill();
+                    return;
+                }
+            }
+        });
+    let publication_join = match publication_join {
+        Ok(join) => join,
+        Err(_) => {
+            let _ = stop.send(());
+            let _ = join.join();
+            return Err(SourceRuntimeError::WatchdogUnavailable);
+        }
+    };
     Ok(SessionWatchdog {
         stop,
         join: Some(join),
+        publication_stop,
+        publication_join: Some(publication_join),
         failed,
     })
 }
@@ -925,10 +1120,10 @@ fn revoke_exact_source_backend(
     slot_name: &str,
     expected_backend_pid: i32,
 ) -> Result<(), SourceRuntimeError> {
-    let mut controller = connect_source_controller(source_connection)?;
+    let mut controller =
+        connect_source_controller(source_connection, CONTROLLER_STATEMENT_TIMEOUT)?;
     verify_regular_source(&mut controller, expected_source)?;
-    let slot = inspect_slot(&mut controller, slot_name)?
-        .ok_or(SourceRuntimeError::SlotMissingReseedRequired)?;
+    let slot = existing_slot(&mut controller, slot_name)?;
     validate_slot(&slot, expected_source)?;
     match slot.active_pid {
         Some(actual) if actual == expected_backend_pid => {
@@ -941,15 +1136,30 @@ fn revoke_exact_source_backend(
     Ok(())
 }
 
-fn connect_source_controller(connection_string: &str) -> Result<Client, SourceRuntimeError> {
+fn controller_timeouts() -> String {
+    format!(
+        "SET statement_timeout = {}; SET lock_timeout = {};",
+        CONTROLLER_STATEMENT_TIMEOUT.as_millis(),
+        CONTROLLER_LOCK_TIMEOUT.as_millis()
+    )
+}
+
+/// A source-controller connection whose longest statement runs for
+/// `longest_statement`. A request that hears nothing from the server for
+/// longer than that, plus a margin, fails the connection.
+fn connect_source_controller(
+    connection_string: &str,
+    longest_statement: Duration,
+) -> Result<Client, SourceRuntimeError> {
     let mut endpoint = postgres_connect::Endpoint::parse(connection_string)
         .map_err(|_| SourceRuntimeError::SourceControlUnavailable)?;
     endpoint
+        .bound_replies(longest_statement)
         .config_mut()
         .connect_timeout(Duration::from_secs(2));
     let mut client = endpoint.connect().map_err(source_error)?;
     client
-        .batch_execute(CONTROLLER_TIMEOUTS)
+        .batch_execute(&controller_timeouts())
         .map_err(source_error)?;
     Ok(client)
 }
@@ -1005,6 +1215,21 @@ fn replication_backend_pid(
         .map_err(|_| SourceRuntimeError::ReplicationBackendPidMissing)
 }
 
+/// The walsender's `wal_sender_timeout`, as this connection's settings,
+/// role's and database's included, leave it.
+fn replication_wal_sender_timeout(
+    connection: &mut PgReplicationConnection,
+) -> Result<Duration, SourceRuntimeError> {
+    let result = connection
+        .exec("SELECT setting FROM pg_catalog.pg_settings WHERE name = 'wal_sender_timeout'")
+        .map_err(replication_error)?;
+    result
+        .get_value(0, 0)
+        .and_then(|millis| millis.parse().ok())
+        .map(Duration::from_millis)
+        .ok_or(SourceRuntimeError::ReplicationUnavailable)
+}
+
 fn validate_slot_name(slot_name: &str) -> Result<(), SourceRuntimeError> {
     if !source_control::is_valid_slot_name(slot_name) {
         return Err(SourceRuntimeError::InvalidSlotName);
@@ -1025,14 +1250,17 @@ fn source_error(error: postgres::Error) -> SourceRuntimeError {
 ///
 /// libpq reports a failed connection as message text alone, with no SQLSTATE,
 /// and the text follows the server's `lc_messages`. A role that lost the
-/// REPLICATION attribute is refused a walsender (42501) while its regular
-/// connections still succeed, and no retry gets past that until the attribute
-/// is granted again. Any other failure is treated as an outage.
+/// replication privilege is refused a walsender (42501) while its regular
+/// connections still succeed, and no retry gets past that until it is granted
+/// again. Any other failure is treated as an outage, so a role that replicates
+/// through RDS's `rds_replication` is retried rather than stopped.
 fn replication_connect_error(controller: &mut Client) -> SourceRuntimeError {
     // The same test PostgreSQL applies to the login role, superusers included.
     let permitted = controller.query_one(
-        "SELECT rolsuper OR rolreplication FROM pg_catalog.pg_roles
-          WHERE rolname = session_user",
+        &format!(
+            "SELECT role.rolsuper OR {ROLE_MAY_REPLICATE} FROM pg_catalog.pg_roles AS role
+              WHERE role.rolname = session_user"
+        ),
         &[],
     );
     match permitted {
@@ -1123,11 +1351,11 @@ pub enum SourceRuntimeError {
     Fence(#[from] FenceError),
     #[error("persistent slot name is invalid")]
     InvalidSlotName,
-    #[error("source control connection failed or returned an uncertain result")]
+    #[error("the source control connection to PostgreSQL failed or returned an uncertain result; if this persists, check that PostgreSQL is running, reachable at the address in the database URL, and has free connections (max_connections)")]
     SourceControlUnavailable,
     #[error("source PostgreSQL refused the connection or a statement: {0}")]
     SourceRefused(PostgresRefusal),
-    #[error("replication connection failed or returned an uncertain result")]
+    #[error("the replication connection to PostgreSQL failed or returned an uncertain result; if this persists, check that PostgreSQL is running, reachable at the address in the database URL, and has a free walsender (max_wal_senders)")]
     ReplicationUnavailable,
     #[error("regular and replication connections do not match the enrolled source identity")]
     SourceIdentityMismatch,
@@ -1145,8 +1373,11 @@ pub enum SourceRuntimeError {
     SlotEnrollmentBindingMismatch,
     #[error("persistent slot lifecycle is not initialized for this source epoch")]
     SlotLifecycleNotInitialized,
-    #[error("persistent slot already exists during explicit create-new enrollment")]
-    SlotAlreadyExists,
+    #[error(
+        "replication slot {slot_name} already exists on the source, but this state has no record of creating it, typically because an earlier start stopped before recording it or its state directory was deleted without `calque destroy`; \
+         if nothing reads it any more, drop it with SELECT pg_drop_replication_slot('{slot_name}') and rerun"
+    )]
+    SlotAlreadyExists { slot_name: String },
     #[error(
         "creating replication slot {slot_name} waited {waited:?} for open transactions to end and gave up; PostgreSQL starts a new slot only after every transaction that has written or locked rows, in any database on the server, has ended; {}",
         describe_open_transactions(.open)
@@ -1156,16 +1387,20 @@ pub enum SourceRuntimeError {
         waited: Duration,
         open: Vec<OpenTransaction>,
     },
-    #[error("persistent slot is missing; explicit epoch/reseed is required")]
-    SlotMissingReseedRequired,
+    #[error(
+        "replication slot {slot_name} no longer exists on the source: it was dropped, so the changes made since it last advanced cannot be replayed"
+    )]
+    SlotMissing { slot_name: String },
     #[error("persistent slot metadata does not match the launch profile")]
     UnexpectedSlotMetadata,
     #[error("persistent slot has no confirmed flush LSN")]
     SlotHasNoConfirmedFlushLsn,
     #[error("persistent slot confirmed flush LSN is invalid")]
     InvalidSlotLsn,
-    #[error("persistent slot has lost required WAL; explicit epoch/reseed is required")]
-    SlotLostReseedRequired,
+    #[error(
+        "replication slot {slot_name} was invalidated by PostgreSQL ({reason}), most often because the source's WAL grew past max_slot_wal_keep_size while calque was not reading it, so the changes it held are gone"
+    )]
+    SlotLost { slot_name: String, reason: String },
     #[error("failed to revoke stale source backend {0}")]
     BackendRevocationFailed(i32),
     #[error("source slot is now owned by a different backend and will not be terminated")]
@@ -1189,6 +1424,35 @@ pub enum SourceRuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A controller request whose server stops answering fails once the
+    /// connection's reply bound runs out: the watchdog's revocation and the
+    /// publication watch then return instead of waiting on the socket.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_controller_request_whose_server_stops_answering_fails_at_its_reply_bound() {
+        let url = std::env::var("CALQUE_SOURCE_DATABASE_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .expect("live source database URL");
+        let relay = postgres_connect::relay::SilenceableRelay::start(&url);
+        let mut controller =
+            connect_source_controller(relay.url(), CONTROLLER_STATEMENT_TIMEOUT).unwrap();
+        relay.silence();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let failed = controller.batch_execute("SELECT 1").is_err();
+            let _ = sender.send((failed, started.elapsed()));
+        });
+        let (failed, elapsed) = receiver
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the request on a silent socket had not returned after 15 s");
+        assert!(failed);
+        assert!(
+            elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(8),
+            "the request returned after {elapsed:?}"
+        );
+    }
 
     fn healthy_slot() -> SlotMetadata {
         SlotMetadata {
@@ -1230,7 +1494,7 @@ mod tests {
         lost.wal_status = Some("lost".to_owned());
         assert!(matches!(
             validate_slot(&lost, &expected_source()),
-            Err(SourceRuntimeError::SlotLostReseedRequired)
+            Err(SourceRuntimeError::SlotLost { .. })
         ));
 
         // PostgreSQL recorded an invalidation reason.
@@ -1238,11 +1502,22 @@ mod tests {
         invalidated.invalidation_reason = Some("wal_removed".to_owned());
         assert!(matches!(
             validate_slot(&invalidated, &expected_source()),
-            Err(SourceRuntimeError::SlotLostReseedRequired)
+            Err(SourceRuntimeError::SlotLost { .. })
         ));
 
+        assert_eq!(
+            validate_slot(&invalidated, &expected_source())
+                .unwrap_err()
+                .to_string(),
+            "replication slot calque_source_1 was invalidated by PostgreSQL (reason wal_removed), most often because the source's WAL grew past max_slot_wal_keep_size while calque was not reading it, so the changes it held are gone"
+        );
+        assert!(validate_slot(&lost, &expected_source())
+            .unwrap_err()
+            .to_string()
+            .contains("(its WAL status is lost)"));
+
         // A lost slot must not be reported as merely unexpected metadata: the
-        // caller reseeds on SlotLostReseedRequired and retries on the other.
+        // caller destroys the state on SlotLost and retries on the other.
         let mut both = healthy_slot();
         both.wal_status = Some("lost".to_owned());
         both.temporary = true;

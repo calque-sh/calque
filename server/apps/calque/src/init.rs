@@ -33,7 +33,7 @@ struct Protocol {
 #[serde(rename_all = "camelCase")]
 struct Source {
     id: String,
-    connection_env: String,
+    database_url_env: String,
     publication: String,
     slot: String,
 }
@@ -107,7 +107,7 @@ struct Config {
 pub struct InitOptions {
     pub application_id: String,
     pub application_version: String,
-    pub connection_env: String,
+    pub database_url_env: String,
     pub slot: Option<String>,
     pub scope_id: String,
     pub tenants: Option<Tenants>,
@@ -188,11 +188,11 @@ fn identifier(value: &str) -> Option<String> {
 }
 
 /// The configuration identifier grammar, `compileConfig`'s `ID`.
-const IDENTIFIER_GRAMMAR: &str = "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$";
+pub(crate) const IDENTIFIER_GRAMMAR: &str = "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$";
 
 /// Whether `value` already matches the configuration identifier grammar,
 /// [`IDENTIFIER_GRAMMAR`].
-fn is_identifier(value: &str) -> bool {
+pub(crate) fn is_identifier(value: &str) -> bool {
     let mut characters = value.chars();
     if !characters
         .next()
@@ -229,27 +229,32 @@ fn named_identifier(
 /// environment, so a value that is not an environment-variable name is very
 /// often the connection string itself.
 fn environment_variable_name(value: &str) -> Result<(), Box<dyn Error>> {
-    // `is_some_and` on the first character already rejects an empty name.
-    let valid = value
-        .chars()
-        .next()
-        .is_some_and(|first| first.is_ascii_uppercase() || first == '_')
-        && value.chars().all(|character| {
-            character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
-        });
-    if valid {
+    if is_environment_variable_name(value) {
         return Ok(());
     }
     Err(format!(
-        "--connection-env must name an environment variable matching \
+        "--database-url-env must name an environment variable matching \
          ^[A-Z_][A-Z0-9_]*$, not a connection string; got {value:?}"
     )
     .into())
 }
 
+/// Whether `value` matches `compileConfig`'s `ENVIRONMENT_VARIABLE`,
+/// `^[A-Z_][A-Z0-9_]*$`.
+pub(crate) fn is_environment_variable_name(value: &str) -> bool {
+    // `is_some_and` on the first character already rejects an empty name.
+    value
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase() || first == '_')
+        && value.chars().all(|character| {
+            character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+        })
+}
+
 /// Reject anything `compileConfig`'s `postgresIdentifier` would: at most 63
 /// bytes, no NUL.
-fn postgres_identifier(subject: &str, value: &str) -> Result<(), Box<dyn Error>> {
+pub(crate) fn postgres_identifier(subject: &str, value: &str) -> Result<(), Box<dyn Error>> {
     if value.is_empty() {
         return Err(format!("{subject} must not be empty").into());
     }
@@ -271,7 +276,7 @@ pub fn build(
     inspection: &InspectionOutput,
     options: &InitOptions,
 ) -> Result<String, Box<dyn Error>> {
-    environment_variable_name(&options.connection_env)?;
+    environment_variable_name(&options.database_url_env)?;
     if options.application_version.is_empty() {
         return Err("--application-version must not be empty".into());
     }
@@ -381,7 +386,7 @@ pub fn build(
             .iter()
             .map(|column| Column {
                 name: column.name.clone(),
-                postgres_type: column.type_name.clone(),
+                postgres_type: column.carried_type_name().to_owned(),
                 nullable: column.nullable,
             })
             .collect();
@@ -394,8 +399,7 @@ pub fn build(
             .iter()
             .map(|column| {
                 CrudColumnRole::of(
-                    &column.type_schema,
-                    &column.type_name,
+                    column.codec(),
                     column.generated,
                     column.primary_key_position.is_some(),
                 )
@@ -413,11 +417,14 @@ pub fn build(
         // neither may the manifest.
         let key_is_carriable = relation.columns.iter().all(|column| {
             column.primary_key_position.is_none()
-                || PostgresTypeCodec::from_catalog(&column.type_schema, &column.type_name)
+                || column
+                    .codec()
                     .is_some_and(PostgresTypeCodec::is_primary_key_safe)
         });
         let operations: Vec<String> = if key_is_carriable {
-            admitted_operations(roles.iter().copied(), CrudOperations::ALL)
+            let operations = CrudOperations::ALL
+                .without_insert_if(!relation.unlisted_required_columns.is_empty());
+            admitted_operations(roles.iter().copied(), operations)
                 .into_iter()
                 .map(|operation| operation.as_str().to_owned())
                 .collect()
@@ -502,7 +509,7 @@ pub fn build(
         },
         sources: vec![Source {
             id: source_id.clone(),
-            connection_env: options.connection_env.clone(),
+            database_url_env: options.database_url_env.clone(),
             publication: inspection.publication.clone(),
             slot,
         }],
@@ -553,7 +560,7 @@ mod tests {
     use super::*;
     use crate::inspect::{ColumnOutput, RelationOutput};
     use mutation_crud::crud_command_summaries;
-    use source_control::{ColumnInspection, RegisteredTable, TableInspection};
+    use source_control::{ColumnInspection, RegisteredTable, TableInspection, UnlistedColumn};
     use sync_types::{ColumnId, TableId};
 
     fn column(name: &str, type_name: &str, primary: Option<u32>) -> ColumnOutput {
@@ -564,6 +571,7 @@ mod tests {
             nullable: primary.is_none(),
             generated: false,
             primary_key_position: primary,
+            carried_as: None,
         }
     }
 
@@ -582,7 +590,7 @@ mod tests {
         InitOptions {
             application_id: "incident-ops".to_owned(),
             application_version: "0.1.0".to_owned(),
-            connection_env: "CALQUE_DATABASE_URL".to_owned(),
+            database_url_env: "CALQUE_DATABASE_URL".to_owned(),
             slot: None,
             scope_id: "all".to_owned(),
             tenants: None,
@@ -645,6 +653,7 @@ mod tests {
                 schema: "public".to_owned(),
                 table: "issues".to_owned(),
                 replica_identity: "default".to_owned(),
+                unlisted_required_columns: Vec::new(),
                 columns: vec![column("id", "uuid", Some(1)), column("title", "text", None)],
             }])
         };
@@ -652,20 +661,20 @@ mod tests {
             (
                 // `ENVIRONMENT_VARIABLE` -- and a lowercase name is what
                 // someone reaching for a connection string types.
-                "connectionEnv grammar",
+                "databaseUrlEnv grammar",
                 InitOptions {
-                    connection_env: "pg_url".to_owned(),
+                    database_url_env: "pg_url".to_owned(),
                     ..options()
                 },
-                "--connection-env",
+                "--database-url-env",
             ),
             (
-                "connectionEnv must not be empty",
+                "databaseUrlEnv must not be empty",
                 InitOptions {
-                    connection_env: String::new(),
+                    database_url_env: String::new(),
                     ..options()
                 },
-                "--connection-env",
+                "--database-url-env",
             ),
             (
                 "application.version must not be empty",
@@ -728,6 +737,7 @@ mod tests {
             schema: "public".to_owned(),
             table: name.to_owned(),
             replica_identity: "default".to_owned(),
+            unlisted_required_columns: Vec::new(),
             columns,
         };
         inspection(vec![
@@ -810,6 +820,7 @@ mod tests {
             schema: "public".to_owned(),
             table: "projects".to_owned(),
             replica_identity: "default".to_owned(),
+            unlisted_required_columns: Vec::new(),
             columns: vec![
                 column("tenant_id", "int4", Some(1)),
                 column("id", "int8", Some(2)),
@@ -847,6 +858,7 @@ mod tests {
             schema: "incidents".to_owned(),
             table: "issue_tags".to_owned(),
             replica_identity: "default".to_owned(),
+            unlisted_required_columns: Vec::new(),
             columns: vec![
                 column("bench_index", "int8", Some(1)),
                 column("tag", "text", None),
@@ -873,6 +885,7 @@ mod tests {
                 schema: "public".to_owned(),
                 table: table.to_owned(),
                 replica_identity: "default".to_owned(),
+                unlisted_required_columns: Vec::new(),
                 columns: vec![column("id", "uuid", Some(1)), column("title", "text", None)],
             }]);
             let error = build(&document, &options())
@@ -900,6 +913,7 @@ mod tests {
             schema: "public".to_owned(),
             table: "issues".to_owned(),
             replica_identity: "default".to_owned(),
+            unlisted_required_columns: Vec::new(),
             columns: vec![column("id", "uuid", Some(1)), column("title", "text", None)],
         }]);
         let options = InitOptions {
@@ -932,6 +946,7 @@ mod tests {
             schema: "public".to_owned(),
             table: "issues".to_owned(),
             replica_identity: "default".to_owned(),
+            unlisted_required_columns: Vec::new(),
             columns: vec![column("id", "uuid", Some(1)), column("title", "text", None)],
         }]);
         let rendered = build(&document, &options()).unwrap();
@@ -959,12 +974,14 @@ mod tests {
                 schema: "public".to_owned(),
                 table: "issues".to_owned(),
                 replica_identity: "default".to_owned(),
+                unlisted_required_columns: Vec::new(),
                 columns: vec![column("id", "uuid", Some(1)), column("title", "text", None)],
             },
             RelationOutput {
                 schema: "audit".to_owned(),
                 table: "issues".to_owned(),
                 replica_identity: "default".to_owned(),
+                unlisted_required_columns: Vec::new(),
                 columns: vec![column("id", "uuid", Some(1)), column("note", "text", None)],
             },
         ]);
@@ -981,6 +998,7 @@ mod tests {
             schema: "public".to_owned(),
             table: "events".to_owned(),
             replica_identity: "default".to_owned(),
+            unlisted_required_columns: Vec::new(),
             columns: vec![column("payload", "jsonb", None)],
         }]);
         let error = build(&document, &options()).unwrap_err().to_string();
@@ -1010,7 +1028,16 @@ mod tests {
                 replica_identity: 'd',
                 is_partition: false,
                 has_publication_row_filter: false,
-                has_publication_column_list: false,
+                has_publication_column_list: !relation.unlisted_required_columns.is_empty(),
+                unlisted_columns: relation
+                    .unlisted_required_columns
+                    .iter()
+                    .map(|name| UnlistedColumn {
+                        name: name.clone(),
+                        primary_key: false,
+                        required_on_insert: true,
+                    })
+                    .collect(),
                 columns: relation
                     .columns
                     .iter()
@@ -1026,6 +1053,7 @@ mod tests {
                         primary_key_ordinal: column.primary_key_position,
                         generated: column.generated,
                         nondeterministic_collation: false,
+                        carried_as: column.carried_as.clone(),
                     })
                     .collect(),
             },
@@ -1046,6 +1074,7 @@ mod tests {
                 schema: "public".to_owned(),
                 table: "tasks".to_owned(),
                 replica_identity: "default".to_owned(),
+                unlisted_required_columns: Vec::new(),
                 columns: vec![
                     column("id", "int8", Some(1)),
                     column("title", "text", None),
@@ -1056,6 +1085,7 @@ mod tests {
                 schema: "public".to_owned(),
                 table: "invoices".to_owned(),
                 replica_identity: "default".to_owned(),
+                unlisted_required_columns: Vec::new(),
                 columns: vec![
                     column("id", "uuid", Some(1)),
                     column("amount", "int4", None),
@@ -1069,6 +1099,7 @@ mod tests {
                 schema: "public".to_owned(),
                 table: "issue_tags".to_owned(),
                 replica_identity: "full".to_owned(),
+                unlisted_required_columns: Vec::new(),
                 columns: vec![
                     column("issue_id", "uuid", Some(1)),
                     column("tag_id", "uuid", Some(2)),
@@ -1078,6 +1109,7 @@ mod tests {
                 schema: "public".to_owned(),
                 table: "shapes".to_owned(),
                 replica_identity: "default".to_owned(),
+                unlisted_required_columns: Vec::new(),
                 columns: vec![
                     column("id", "int8", Some(1)),
                     column("outline", "polygon", None),
@@ -1172,6 +1204,7 @@ mod tests {
             schema: "public".to_owned(),
             table: "ledger".to_owned(),
             replica_identity: "default".to_owned(),
+            unlisted_required_columns: Vec::new(),
             columns: vec![
                 column("id", "numeric", Some(1)),
                 column("memo", "text", None),
@@ -1197,6 +1230,7 @@ mod tests {
             schema: "public".to_owned(),
             table: "issues".to_owned(),
             replica_identity: "default".to_owned(),
+            unlisted_required_columns: Vec::new(),
             columns: vec![column("id", "uuid", Some(1)), column("title", "text", None)],
         }]);
         document.schema_version = "calque.pg-inspection.v0".to_owned();

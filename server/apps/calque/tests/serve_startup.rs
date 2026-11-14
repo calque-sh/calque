@@ -115,6 +115,35 @@ const COMPLETE_S3: &[(&str, &str)] = &[
     ("CALQUE_S3_FORCE_PATH_STYLE", "1"),
 ];
 
+/// A path-style setting that is neither 1 nor 0 lists the two values.
+#[test]
+fn a_bad_force_path_style_value_lists_what_is_accepted() {
+    let workspace = tempfile::tempdir().unwrap();
+    let unit = workspace.path().join("unit");
+    let state = workspace.path().join("state");
+    let object_store = COMPLETE_S3
+        .iter()
+        .copied()
+        .filter(|(name, _)| *name != "CALQUE_S3_FORCE_PATH_STYLE")
+        .chain([("CALQUE_S3_FORCE_PATH_STYLE", "true")])
+        .collect::<Vec<_>>();
+    let (success, stderr) = recovery_command(
+        &[
+            "backup",
+            "--output",
+            unit.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+        ],
+        &object_store,
+    );
+    assert!(!success, "{stderr}");
+    assert!(
+        stderr.contains("E_SERVE_OBJECT_STORE_INVALID CALQUE_S3_FORCE_PATH_STYLE=true is not accepted; set it to 1 for path-style bucket addressing or 0 for virtual-host style, or unset it to use path style exactly when CALQUE_S3_ENDPOINT is set"),
+        "{stderr}"
+    );
+}
+
 /// The S3 store is not a refusal, but a configuration `serve` would not start
 /// on is refused first, before the connection string is read or any directory
 /// exists. `restore` needs this most: its target directory has to stay absent.

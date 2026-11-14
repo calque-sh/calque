@@ -126,6 +126,7 @@ version = "0.1.0"
 dependencies = [
  "artifact-contract",
  "async-trait",
+ "background-thread",
  "blob-store",
  "rusqlite",
  "serde_json",
@@ -852,12 +853,13 @@ dependencies = [
 
 [[package]]
 name = "calque"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "artifact-catalog",
  "async-trait",
  "authz",
  "axum",
+ "background-thread",
  "base64 0.22.1",
  "blob-store",
  "calque-engine",
@@ -946,6 +948,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "zstd",

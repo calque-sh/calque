@@ -19,6 +19,7 @@ import {
   type SyncClient,
   type SyncPublication,
 } from "../client.js";
+import { stubBrowserFeatures } from "../browser.fixture.js";
 import { createGeneratedClientSchema } from "../client-options.js";
 import type { CollectionShape } from "../facade/types.js";
 import type { GeneratedClientSchemaDescriptor } from "../generated-schema.js";
@@ -902,6 +903,12 @@ export function outcomeResponder(
   };
 }
 
+/**
+ * `makeClient`'s `extraOptions` for a test of `retryMutation`, where the
+ * client must leave an undecided write to the caller.
+ */
+export const NO_AUTOMATIC_RESENDS = { automaticMutationResends: 0 } as const;
+
 export const acceptedResponder = outcomeResponder(
   mutation.MutationOutcomeCode.ACCEPTED_AWAITING_CANONICAL_ECHO,
 );
@@ -1010,12 +1017,9 @@ export function patternBytes(length: number): Uint8Array {
   return bytes;
 }
 
-/** A Chromium navigator that reports `threads` hardware threads. */
+/** A browser that reports `threads` hardware threads. */
 export function stubThreads(threads: number): void {
-  vi.stubGlobal("navigator", {
-    userAgentData: { brands: [{ brand: "Chromium" }] },
-    hardwareConcurrency: threads,
-  });
+  stubBrowserFeatures(threads);
 }
 
 /** How many bytes a paced artifact body gives for each read the page makes. */

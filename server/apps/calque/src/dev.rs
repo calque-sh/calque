@@ -44,7 +44,7 @@ use crate::lifecycle::{
 use crate::listen::{spawn_metrics_server, stop_metrics_server, ListenError, ReservedListener};
 use crate::log_sink::print_line;
 use crate::open_files::{fit_open_file_limit, ConnectionBounds};
-use crate::recovery::RecoveryCliError;
+use crate::recovery::{self, RecoveryCliError};
 use crate::remedy::{after_stopped_runtime, reconnect_or_forget, restore_publication, Destroy};
 
 const MAX_DEV_TABLES: usize = 256;
@@ -201,11 +201,19 @@ pub async fn run_dev(command: DevCommand) -> Result<(), DevError> {
 
 async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
     command.validate()?;
+    if let Some(name) = crate::serve::object_store_variable_set(|name| {
+        std::env::var(name).ok().filter(|value| !value.is_empty())
+    }) {
+        return Err(DevError::ObjectStoreNotSupported(name));
+    }
     let connections = fit_open_file_limit(ConnectionBounds {
         max_open_streams: command.max_open_streams,
         max_inflight_requests: command.max_inflight_requests,
     });
-    let database_url = command.database.resolve()?;
+    let database_url = command.database.resolve_allowing_plaintext()?;
+    if let Some(host) = database_url.plaintext_remote_host() {
+        tracing::warn!("{}", recovery::plaintext_warning(host));
+    }
     // Browsers always name the listener 127.0.0.1, also when it binds
     // `0.0.0.0` in a container whose port the host publishes on loopback.
     let binding = HttpBinding::configured(
@@ -230,6 +238,7 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
         .map(|metrics| ReservedListener::bind(metrics.socket_address(), "--metrics-port"))
         .transpose()?;
     let state_store = StateStore::open(&command.state_dir)?;
+    tracing::info!(state_dir = %state_store.root().display(), "using state directory");
     let requested_tables = {
         let mut tables = command.tables.clone();
         tables.sort();
@@ -335,6 +344,7 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
     let runtime_metrics = metrics.clone();
     let runtime_owner = format!("local-runtime-{}", Uuid::new_v4().simple());
     let runtime_state_dir = state_store.root().to_path_buf();
+    let runtime_database_url_env = command.database.database_url_env.clone();
     let started = Instant::now();
     let runtime = run_blocking(move || {
         start_local_source_runtime(
@@ -345,7 +355,8 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
                 &runtime_state_dir,
                 runtime_owner,
             )
-            .with_metrics(runtime_metrics),
+            .with_metrics(runtime_metrics)
+            .with_database_url_env(runtime_database_url_env),
             runtime_head_signal,
         )
         .map_err(DevError::from)
@@ -542,6 +553,10 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
     }
     print_line(format_args!("Calque dev is ready at {base_url}"));
     print_line(format_args!(
+        "State directory: {}",
+        state_store.root().display()
+    ));
+    print_line(format_args!(
         "Client settings: {}",
         state_store.client_env_path().display()
     ));
@@ -568,6 +583,7 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
     let metrics_result = stop_metrics_server(metrics_server, &metrics_stop).await;
     cancellation.cancel();
     let shutdown_result = shutdown_runtime::<DevError>(runtime).await;
+    tracing::info!("stopped");
     serve_result?;
     metrics_result?;
     shutdown_result?;
@@ -581,8 +597,8 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
 async fn dev_stop_signal() {
     tokio::select! {
         () = shutdown_signal() => {},
-        () = hangup() => {},
-        () = crate::log_sink::closed() => {},
+        () = hangup() => tracing::info!("stopping: received SIGHUP, so the terminal that started calque dev closed"),
+        () = crate::log_sink::closed() => tracing::info!("stopping: calque's stdout or stderr is a closed pipe, so whoever started calque dev is gone"),
     }
 }
 
@@ -650,13 +666,16 @@ pub async fn run_destroy(command: DestroyCommand) -> Result<(), DevError> {
         );
         return Ok(());
     }
-    let database_url = match command.database.resolve() {
+    let database_url = match command.database.resolve_allowing_plaintext() {
         Ok(url) => url,
         Err(RecoveryCliError::MissingDatabaseUrl(name)) => {
             return Err(DevError::DestroyMissingDatabaseUrl(name))
         }
         Err(error) => return Err(error.into()),
     };
+    if let Some(host) = database_url.plaintext_remote_host() {
+        eprintln!("warning: {}", recovery::plaintext_warning(host));
+    }
     let identity_database_url = database_url.clone();
     let connected = run_blocking(move || {
         inspect_local_identity(&identity_database_url).map_err(DevError::from)
@@ -670,11 +689,17 @@ pub async fn run_destroy(command: DestroyCommand) -> Result<(), DevError> {
             connected: describe_source_identity(&connected),
         });
     }
-    run_blocking(move || destroy_local_source(&database_url, &state).map_err(DevError::from))
-        .await
-        .map_err(|error| destroy_refusal(error, state_dir, &command.database.database_url_env))?;
+    let destroyed =
+        run_blocking(move || destroy_local_source(&database_url, &state).map_err(DevError::from))
+            .await
+            .map_err(|error| {
+                destroy_refusal(error, state_dir, &command.database.database_url_env)
+            })?;
     fs::remove_dir_all(store.root())?;
     println!("Destroyed Calque state and its owned PostgreSQL objects.");
+    if let Some(publication) = destroyed.kept_publication {
+        println!("Kept the publication {publication}, which another role owns.");
+    }
     Ok(())
 }
 
@@ -784,6 +809,8 @@ async fn await_current_cdc_with(
 pub enum DevError {
     #[error("calque dev creates a publication, a replication slot and the calque_control schema in the database it connects to; pass --acknowledge-disposable-source to confirm that database is disposable")]
     DisposableSourceNotAcknowledged,
+    #[error("{0} is set, but calque dev always keeps artifacts in the filesystem store under its state directory and would ignore it. Unset it to run dev, or run calque serve to use S3")]
+    ObjectStoreNotSupported(&'static str),
     #[error("--port must be nonzero")]
     InvalidPort,
     #[error("--metrics-port must be nonzero")]
@@ -920,8 +947,12 @@ pub enum DevError {
     /// The engine's refusal of a publication that no longer has its enrolled
     /// definition, which enrollment and a CDC reconnect raise alike. See
     /// `remedy::restore_publication`.
-    #[error("{refusal} {remedy}", remedy = restore_publication("dev"))]
-    PublicationDrifted { refusal: Box<DevError> },
+    #[error("{refusal} {remedy}", remedy = restore_publication(Destroy::reading(state_dir, database_url_env), "dev"))]
+    PublicationDrifted {
+        refusal: Box<DevError>,
+        state_dir: PathBuf,
+        database_url_env: String,
+    },
     #[error("a blocking operation did not complete: {0}")]
     BlockingTask(String),
 }
@@ -995,9 +1026,11 @@ impl CommandError for DevError {
         }
     }
 
-    fn publication_drifted(refusal: Self) -> Self {
+    fn publication_drifted(refusal: Self, state_dir: &Path, database_url_env: &str) -> Self {
         Self::PublicationDrifted {
             refusal: Box::new(refusal),
+            state_dir: state_dir.to_path_buf(),
+            database_url_env: database_url_env.to_owned(),
         }
     }
 }
@@ -1540,6 +1573,7 @@ mod tests {
     const EARLIER_LOG: &str = ".calque-dev serves a canonical log an earlier release of calque wrote, and calque does not migrate it.";
     const FOREIGN_BUILD: &str = ".calque-dev holds an interrupted build of local-artifact-earlier-release, an artifact this build of calque does not make, and calque does not migrate it.";
     const DESTROY_THEN_DEV: &str = "Run calque destroy --state-dir .calque-dev --database-url-env CALQUE_DEV_SOURCE_URL --yes, then rerun dev to prepare the working set anew.";
+    const RESTORE_THEN_DEV: &str = "Restore the publication's definition if it was altered, then run calque destroy --state-dir .calque-dev --database-url-env CALQUE_DEV_SOURCE_URL --yes and rerun dev to prepare the working set anew, since the one it holds may no longer match PostgreSQL.";
 
     /// The refusal of a canonical log an earlier release wrote, as the CDC
     /// loop stops on it and the stop that joins the loop returns it.
@@ -1556,7 +1590,7 @@ mod tests {
         })
     }
 
-    const DRIFT: &str = "the PostgreSQL publication calque_0123456789abcdef01234567 no longer publishes exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root, and without row filters or column lists.";
+    const DRIFT: &str = "the PostgreSQL publication calque_0123456789abcdef01234567 was altered, or an enum its columns use gained or renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists and enum values it had at enrollment.";
 
     fn drift() -> calque_engine::LocalSourceError {
         calque_engine::LocalSourceError::PublicationDrift {
@@ -1626,13 +1660,13 @@ mod tests {
                     publication: "calque_0123456789abcdef01234567".to_owned(),
                 }
             )),
-            "the PostgreSQL publication calque_0123456789abcdef01234567 no longer publishes exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root, and without row filters or column lists. Restore that definition, then rerun dev."
+            "the PostgreSQL publication calque_0123456789abcdef01234567 was altered, or an enum its columns use gained or renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists and enum values it had at enrollment. Restore the publication's definition if it was altered, then run calque destroy --state-dir .calque-dev --database-url-env CALQUE_DEV_SOURCE_URL --yes and rerun dev to prepare the working set anew, since the one it holds may no longer match PostgreSQL."
         );
         assert_eq!(
             printed(DevError::Source(
                 calque_engine::LocalSourceError::SessionCleanupFailedAfter(Box::new(drift()))
             )),
-            format!("persistent CDC session cleanup failed after persistent CDC failed: {DRIFT} Restore that definition, then rerun dev.")
+            format!("persistent CDC session cleanup failed after persistent CDC failed: {DRIFT} {RESTORE_THEN_DEV}")
         );
     }
 
@@ -1758,8 +1792,8 @@ mod tests {
         );
     }
 
-    /// The remedy is restoring the publication, not destroy, which refuses a
-    /// publication it cannot verify.
+    /// The remedy is restoring the publication, which destroy refuses to drop
+    /// otherwise, then destroy, since the working set may miss changes.
     #[tokio::test]
     async fn a_runtime_stopped_on_a_drifted_publication_names_restoring_it_once() {
         let error = stop_after(
@@ -1775,9 +1809,14 @@ mod tests {
         let printed = printed(error);
         assert_eq!(
             printed,
-            format!("persistent CDC stopped before the HTTP service became ready: persistent CDC failed: {DRIFT} No incomplete browser state was served. Restore that definition, then rerun dev.")
+            format!("persistent CDC stopped before the HTTP service became ready: persistent CDC failed: {DRIFT} No incomplete browser state was served. {RESTORE_THEN_DEV}")
         );
-        assert_eq!(printed.matches("Restore that definition").count(), 1);
+        assert_eq!(
+            printed
+                .matches("Restore the publication's definition")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1789,7 +1828,7 @@ mod tests {
         .await;
         assert_eq!(
             printed(error),
-            format!("local snapshot PostgreSQL connection failed\nStopping the source runtime afterwards also failed: {DRIFT} Restore that definition, then rerun dev.")
+            format!("local snapshot PostgreSQL connection failed\nStopping the source runtime afterwards also failed: {DRIFT} {RESTORE_THEN_DEV}")
         );
     }
 

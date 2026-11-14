@@ -34,11 +34,20 @@ use crate::{ActiveLease, ActiveSourceSession, FenceAuthority, FenceError, Postgr
 const MAX_BOUNDED_TRANSACTIONS: usize = 10_000;
 const MAX_INGEST_DURATION: Duration = Duration::from_secs(300);
 const FEEDBACK_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+/// The mutation-receipt connection's `statement_timeout`; its replies are
+/// bounded a margin past it.
+const RECEIPT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// The most source transactions one append group holds.
 const MAX_GROUP_TRANSACTIONS: usize = 256;
 /// The most CopyData bytes read to fill one append group after its first
 /// transaction.
 const MAX_GROUP_READ_BYTES: usize = 8 * 1024 * 1024;
+/// How long the replication stream may carry nothing when its walsender's
+/// `wal_sender_timeout` is 0, which stops its keepalives: PostgreSQL's default
+/// for that setting and for its own subscribers' `wal_receiver_timeout`.
+const SILENCE_BOUND_WITHOUT_KEEPALIVES: Duration = Duration::from_secs(60);
+/// The shortest silence bound, whatever `wal_sender_timeout` says.
+const MIN_SILENCE_BOUND: Duration = Duration::from_secs(5);
 
 pub(crate) struct PersistentIngestState {
     decoder: Option<Decoder>,
@@ -51,6 +60,74 @@ pub(crate) struct PersistentIngestState {
     ingest: Option<RuntimeIngestSession>,
     authorization_policy: Option<IngestAuthorizationPolicy>,
     observer: Arc<SessionObserver>,
+    silence: StreamSilence,
+}
+
+/// When a replication stream that has carried nothing asks its walsender for
+/// a reply, and when it gives the stream up.
+///
+/// A walsender whose `wal_sender_timeout` is not 0 sends a keepalive once half
+/// of it has passed without a reply, even while it decodes a transaction that
+/// sends nothing, so a stream silent for all of it has lost its peer. One whose
+/// timeout is 0 sends none on a timer, so after half the bound the session asks
+/// for a reply itself. It gives the stream up once the whole bound has passed since
+/// the last message and half of it since that request, so time the session
+/// spent busy, reading nothing, never counts against a server that had no
+/// request to answer.
+#[derive(Debug)]
+struct StreamSilence {
+    bound: Duration,
+    heard_at: Instant,
+    asked_at: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SilenceStep {
+    Wait,
+    AskForReply,
+    GiveUp,
+}
+
+impl StreamSilence {
+    fn new(wal_sender_timeout: Duration, now: Instant) -> Self {
+        let bound = if wal_sender_timeout.is_zero() {
+            SILENCE_BOUND_WITHOUT_KEEPALIVES
+        } else {
+            wal_sender_timeout.max(MIN_SILENCE_BOUND)
+        };
+        Self {
+            bound,
+            heard_at: now,
+            asked_at: None,
+        }
+    }
+
+    fn heard(&mut self, now: Instant) {
+        self.heard_at = now;
+        self.asked_at = None;
+    }
+
+    fn asked(&mut self, now: Instant) {
+        self.asked_at = Some(now);
+    }
+
+    fn due_at(&self) -> Instant {
+        let half = self.bound / 2;
+        match self.asked_at {
+            None => self.heard_at + half,
+            Some(asked) => (self.heard_at + self.bound).max(asked + half),
+        }
+    }
+
+    fn step(&self, now: Instant) -> SilenceStep {
+        if now < self.due_at() {
+            SilenceStep::Wait
+        } else if self.asked_at.is_none() {
+            SilenceStep::AskForReply
+        } else {
+            SilenceStep::GiveUp
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +301,13 @@ impl PersistentIngestObserver for SessionObserver {
 }
 
 impl PersistentIngestState {
-    pub(crate) fn new(initial_lsn: u64, start_flushed_lsn: u64) -> Self {
+    /// State for a stream just started on a walsender whose
+    /// `wal_sender_timeout` is `wal_sender_timeout`.
+    pub(crate) fn new(
+        initial_lsn: u64,
+        start_flushed_lsn: u64,
+        wal_sender_timeout: Duration,
+    ) -> Self {
         Self {
             decoder: None,
             decoder_limits: None,
@@ -234,6 +317,7 @@ impl PersistentIngestState {
             ingest: None,
             authorization_policy: None,
             observer: Arc::new(SessionObserver::new()),
+            silence: StreamSilence::new(wal_sender_timeout, Instant::now()),
         }
     }
 
@@ -356,6 +440,9 @@ pub struct PersistentIngestStats {
     /// the source's clock; zero when it decoded none. A walsender that is
     /// behind sends late even while the connection keeps draining.
     pub longest_send_delay: Duration,
+    /// When PostgreSQL sent the newest message that carried a commit, on the
+    /// source's clock, or zero before the first.
+    newest_send_postgres_micros: i64,
 }
 
 /// Operator-facing recovery category for one failed persistent ingest attempt.
@@ -390,8 +477,12 @@ pub enum PersistentIngestError {
     Ingest(#[from] IngestError),
     #[error(transparent)]
     Fence(#[from] FenceError),
-    #[error("PostgreSQL replication transport failed or returned an uncertain result")]
+    #[error("the PostgreSQL replication stream failed or returned an uncertain result; if this persists, check that PostgreSQL is running, reachable at the address in the database URL, and has a free walsender (max_wal_senders)")]
     ReplicationUnavailable,
+    #[error(
+        "PostgreSQL replication stream carried nothing for {0:?}, even after a reply was requested"
+    )]
+    ReplicationSilent(Duration),
 }
 
 impl PersistentIngestError {
@@ -402,7 +493,8 @@ impl PersistentIngestError {
             }
             Self::SessionClosed
             | Self::MutationReceiptUnavailable
-            | Self::ReplicationUnavailable => PersistentIngestDisposition::Retry,
+            | Self::ReplicationUnavailable
+            | Self::ReplicationSilent(_) => PersistentIngestDisposition::Retry,
             Self::RegistryBindingMismatch => PersistentIngestDisposition::Resnapshot,
             Self::CanonicalLog(error) => log_disposition(error),
             Self::Decoder(_) => PersistentIngestDisposition::OperatorAction,
@@ -666,6 +758,24 @@ impl DurableAppender for ReceiptMarkingAppender {
     }
 }
 
+/// The connection that marks mutation receipts. A request that hears nothing
+/// from the server for `RECEIPT_STATEMENT_TIMEOUT` plus a margin fails the
+/// connection, so a silent source does not hold the ingest loop.
+fn connect_receipts(source_connection: &str) -> Result<Client, PersistentIngestError> {
+    let mut receipts = postgres_connect::Endpoint::parse(source_connection)
+        .map_err(|_| PersistentIngestError::MutationReceiptUnavailable)?
+        .bound_replies(RECEIPT_STATEMENT_TIMEOUT)
+        .connect()
+        .map_err(|_| PersistentIngestError::MutationReceiptUnavailable)?;
+    receipts
+        .batch_execute(&format!(
+            "SET statement_timeout = {}; SET lock_timeout = '1s';",
+            RECEIPT_STATEMENT_TIMEOUT.as_millis()
+        ))
+        .map_err(|_| PersistentIngestError::MutationReceiptUnavailable)?;
+    Ok(receipts)
+}
+
 #[derive(Debug, Error)]
 enum ReceiptMarkError {
     #[error("canonical mutation marker identity is malformed")]
@@ -764,13 +874,7 @@ impl ActiveSourceSession {
                         observer: Arc::clone(&observer),
                     }),
                 )?;
-                let mut receipts = postgres_connect::Endpoint::parse(&self.source_connection)
-                    .map_err(|_| PersistentIngestError::MutationReceiptUnavailable)?
-                    .connect()
-                    .map_err(|_| PersistentIngestError::MutationReceiptUnavailable)?;
-                receipts
-                    .batch_execute("SET statement_timeout = '2s'; SET lock_timeout = '1s';")
-                    .map_err(|_| PersistentIngestError::MutationReceiptUnavailable)?;
+                let receipts = connect_receipts(&self.source_connection)?;
                 let appender = ReceiptMarkingAppender {
                     log,
                     receipts,
@@ -820,6 +924,7 @@ impl ActiveSourceSession {
                 replication,
                 decoder,
                 &mut self.ingest_state.pending_events,
+                &mut self.ingest_state.silence,
                 ingest,
                 &self.authority,
                 &self.lease,
@@ -861,12 +966,16 @@ impl ActiveSourceSession {
 /// without waiting for more, up to `MAX_GROUP_TRANSACTIONS` or
 /// `MAX_GROUP_READ_BYTES` of CopyData. The group appends in one canonical-log
 /// commit, and one fenced status update then acknowledges its last WAL end.
+///
+/// A wait for the stream also ends when `silence` says to ask for a reply or
+/// to give the stream up.
 #[allow(clippy::too_many_arguments)]
 fn run_ingest_loop<A, F, N>(
     runtime: &mut tokio::runtime::Runtime,
     replication: &mut PgReplicationConnection,
     decoder: &mut Decoder,
     pending_events: &mut VecDeque<DecoderEvent>,
+    silence: &mut StreamSilence,
     ingest: &mut IngestSession<A, F, N>,
     authority: &Arc<FenceAuthority<PostgresFenceStore>>,
     lease: &ActiveLease,
@@ -885,7 +994,6 @@ where
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(PersistentIngestError::InvalidConfig)?;
-    let cancellation = CancellationToken::new();
     let mut stats = PersistentIngestStats {
         committed_transactions: 0,
         last_canonical_position: None,
@@ -894,6 +1002,7 @@ where
         feedback_writes: 0,
         caught_up: false,
         longest_send_delay: Duration::ZERO,
+        newest_send_postgres_micros: 0,
     };
     while stats.committed_transactions < max_transactions {
         let limit = (max_transactions - stats.committed_transactions).min(MAX_GROUP_TRANSACTIONS);
@@ -910,6 +1019,7 @@ where
                     stats.caught_up = true;
                     break;
                 };
+                silence.heard(Instant::now());
                 read_bytes = read_bytes.saturating_add(data.len());
                 let copy_data = decoder.decode_copy_data(data)?;
                 if decoder.total_spool_bytes() > 0 {
@@ -919,8 +1029,10 @@ where
                 group.extend(take_group(pending_events, limit - group.len()));
             }
             let transactions = group.len();
+            let stamps = DeliveryStamps::of(&group, stats.newest_send_postgres_micros);
             let pending = ingest.ingest_group(group)?;
             let authorized = ingest.authorize_ack(pending)?;
+            stamps.appended(transactions);
             let ack_lsn: u64 = authorized.wal_end().into();
             if !authorized.checkpoint_is_durable() {
                 observer.observe(PersistentIngestBoundary::BeforeCheckpoint);
@@ -935,6 +1047,7 @@ where
                 observer,
                 stats.received_lsn,
                 ack_lsn,
+                false,
             )?;
             stats.flushed_lsn = ack_lsn;
             stats.feedback_writes = stats
@@ -957,6 +1070,7 @@ where
                 .map_err(|_| PersistentIngestError::ReplicationUnavailable)?
             {
                 Some(data) => {
+                    silence.heard(Instant::now());
                     let copy_data = decoder.decode_copy_data(data)?;
                     take_copy_data(
                         runtime,
@@ -985,6 +1099,7 @@ where
                 .map_err(|_| PersistentIngestError::ReplicationUnavailable)?
             {
                 Some(data) => {
+                    silence.heard(Instant::now());
                     let copy_data = decoder.decode_copy_data(data)?;
                     take_copy_data(
                         runtime,
@@ -1005,6 +1120,8 @@ where
                 }
             }
         }
+        let wait = remaining.min(silence.due_at().saturating_duration_since(Instant::now()));
+        let cancellation = CancellationToken::new();
         let data = runtime.block_on(async {
             let read = replication.get_copy_data_async(&cancellation);
             tokio::pin!(read);
@@ -1012,7 +1129,7 @@ where
                 result = &mut read => result
                     .map(Some)
                     .map_err(|_| PersistentIngestError::ReplicationUnavailable),
-                () = tokio::time::sleep(remaining) => {
+                () = tokio::time::sleep(wait) => {
                     cancellation.cancel();
                     settle_cancelled_read(
                         tokio::time::timeout(FEEDBACK_FLUSH_TIMEOUT, &mut read).await.ok(),
@@ -1021,10 +1138,34 @@ where
             }
         })?;
         let Some(data) = data else {
-            // Nothing reached the connection before the deadline.
-            stats.caught_up = true;
-            return Ok(stats);
+            // Nothing reached the connection before the wait ended. The loop
+            // ends the cycle once its deadline has passed.
+            match silence.step(Instant::now()) {
+                SilenceStep::Wait => {}
+                SilenceStep::AskForReply => {
+                    send_feedback_fenced(
+                        runtime,
+                        replication,
+                        authority,
+                        lease,
+                        observer,
+                        stats.received_lsn,
+                        stats.flushed_lsn,
+                        true,
+                    )?;
+                    silence.asked(Instant::now());
+                    stats.feedback_writes = stats
+                        .feedback_writes
+                        .checked_add(1)
+                        .ok_or(PersistentIngestError::InvalidConfig)?;
+                }
+                SilenceStep::GiveUp => {
+                    return Err(PersistentIngestError::ReplicationSilent(silence.bound));
+                }
+            }
+            continue;
         };
+        silence.heard(Instant::now());
         let copy_data = decoder.decode_copy_data(data)?;
         take_copy_data(
             runtime,
@@ -1088,6 +1229,7 @@ fn take_copy_data(
             observer,
             stats.received_lsn,
             stats.flushed_lsn,
+            false,
         )?;
         stats.feedback_writes = stats
             .feedback_writes
@@ -1136,6 +1278,7 @@ fn receive_copy_data(
             stats.received_lsn = stats.received_lsn.max(wal_end.get());
             for event in &events {
                 if let DecoderEvent::TransactionCommitted(transaction) = event {
+                    stats.newest_send_postgres_micros = send_time_postgres_micros;
                     stats.longest_send_delay = stats.longest_send_delay.max(send_delay(
                         transaction.commit_time_postgres_micros,
                         send_time_postgres_micros,
@@ -1156,6 +1299,52 @@ fn receive_copy_data(
     }
 }
 
+const POSTGRES_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
+
+fn unix_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX)
+        })
+}
+
+/// When an append group's commits happened and when it reached each step, in
+/// microseconds since the Unix epoch, for the `calque::delivery` debug log.
+struct DeliveryStamps {
+    oldest_commit: i64,
+    newest_commit: i64,
+    sent: i64,
+    received: i64,
+}
+
+impl DeliveryStamps {
+    fn of(group: &[DecodedTransaction], send_postgres_micros: i64) -> Self {
+        let commits = group
+            .iter()
+            .map(|transaction| transaction.commit_time_postgres_micros);
+        Self {
+            oldest_commit: commits.clone().min().unwrap_or(0) + POSTGRES_EPOCH_UNIX_MICROS,
+            newest_commit: commits.max().unwrap_or(0) + POSTGRES_EPOCH_UNIX_MICROS,
+            sent: send_postgres_micros + POSTGRES_EPOCH_UNIX_MICROS,
+            received: unix_micros(),
+        }
+    }
+
+    fn appended(&self, transactions: usize) {
+        tracing::debug!(
+            target: "calque::delivery",
+            event = "append",
+            oldest_commit = self.oldest_commit,
+            newest_commit = self.newest_commit,
+            sent = self.sent,
+            received = self.received,
+            appended = unix_micros(),
+            transactions,
+        );
+    }
+}
+
 /// How long after a commit at `commit_micros` the message carrying it was
 /// sent at `send_micros`, both PostgreSQL microseconds on the source's clock;
 /// zero when that clock ran backwards between them.
@@ -1163,6 +1352,7 @@ fn send_delay(commit_micros: i64, send_micros: i64) -> Duration {
     Duration::from_micros(u64::try_from(send_micros.saturating_sub(commit_micros)).unwrap_or(0))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_feedback_fenced(
     runtime: &mut tokio::runtime::Runtime,
     replication: &mut PgReplicationConnection,
@@ -1171,6 +1361,7 @@ fn send_feedback_fenced(
     observer: &Arc<dyn PersistentIngestObserver>,
     received_lsn: u64,
     flushed_lsn: u64,
+    reply_requested: bool,
 ) -> Result<(), PersistentIngestError> {
     observer.observe(PersistentIngestBoundary::BeforeFinalFence);
     authority.with_active_feedback_fence(lease, || {
@@ -1187,7 +1378,7 @@ fn send_feedback_fenced(
                     received_lsn,
                     flushed_lsn,
                     flushed_lsn,
-                    false,
+                    reply_requested,
                     feedback_observer,
                 ),
             )
@@ -1207,6 +1398,33 @@ mod tests {
 
     use super::*;
 
+    /// A receipt request whose server stops answering fails once the
+    /// connection's reply bound runs out, 5 s after it began.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_receipt_request_whose_server_stops_answering_fails_at_its_reply_bound() {
+        let url = std::env::var("CALQUE_SOURCE_DATABASE_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .expect("live source database URL");
+        let relay = postgres_connect::relay::SilenceableRelay::start(&url);
+        let mut receipts = connect_receipts(relay.url()).unwrap();
+        relay.silence();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let failed = receipts.batch_execute("SELECT 1").is_err();
+            let _ = sender.send((failed, started.elapsed()));
+        });
+        let (failed, elapsed) = receiver
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the request on a silent socket had not returned after 15 s");
+        assert!(failed);
+        assert!(
+            elapsed >= Duration::from_secs(4) && elapsed < Duration::from_secs(8),
+            "the request returned after {elapsed:?}"
+        );
+    }
+
     fn committed(xid: u32) -> DecoderEvent {
         let lsn = DecodedLsn::new(u64::from(xid) * 16);
         DecoderEvent::TransactionCommitted(DecodedTransaction {
@@ -1223,6 +1441,51 @@ mod tests {
 
     fn xids(group: &[DecodedTransaction]) -> Vec<u32> {
         group.iter().map(|transaction| transaction.xid).collect()
+    }
+
+    fn after(start: Instant, seconds: u64) -> Instant {
+        start + Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn the_silence_bound_is_wal_sender_timeout_floored_and_a_minute_without_keepalives() {
+        let start = Instant::now();
+        let bound = |timeout| StreamSilence::new(timeout, start).bound;
+        assert_eq!(bound(Duration::ZERO), Duration::from_secs(60));
+        assert_eq!(bound(Duration::from_secs(2)), Duration::from_secs(5));
+        assert_eq!(bound(Duration::from_secs(120)), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn a_silent_stream_asks_for_a_reply_at_half_its_bound_and_gives_up_at_all_of_it() {
+        let start = Instant::now();
+        let mut silence = StreamSilence::new(Duration::from_secs(60), start);
+        assert_eq!(silence.step(after(start, 29)), SilenceStep::Wait);
+        assert_eq!(silence.step(after(start, 30)), SilenceStep::AskForReply);
+        silence.asked(after(start, 30));
+        assert_eq!(silence.due_at(), after(start, 60));
+        assert_eq!(silence.step(after(start, 59)), SilenceStep::Wait);
+        assert_eq!(silence.step(after(start, 60)), SilenceStep::GiveUp);
+    }
+
+    #[test]
+    fn time_the_session_spent_busy_does_not_count_against_a_server_not_yet_asked() {
+        let start = Instant::now();
+        let mut silence = StreamSilence::new(Duration::from_secs(60), start);
+        assert_eq!(silence.step(after(start, 100)), SilenceStep::AskForReply);
+        silence.asked(after(start, 100));
+        assert_eq!(silence.step(after(start, 129)), SilenceStep::Wait);
+        assert_eq!(silence.step(after(start, 130)), SilenceStep::GiveUp);
+    }
+
+    #[test]
+    fn a_message_starts_the_silence_over() {
+        let start = Instant::now();
+        let mut silence = StreamSilence::new(Duration::from_secs(60), start);
+        silence.asked(after(start, 30));
+        silence.heard(after(start, 45));
+        assert_eq!(silence.step(after(start, 74)), SilenceStep::Wait);
+        assert_eq!(silence.step(after(start, 75)), SilenceStep::AskForReply);
     }
 
     #[test]
@@ -1314,6 +1577,7 @@ mod tests {
             feedback_writes: 0,
             caught_up: false,
             longest_send_delay: Duration::ZERO,
+            newest_send_postgres_micros: 0,
         };
 
         let early = wal(

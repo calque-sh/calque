@@ -43,8 +43,23 @@ const device = () => {
     return crypto.randomUUID();
   }
 };
+const supported = () => {
+  let moduleWorkers = false;
+  try {
+    new Worker("http://[", { get type() { moduleWorkers = true; return "module"; } });
+  } catch {}
+  return (
+    moduleWorkers &&
+    typeof Response === "function" &&
+    typeof ReadableStreamBYOBReader === "function" &&
+    typeof globalThis.crypto?.subtle?.digest === "function" &&
+    typeof crypto.randomUUID === "function" &&
+    typeof structuredClone === "function" &&
+    typeof Promise.withResolvers === "function" &&
+    typeof String.prototype.isWellFormed === "function"
+  );
+};
 const decodes = () => {
-  if (typeof Worker !== "function") return false;
   try {
     return (
       new WebAssembly.Module(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0])) instanceof
@@ -58,9 +73,7 @@ const start = () => {
   const connection = rendered("calque-connection");
   if (
     globalThis[slot] !== undefined ||
-    navigator.userAgentData?.brands.some(({ brand }) => brand === "Chromium") !== true ||
-    typeof ReadableStreamBYOBReader !== "function" ||
-    typeof Response !== "function" ||
+    !supported() ||
     typeof connection?.endpoint !== "string" ||
     typeof connection.bearerToken !== "string"
   )
@@ -192,4 +205,4 @@ start();`;
 
 /** `BOOTSTRAP_START_SCRIPT`'s hash, as a CSP `script-src` source. */
 export const BOOTSTRAP_START_SCRIPT_SHA256 =
-  "sha256-zLXfjYFfg+biOOeQRNCqU8qPPZmVUKy86S3awBB5A9A=";
+  "sha256-d6/MX2OAEZzCd0dA4QuwhFCzqL8UwpwFQoZKpQNOmk4=";

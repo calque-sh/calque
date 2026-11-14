@@ -20,9 +20,9 @@ pub(crate) trait CommandError: From<LocalSourceError> + Send + Sized + 'static {
     fn requires_destroying_state(&self) -> bool;
     fn runtime_cleanup(startup: Self, cleanup: Self) -> Self;
     fn into_runtime_cleanup(self) -> Result<(Self, Self), Self>;
-    fn state_must_be_destroyed(refusal: Self, state_dir: &Path, connection_env: &str) -> Self;
-    fn source_changed(refusal: Self, state_dir: &Path, connection_env: &str) -> Self;
-    fn publication_drifted(refusal: Self) -> Self;
+    fn state_must_be_destroyed(refusal: Self, state_dir: &Path, database_url_env: &str) -> Self;
+    fn source_changed(refusal: Self, state_dir: &Path, database_url_env: &str) -> Self;
+    fn publication_drifted(refusal: Self, state_dir: &Path, database_url_env: &str) -> Self;
 }
 
 /// Whether this is the engine's refusal of a drifted publication.
@@ -108,13 +108,13 @@ fn added_by_the_stop(error: LocalSourceError) -> Option<LocalSourceError> {
 pub(crate) fn with_state_remedy<E: CommandError>(
     error: E,
     state_dir: &Path,
-    connection_env: &str,
+    database_url_env: &str,
 ) -> E {
     let error = match error.into_runtime_cleanup() {
         Ok((startup, cleanup)) => {
             return if startup.requires_destroying_state() {
                 E::runtime_cleanup(
-                    E::state_must_be_destroyed(startup, state_dir, connection_env),
+                    E::state_must_be_destroyed(startup, state_dir, database_url_env),
                     cleanup,
                 )
             } else if startup.names_its_remedy() {
@@ -123,10 +123,14 @@ pub(crate) fn with_state_remedy<E: CommandError>(
                 E::state_must_be_destroyed(
                     E::runtime_cleanup(startup, cleanup),
                     state_dir,
-                    connection_env,
+                    database_url_env,
                 )
             } else if drifted(&cleanup) {
-                E::publication_drifted(E::runtime_cleanup(startup, cleanup))
+                E::publication_drifted(
+                    E::runtime_cleanup(startup, cleanup),
+                    state_dir,
+                    database_url_env,
+                )
             } else {
                 E::runtime_cleanup(startup, cleanup)
             };
@@ -137,11 +141,11 @@ pub(crate) fn with_state_remedy<E: CommandError>(
         error.source(),
         Some(LocalSourceError::SourceIdentityChanged)
     ) {
-        E::source_changed(error, state_dir, connection_env)
+        E::source_changed(error, state_dir, database_url_env)
     } else if drifted(&error) {
-        E::publication_drifted(error)
+        E::publication_drifted(error, state_dir, database_url_env)
     } else if error.requires_destroying_state() {
-        E::state_must_be_destroyed(error, state_dir, connection_env)
+        E::state_must_be_destroyed(error, state_dir, database_url_env)
     } else {
         error
     }
@@ -165,14 +169,15 @@ pub(crate) async fn shutdown_signal() {
         }
     };
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate.recv() => {},
+        _ = ctrl_c => tracing::info!("stopping: received SIGINT"),
+        _ = terminate.recv() => tracing::info!("stopping: received SIGTERM"),
     }
 }
 
 #[cfg(not(unix))]
 pub(crate) async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("stopping: received ctrl-c");
 }
 
 /// How long a stop may take once it is requested. One that took longer than a

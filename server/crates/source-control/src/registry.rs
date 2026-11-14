@@ -88,7 +88,13 @@ struct RegistryEnvelope {
 struct FingerprintInput<'a> {
     source_identity: &'a SourceIdentity,
     publication: &'a PublicationSettings,
-    tables: Vec<&'a TableInspection>,
+    tables: Vec<TableInspection>,
+    /// The tables whose column list leaves out a column an insert needs.
+    /// That is all Calque takes from the columns a list leaves out, so they
+    /// stand in for those columns, which a migration may then add, change or
+    /// drop without drift.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    inserts_need_unlisted_column: Vec<&'a QualifiedTable>,
 }
 
 #[derive(Debug, Error)]
@@ -343,7 +349,18 @@ fn schema_fingerprint(snapshot: &EnrollmentSnapshot) -> Result<String, serde_jso
     let input = FingerprintInput {
         source_identity: &snapshot.identity,
         publication: &snapshot.publication,
-        tables,
+        inserts_need_unlisted_column: tables
+            .iter()
+            .filter(|table| table.insert_needs_unlisted_column())
+            .map(|table| &table.table)
+            .collect(),
+        tables: tables
+            .into_iter()
+            .map(|table| TableInspection {
+                unlisted_columns: Vec::new(),
+                ..table.clone()
+            })
+            .collect(),
     };
     Ok(sha256_hex(&serde_json::to_vec(&input)?))
 }
@@ -424,6 +441,7 @@ mod tests {
             is_partition: false,
             has_publication_row_filter: false,
             has_publication_column_list: false,
+            unlisted_columns: Vec::new(),
             columns: vec![
                 ColumnInspection {
                     attribute_number: 1,
@@ -436,6 +454,7 @@ mod tests {
                     primary_key_ordinal: Some(1),
                     generated: false,
                     nondeterministic_collation: false,
+                    carried_as: None,
                 },
                 ColumnInspection {
                     attribute_number: 2,
@@ -448,6 +467,7 @@ mod tests {
                     primary_key_ordinal: None,
                     generated: false,
                     nondeterministic_collation: false,
+                    carried_as: None,
                 },
             ],
         }
@@ -529,6 +549,34 @@ mod tests {
             schema_fingerprint(&changed).unwrap(),
             registry.source_schema_sha256()
         );
+    }
+
+    /// A column the publication's column list leaves out moves the
+    /// fingerprint only when it changes whether an insert can succeed.
+    #[test]
+    fn unlisted_columns_move_the_fingerprint_only_through_inserts() {
+        let unlisted = |name: &str, required_on_insert| crate::UnlistedColumn {
+            name: name.to_owned(),
+            primary_key: false,
+            required_on_insert,
+        };
+        let mut listed = snapshot();
+        listed.tables[0].has_publication_column_list = true;
+        listed.tables[0]
+            .unlisted_columns
+            .push(unlisted("secret", false));
+        let fingerprint = schema_fingerprint(&listed).unwrap();
+
+        let mut added = listed.clone();
+        added.tables[0]
+            .unlisted_columns
+            .push(unlisted("later", false));
+        assert_eq!(schema_fingerprint(&added).unwrap(), fingerprint);
+
+        added.tables[0]
+            .unlisted_columns
+            .push(unlisted("needed", true));
+        assert_ne!(schema_fingerprint(&added).unwrap(), fingerprint);
     }
 
     #[test]

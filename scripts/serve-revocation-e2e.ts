@@ -9,9 +9,10 @@
  * Four pages share one `calque serve` and one database of the run's own.
  * **rebuild** (alice) is revoked and handed a narrower grant, and must rebuild
  * and be refused a write. **lock** (bob) is revoked and signed out, and must
- * lock and paint nothing further. **renew** (carol) has its expiring grant
- * renewed and must rebuild without blanking. **expire** (dave) cannot renew,
- * and must lock and discard its rows. Each revoked page holds one write in
+ * lock and paint nothing further. **renew** (carol) is handed a fresh grant at
+ * each renewal and must cross three grant expiries without leaving `ready`,
+ * downloading again or missing a change, and still write. **expire** (dave)
+ * cannot renew, and must lock and discard its rows. Each revoked page holds one write in
  * flight across the barrier, which must end ambiguous and then be refused
  * under the retired grant. Rows committed after the fence are past the barrier
  * cursor, so a paint that lacks them came from a revoked mount.
@@ -23,17 +24,13 @@
  */
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import {
-  createPrivateKey,
-  randomUUID,
-  sign as signEd25519,
-  type KeyObject,
-} from "node:crypto";
+import { randomUUID, sign as signEd25519, type KeyObject } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { cpus, loadavg } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
+import { loadSigningKey } from "@calque/grant";
 import type { Browser, Page } from "playwright";
 import { importBuilt } from "./demo-process.ts";
 import {
@@ -89,7 +86,9 @@ interface PageState {
     readonly atEpochMs: number;
     readonly grant: string | null;
     readonly status: number | null;
+    readonly renewal: boolean;
   }[];
+  readonly artifactDownloads: number;
   readonly mutationRequests: readonly {
     readonly mutationIds: readonly string[];
     readonly grant: string | null;
@@ -117,6 +116,9 @@ declare global {
   var __calqueRevocationSetGrant: (
     token: string | null,
     label: string | null,
+  ) => void;
+  var __calqueRevocationQueueGrants: (
+    grants: readonly (readonly [token: string, label: string])[],
   ) => void;
   var __calqueRevocationHoldMutations: () => void;
   var __calqueRevocationReleaseMutations: () => void;
@@ -213,6 +215,10 @@ const REBUILD_WRITE_ID = 1001;
 const LOCK_WRITE_ID = 1002;
 const EXPIRE_WRITE_ID = 1004;
 const NARROWED_WRITE_ID = 1007;
+const RENEWED_LIVE_ID = 1006;
+const RENEWED_LIVE_TITLE = `committed after three renewals ${runId}`;
+const RENEWED_WRITE_ID = 1008;
+const RENEWED_WRITE_TITLE = `written after three renewals ${runId}`;
 const REVOKED_MESSAGE =
   "an authenticated revocation barrier retired this mutation's grant before the canonical echo; the mutation may have committed, so read the rebuilt snapshot before reissuing it";
 const REBUILD_MESSAGE =
@@ -495,11 +501,11 @@ async function main(): Promise<Record<string, unknown>> {
       "utf8",
     ),
   ) as {
-    sources: { connectionEnv: string; slot: string; publication: string }[];
+    sources: { databaseUrlEnv: string; slot: string; publication: string }[];
   };
   const [source] = manifest.sources;
   if (!source) throw new Error("the binding fixture declares no source");
-  source.connectionEnv = DATABASE_ENV;
+  source.databaseUrlEnv = DATABASE_ENV;
   source.slot = runSlot;
   source.publication = runPublication;
   writeFileSync(configPath, `${JSON.stringify(manifest, null, 2)}\n`);
@@ -540,11 +546,7 @@ async function main(): Promise<Record<string, unknown>> {
   };
   const aliceG1 = mint("alice-g1", "alice", 1, 900, ["tasks=update"]);
   const bobG1 = mint("bob-g1", "bob", 1, 900, ["tasks=update"]);
-  const applicationKey = createPrivateKey({
-    key: readFileSync(keyFile),
-    format: "der",
-    type: "pkcs8",
-  });
+  const applicationKey = loadSigningKey(readFileSync(keyFile));
   // `calque serve` below and each page's client get the same key object: the
   // barrier key and the grant key are the same key.
   const barrierKey = aliceG1.verificationKeyEnvironment;
@@ -950,7 +952,9 @@ UPDATE tasks SET title = '${AFTER_FENCE_RENAMED_TITLE}'
     assert.equal(lockedAfter.status.state, "locked");
 
     // ---- Expiry: one application renews, one cannot. ----
-    const carolShort = mint("carol-short", "carol", 2, SHORT_GRANT_SECONDS, []);
+    const carolShort = mint("carol-short", "carol", 2, SHORT_GRANT_SECONDS, [
+      "tasks=update",
+    ]);
     const daveShort = mint("dave-short", "dave", 2, SHORT_GRANT_SECONDS, [
       "tasks=update",
     ]);
@@ -972,11 +976,18 @@ UPDATE tasks SET title = '${AFTER_FENCE_RENAMED_TITLE}'
       "expire",
       pageErrors,
     );
-    const carolLong = mint("carol-long", "carol", 2, 900, []);
+    // Each renewal takes the next grant, and the first two expire after the
+    // grant before them, so the page crosses three expiries on renewals.
+    const carolRenewals = [
+      mint("carol-r1", "carol", 2, SHORT_GRANT_SECONDS + 10, ["tasks=update"]),
+      mint("carol-r2", "carol", 2, SHORT_GRANT_SECONDS + 20, ["tasks=update"]),
+      mint("carol-r3", "carol", 2, 900, ["tasks=update"]),
+    ];
     await renew.evaluate(
-      ([token, label]) => globalThis.__calqueRevocationSetGrant(token, label),
-      [carolLong.token, carolLong.label] as const,
+      (grants) => globalThis.__calqueRevocationQueueGrants(grants),
+      carolRenewals.map((grant) => [grant.token, grant.label] as const),
     );
+    const renewDownloadsBefore = (await stateOf(renew)).artifactDownloads;
     await expire.evaluate(() => globalThis.__calqueRevocationHoldMutations());
     await expire.evaluate(
       ([id, title]) => globalThis.__calqueRevocationStartUpdate(id, title),
@@ -1004,26 +1015,6 @@ UPDATE tasks SET title = '${AFTER_FENCE_RENAMED_TITLE}'
       async () => (await stateOf(expire)).status.state === "locked",
       20,
     );
-    await waitFor(
-      "the renew page to rebuild under its renewed grant",
-      SHORT_GRANT_SECONDS * 1000 + REBUILD_TIMEOUT_MS,
-      async () => {
-        const state = await stateOf(renew);
-        if (state.status.state === "locked" || state.status.state === "error")
-          throw new Error(
-            `the renew page ${state.status.state}: ${state.status.message ?? ""}`,
-          );
-        return (
-          state.status.state === "ready" &&
-          state.bootstraps.some(
-            (bootstrap) =>
-              bootstrap.grant === "carol-long" && bootstrap.status === 200,
-          )
-        );
-      },
-      20,
-    );
-
     const expired = await stateOf(expire);
     const expiredLock = expired.statuses.find(
       (status) => status.state === "locked",
@@ -1079,23 +1070,101 @@ UPDATE tasks SET title = '${AFTER_FENCE_RENAMED_TITLE}'
       SEEDED_TITLES.get(EXPIRE_WRITE_ID),
     );
 
+    // The renew page renews on its own clock. Once the second renewal grant
+    // has expired, a change committed now reaches it only under the third
+    // renewal's plan, and a write is accepted only under its token.
+    const lastExpiredAt = (carolRenewals[1]?.expiresAtUnixSeconds ?? 0) * 1000;
+    const untilRenewalsExpired = lastExpiredAt + 1_000 - Date.now();
+    if (untilRenewalsExpired > 0)
+      await new Promise((done) => setTimeout(done, untilRenewalsExpired));
+    const renewedLiveCommittedAt = Date.now();
+    psql(`
+UPDATE tasks SET title = '${RENEWED_LIVE_TITLE}'
+  WHERE id = ${String(RENEWED_LIVE_ID)};
+`);
+    await waitFor(
+      "the renew page to paint a change committed after three renewals",
+      DELIVERY_TIMEOUT_MS,
+      async () => {
+        const state = await stateOf(renew);
+        if (state.status.state !== "ready")
+          throw new Error(
+            `the renew page left ready: ${JSON.stringify(state.statuses)}`,
+          );
+        return titleIn(state, RENEWED_LIVE_ID) === RENEWED_LIVE_TITLE;
+      },
+      20,
+    );
+    const renewedLiveAt = Date.now();
+    await renew.evaluate(
+      ([id, title]) => globalThis.__calqueRevocationStartUpdate(id, title),
+      [RENEWED_WRITE_ID, RENEWED_WRITE_TITLE] as const,
+    );
+    await waitFor(
+      "the renew page's write to settle",
+      DELIVERY_TIMEOUT_MS,
+      async () =>
+        (await stateOf(renew)).attempts.some(
+          (attempt) =>
+            attempt.id === RENEWED_WRITE_ID && attempt.settled !== "pending",
+        ),
+    );
+    await waitFor(
+      "the renew page to paint its own write",
+      DELIVERY_TIMEOUT_MS,
+      async () =>
+        titleIn(await stateOf(renew), RENEWED_WRITE_ID) === RENEWED_WRITE_TITLE,
+    );
+
     const renewed = await stateOf(renew);
-    const renewLeftReady = leftReady(renewed, expirySetUpAt);
-    assert.ok(
-      renewLeftReady.atEpochMs >= renewExpiresAt - PLAN_EXPIRY_LEAD_MS,
-      "the renew page left ready before its plan could have expired",
+    const renewedWrite = renewed.attempts.find(
+      (attempt) => attempt.id === RENEWED_WRITE_ID,
     );
-    const renewReady = renewed.statuses.find(
-      (status) =>
-        status.atEpochMs > renewLeftReady.atEpochMs && status.state === "ready",
+    assert.equal(
+      renewedWrite?.settled,
+      "accepted",
+      JSON.stringify(renewedWrite),
     );
-    assert.ok(renewReady);
-    assert.ok(
-      !renewed.statuses.some((status) => status.state === "locked"),
-      "a renewed grant locked the page",
+    assert.equal(committedTitle(RENEWED_WRITE_ID), RENEWED_WRITE_TITLE);
+    assert.deepEqual(
+      renewed.mutationRequests.map((request) => [
+        request.grant,
+        request.status,
+      ]),
+      [["carol-r3", 200]],
     );
+    const renewals = renewed.bootstraps.filter(
+      (bootstrap) => bootstrap.renewal,
+    );
+    assert.deepEqual(
+      renewals.map((bootstrap) => [bootstrap.grant, bootstrap.status]),
+      [
+        ["carol-r1", 200],
+        ["carol-r2", 200],
+        ["carol-r3", 200],
+      ],
+      JSON.stringify(renewed.bootstraps),
+    );
+    assert.equal(
+      renewed.bootstraps.length,
+      renewals.length + 1,
+      "the renew page bootstrapped again",
+    );
+    assert.equal(
+      renewed.artifactDownloads,
+      renewDownloadsBefore,
+      "the renew page downloaded its artifact again",
+    );
+    assert.deepEqual(
+      renewed.statuses
+        .filter((status) => status.atEpochMs >= expirySetUpAt)
+        .map((status) => status.state),
+      [],
+      "the renew page left ready",
+    );
+    assert.equal(renewed.status.state, "ready");
     // No blank: once the working set was on screen, no paint left the table
-    // empty, across the expiry and the rebuild.
+    // empty across the three expiries.
     const firstFull = renewed.paints.findIndex(
       (paint) => paint.rows.length >= SEEDED_TASKS,
     );
@@ -1103,7 +1172,7 @@ UPDATE tasks SET title = '${AFTER_FENCE_RENAMED_TITLE}'
     const blanks = renewed.paints
       .slice(firstFull)
       .filter((paint) => paint.rows.length === 0);
-    assert.deepEqual(blanks, [], "the renew page blanked across its rebuild");
+    assert.deepEqual(blanks, [], "the renew page blanked across its renewals");
     assert.equal(renewed.rows.length, SEEDED_TASKS + 1);
 
     assert.deepEqual(pageErrors, []);
@@ -1167,12 +1236,17 @@ UPDATE tasks SET title = '${AFTER_FENCE_RENAMED_TITLE}'
           lateRefusalStatus: expiredAfterRelease.mutationRequests[0]?.status,
         },
         renew: {
-          expiryToLeftReadyMs: renewLeftReady.atEpochMs - renewExpiresAt,
-          expiryToReadyMs: renewReady.atEpochMs - renewExpiresAt,
+          renewalsBeforeExpiryMs: renewals.map(
+            (bootstrap, index) =>
+              (index === 0
+                ? renewExpiresAt
+                : (carolRenewals[index - 1]?.expiresAtUnixSeconds ?? 0) *
+                  1000) - bootstrap.atEpochMs,
+          ),
+          expiriesCrossed: 3,
+          artifactDownloads: renewed.artifactDownloads,
+          commitToPaintAfterRenewalsMs: renewedLiveAt - renewedLiveCommittedAt,
           blankPaints: blanks.length,
-          statuses: renewed.statuses
-            .filter((status) => status.atEpochMs >= renewLeftReady.atEpochMs)
-            .map((status) => status.state),
         },
       },
     };

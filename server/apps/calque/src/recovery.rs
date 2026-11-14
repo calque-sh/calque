@@ -128,14 +128,32 @@ fn with_object_half<T>(
     outcome
 }
 
+/// What a command reaching its database in plaintext tells the person who ran it.
+pub fn plaintext_warning(host: &str) -> String {
+    format!(
+        "the database at {host} is reached without TLS (sslmode=disable): its password and every row cross the network in plaintext, so use it only for a disposable database"
+    )
+}
+
 impl DatabaseEnvironment {
     /// The connection string, read only from the named environment variable.
     pub fn resolve(&self) -> Result<DatabaseUrl, RecoveryCliError> {
+        Ok(DatabaseUrl::parse(&self.read()?)?)
+    }
+
+    /// As [`resolve`](Self::resolve), for the commands a person runs by hand
+    /// against a database they chose, `dev`, `inspect` and `destroy`: an
+    /// explicit `sslmode=disable` is also accepted on a host that is not
+    /// loopback, and the caller prints [`plaintext_warning`].
+    pub fn resolve_allowing_plaintext(&self) -> Result<DatabaseUrl, RecoveryCliError> {
+        Ok(DatabaseUrl::parse_for_dev(&self.read()?)?)
+    }
+
+    fn read(&self) -> Result<String, RecoveryCliError> {
         let raw = env::var_os(&self.database_url_env)
             .ok_or_else(|| RecoveryCliError::MissingDatabaseUrl(self.database_url_env.clone()))?;
-        let raw = OsString::into_string(raw)
-            .map_err(|_| RecoveryCliError::NonUtf8DatabaseUrl(self.database_url_env.clone()))?;
-        Ok(DatabaseUrl::parse(&raw)?)
+        OsString::into_string(raw)
+            .map_err(|_| RecoveryCliError::NonUtf8DatabaseUrl(self.database_url_env.clone()))
     }
 }
 
@@ -312,6 +330,61 @@ mod tests {
             error.to_string(),
             "environment variable CALQUE_ABSENT_RECOVERY_URL_FOR_TEST is not set; set it to the source's PostgreSQL connection string, or name the variable that holds it with --database-url-env"
         );
+    }
+
+    /// Only the hand-run commands read an explicit `sslmode=disable` on a
+    /// host name; every command that goes through `resolve` refuses it.
+    #[test]
+    fn only_the_plaintext_resolver_takes_plaintext_to_a_host_name() {
+        const NAME: &str = "CALQUE_PLAINTEXT_HOST_URL_FOR_TEST";
+        std::env::set_var(
+            NAME,
+            "postgresql://calque:secret@host.docker.internal:5432/app?sslmode=disable",
+        );
+        let environment = DatabaseEnvironment {
+            database_url_env: NAME.to_owned(),
+        };
+        let refusal = environment
+            .resolve()
+            .expect_err("resolve is the strict rule");
+        assert!(
+            matches!(
+                refusal,
+                RecoveryCliError::Guard(calque_engine::GuardError::DatabaseTlsRequired)
+            ),
+            "{refusal}"
+        );
+        let database = environment.resolve_allowing_plaintext().unwrap();
+        assert_eq!(
+            database.plaintext_remote_host(),
+            Some("host.docker.internal")
+        );
+        std::env::remove_var(NAME);
+    }
+
+    /// `serve` reads its URL through `DatabaseUrl::parse`, and among these
+    /// files only the command line's `inspect` reads it through the
+    /// plaintext-tolerant resolver.
+    #[test]
+    fn serve_and_the_recovery_commands_never_call_the_dev_parse() {
+        for (file, source) in [
+            ("serve.rs", include_str!("serve.rs")),
+            ("recovery.rs", include_str!("recovery.rs")),
+            ("inspect.rs", include_str!("inspect.rs")),
+            ("cli.rs", include_str!("cli.rs")),
+        ] {
+            let code = source.split("#[cfg(test)]").next().unwrap();
+            let calls = code.matches("parse_for_dev(").count()
+                + code.matches("resolve_allowing_plaintext(").count();
+            // `recovery.rs` defines the resolver and its one call to the parse;
+            // `cli.rs` calls it for `inspect`.
+            let allowed = match file {
+                "recovery.rs" => 2,
+                "cli.rs" => 1,
+                _ => 0,
+            };
+            assert_eq!(calls, allowed, "{file}");
+        }
     }
 
     #[test]

@@ -43,6 +43,7 @@ import {
   freezeMutationResult,
   freezeMutationStatus,
   MutationSubmissionError,
+  type MutationAccepted,
   type MutationResult,
   type MutationStatus,
 } from "../mutation.js";
@@ -96,13 +97,25 @@ import { encodeCrudOperation } from "./mutation-encoding.js";
 import {
   CRUD_COMMAND_PREFIX,
   CRUD_COMMAND_VERSION,
+  MAX_MUTATION_RETRY_AFTER_MS,
   MAX_RESUBMITTABLE_MUTATIONS,
   MAX_RETAINED_MUTATION_STATUSES,
   rowKey,
   terminal,
   type MutationRow,
 } from "./mutation-tracking.js";
-import { bindColumnarPlan, collectionRelations } from "./plan-binding.js";
+import {
+  bindColumnarPlan,
+  checkRenewal,
+  collectionRelations,
+  renewablePlan,
+} from "./plan-binding.js";
+import {
+  nextRenewalAt,
+  RENEWAL_CUTOFF_MS,
+  renewalRetryable,
+  waitUntil,
+} from "./plan-renewal.js";
 import {
   LOADING,
   QuerySubscription,
@@ -138,6 +151,14 @@ type PublicationListener = (publication: SyncPublication) => void;
  * Every public call reads the mount of the current epoch, so a `reset()` or
  * `close()` in flight drops an older result rather than delivering it late.
  */
+/** One submission of a mutation's envelope, under the credentials it goes with. */
+interface MutationAttempt {
+  readonly activation: Activation;
+  readonly row: MutationRow;
+  readonly request: mutation.MutationBatchRequest;
+  readonly bearerToken: string;
+}
+
 export class ColumnarSession {
   readonly #options: SealedSyncClientOptions;
   readonly #workerFactory: () => ColumnarEngineWorker;
@@ -186,6 +207,10 @@ export class ColumnarSession {
     | { readonly mutationIds: Set<string>; readonly held: PublishedBatch[] }
     | undefined;
   readonly #mutations = new Map<string, MutationStatus>();
+  /** The calls settling each mutation the client is still submitting. */
+  readonly #settling = new Map<string, Promise<MutationAccepted>>();
+  /** Ends the wait before each automatic resend, for `retryMutation`. */
+  readonly #resendNow = new Map<string, () => void>();
   readonly #mutationListeners = new Map<string, ObserverRegistry<true>>();
   readonly #everyMutationListeners = new Set<
     (status: MutationStatus) => void
@@ -327,21 +352,56 @@ export class ColumnarSession {
 
   /**
    * Resends a mutation the server never decided, after a lost response or a
-   * `RETRYABLE_FAILURE`, as the identical envelope under its original id, so a
-   * server that committed it answers from its receipt instead of executing it
-   * again. A mutation the echo already confirmed returns that result.
+   * `RETRYABLE_FAILURE`, and settles it as a write's call does. While the
+   * client is resending it on its own, the waiting resend goes now and this
+   * call settles with it.
    */
-  async retryMutation(mutationId: string): Promise<MutationResult> {
+  async retryMutation(mutationId: string): Promise<MutationAccepted> {
     assertMutationId(mutationId);
+    const settling = this.#settling.get(mutationId);
+    if (settling) {
+      this.#resendNow.get(mutationId)?.();
+      return settling;
+    }
+    return this.#track(
+      mutationId,
+      (async () => {
+        const resend = await this.#prepareResend(mutationId, false);
+        if ("accepted" in resend) return resend.accepted;
+        return this.#submitUntilDecided(mutationId, resend);
+      })(),
+    );
+  }
+
+  /**
+   * The envelope of an undecided mutation, ready to resend under its original
+   * id so a server that committed it answers from its receipt instead of
+   * executing it again. The batch carries the scope token of the plan in
+   * force, which a renewal may have replaced since, and fresh credentials. A
+   * mutation the echo already confirmed returns that result instead. With
+   * `automatic`, an envelope the client no longer holds is ambiguous rather
+   * than rejected: the attempt before it may have committed.
+   */
+  async #prepareResend(
+    mutationId: string,
+    automatic: boolean,
+  ): Promise<{ readonly accepted: MutationAccepted } | MutationAttempt> {
     const status = this.#mutations.get(mutationId);
-    if (status?.state === "canonical") return status.result;
+    if (status?.state === "canonical") return { accepted: status.result };
     const resubmittable = this.#resubmittable.get(mutationId);
     if (!resubmittable)
-      throw new MutationSubmissionError(
-        mutationId,
-        "MUTATION_REJECTED",
-        `mutation ${mutationId} has no submission awaiting a retry`,
-      );
+      throw automatic
+        ? new MutationSubmissionError(
+            mutationId,
+            "MUTATION_AMBIGUOUS",
+            `mutation ${mutationId} is undecided and the client no longer holds it to resend; the rows show whether it landed`,
+            { recovery: "none" },
+          )
+        : new MutationSubmissionError(
+            mutationId,
+            "MUTATION_REJECTED",
+            `mutation ${mutationId} has no submission awaiting a retry`,
+          );
     const activation = await this.#ready(undefined);
     if (resubmittable.activation !== activation)
       // The mount that held the delta is gone. Resubmitting against a new
@@ -361,19 +421,21 @@ export class ColumnarSession {
     // the credentials. Resending then would put the status back to awaiting
     // an echo that has already been applied, and nothing would move it again.
     const confirmed = this.#mutations.get(mutationId);
-    if (confirmed?.state === "canonical") return confirmed.result;
+    if (confirmed?.state === "canonical") return { accepted: confirmed.result };
     this.#setMutationStatus({
       mutationId,
       ...resubmittable.row,
       state: "submitting",
     });
-    return this.#submitMutation(
+    return {
       activation,
-      mutationId,
-      resubmittable.row,
-      resubmittable.request,
-      auth.bearerToken,
-    );
+      row: resubmittable.row,
+      request: {
+        ...resubmittable.request,
+        authorizationScopeToken: encoder.encode(activation.grant.scopeToken),
+      },
+      bearerToken: auth.bearerToken,
+    };
   }
 
   async refresh(signal?: AbortSignal): Promise<void> {
@@ -445,10 +507,12 @@ export class ColumnarSession {
       "none",
       "the client is closed",
     );
-    for (const subscription of this.#subscriptions.values())
+    for (const subscription of this.#subscriptions.values()) {
+      subscription.stopIdle();
       subscription.publish(
         Object.freeze({ status: "error", error: closedError }),
       );
+    }
     this.#subscriptions.clear();
     if (previous) await teardownActivation(previous);
     this.#setStatus({ state: "closed" });
@@ -544,8 +608,10 @@ export class ColumnarSession {
         candidate.window?.offset === window?.offset &&
         candidate.window?.count === window?.count &&
         candidate.canonical === canonical
-      )
+      ) {
+        candidate.touch();
         return candidate as unknown as LiveQueryResource<Result>;
+      }
     const key = `subscription-${this.#nextSubscriptionKey++}`;
     const subscription = new QuerySubscription<Result>(
       this,
@@ -589,7 +655,7 @@ export class ColumnarSession {
     operation: GeneratedClientCrudOperation,
     key: Readonly<Record<string, unknown>>,
     values: Readonly<Record<string, unknown>> | undefined,
-  ): Promise<MutationResult> {
+  ): Promise<MutationAccepted> {
     const activation = await this.#ready(undefined);
     const table = activation.tables.get(collection);
     if (!table)
@@ -639,7 +705,7 @@ export class ColumnarSession {
       protocolVersion: 1,
       clientInstanceId: this.#clientInstanceId,
       deviceId: this.#deviceId,
-      authorizationScopeToken: encoder.encode(activation.scopeToken),
+      authorizationScopeToken: encoder.encode(activation.grant.scopeToken),
       mutations: [
         create(mutation.MutationEnvelopeSchema, {
           mutationId,
@@ -661,18 +727,163 @@ export class ColumnarSession {
         }),
       ],
     });
-    return this.#submitMutation(
-      activation,
+    return this.#track(
       mutationId,
-      row,
-      request,
-      auth.bearerToken,
+      this.#submitUntilDecided(mutationId, {
+        activation,
+        row,
+        request,
+        bearerToken: auth.bearerToken,
+      }),
     );
+  }
+
+  /** Keeps `settling` as the answer to a `retryMutation` while it runs. */
+  #track(
+    mutationId: string,
+    settling: Promise<MutationAccepted>,
+  ): Promise<MutationAccepted> {
+    this.#settling.set(mutationId, settling);
+    const forget = () => {
+      if (this.#settling.get(mutationId) === settling)
+        this.#settling.delete(mutationId);
+    };
+    settling.then(forget, forget);
+    return settling;
+  }
+
+  /**
+   * Submits a mutation until the server decides it, resending an undecided
+   * one under the same id: after a lost or unreadable response, waiting a
+   * delay that doubles each time, and after a retry-later answer, waiting
+   * what the server asked for. Resolves once the server committed it, and
+   * rejects when the server refused it or it stays undecided through every
+   * resend.
+   */
+  async #submitUntilDecided(
+    mutationId: string,
+    first: MutationAttempt,
+  ): Promise<MutationAccepted> {
+    const { count, delayMs } = this.#options.mutationResends;
+    let attempt = first;
+    for (let resend = 0; ; resend += 1) {
+      const decision = await this.#submitOnce(
+        attempt,
+        mutationId,
+        resend < count ? delayMs * 2 ** resend : undefined,
+        resend,
+      );
+      if (typeof decision !== "number") return decision;
+      await this.#waitToResend(attempt.activation, mutationId, decision);
+      const next = await this.#prepareResend(mutationId, true);
+      if ("accepted" in next) return next.accepted;
+      attempt = next;
+    }
+  }
+
+  /**
+   * One submission, read as a decision: the accepted result, a throw for a
+   * refusal or for an undecided mutation with no resend left, or the wait
+   * before the next resend. `lostResponseWaitMs` is the wait after a lost
+   * response, `undefined` once the resends are spent.
+   */
+  async #submitOnce(
+    attempt: MutationAttempt,
+    mutationId: string,
+    lostResponseWaitMs: number | undefined,
+    resend: number,
+  ): Promise<MutationAccepted | number> {
+    let result: MutationResult;
+    try {
+      result = await this.#submitMutation(
+        attempt.activation,
+        mutationId,
+        attempt.row,
+        attempt.request,
+        attempt.bearerToken,
+      );
+    } catch (error) {
+      if (
+        lostResponseWaitMs !== undefined &&
+        error instanceof MutationSubmissionError &&
+        error.code === "MUTATION_AMBIGUOUS" &&
+        error.recovery === "retry"
+      )
+        return lostResponseWaitMs;
+      throw error;
+    }
+    switch (result.state) {
+      case "awaiting_canonical_echo":
+      case "already_canonical":
+        return result;
+      case "rejected":
+        throw new MutationSubmissionError(
+          mutationId,
+          "MUTATION_REJECTED",
+          result.message,
+        );
+      case "conflict":
+        throw new MutationSubmissionError(
+          mutationId,
+          "MUTATION_CONFLICT",
+          result.message,
+          { conflict: result.conflict },
+        );
+      case "retryable":
+        if (lostResponseWaitMs === undefined)
+          throw this.#activation === attempt.activation
+            ? new MutationSubmissionError(
+                mutationId,
+                "MUTATION_AMBIGUOUS",
+                `the server was temporarily unavailable for ${resend + 1} attempt${resend === 0 ? "" : "s"}; retryMutation resends it`,
+              )
+            : new MutationSubmissionError(
+                mutationId,
+                "MUTATION_AMBIGUOUS",
+                "the server was temporarily unavailable, and the mount this mutation was submitted on was torn down; the rebuilt rows show whether it landed",
+                { recovery: "none" },
+              );
+        return Math.min(
+          Number(result.retryAfterMs),
+          MAX_MUTATION_RETRY_AFTER_MS,
+        );
+    }
+  }
+
+  /**
+   * Waits `ms` before a resend, and rejects as soon as the mount the
+   * mutation was submitted on is torn down: its envelope went with it.
+   */
+  async #waitToResend(
+    activation: Activation,
+    mutationId: string,
+    ms: number,
+  ): Promise<void> {
+    const signal = this.#epoch.signal;
+    if (this.#activation === activation && !signal.aborted)
+      await new Promise<void>((resolve) => {
+        const done = (): void => {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", done);
+          this.#resendNow.delete(mutationId);
+          resolve();
+        };
+        const timer = setTimeout(done, ms);
+        signal.addEventListener("abort", done, { once: true });
+        this.#resendNow.set(mutationId, done);
+      });
+    if (this.#activation !== activation)
+      throw new MutationSubmissionError(
+        mutationId,
+        "MUTATION_AMBIGUOUS",
+        "the mount this mutation was submitted on was torn down before the server decided it; the rebuilt rows show whether it landed",
+        { recovery: "none" },
+      );
   }
 
   /**
    * POSTs one mutation envelope and reconciles the answer, for the first
-   * submission and for `retryMutation` alike.
+   * submission and for every resend alike.
    */
   async #submitMutation(
     activation: Activation,
@@ -1146,6 +1357,7 @@ export class ColumnarSession {
         this.#rerun(activation, true);
         mark("ready");
         this.#setStatus({ state: "ready" });
+        void this.#keepRenewing(activation);
       },
       (error: unknown) => {
         if (epoch.aborted) return;
@@ -1344,6 +1556,98 @@ export class ColumnarSession {
   }
 
   /**
+   * Renews the activation's plan before it expires, for as long as the
+   * activation serves. A renewal that cannot succeed leaves the plan to
+   * expire, and the change stream's expiry rebuilds the session as before.
+   */
+  async #keepRenewing(activation: Activation): Promise<void> {
+    const { signal } = activation.renewal;
+    let failures = 0;
+    for (;;) {
+      const at = nextRenewalAt(
+        Date.now(),
+        activation.grant.expiresAt,
+        failures,
+      );
+      if (at === undefined) return;
+      await waitUntil(at, signal);
+      if (signal.aborted || this.#activation !== activation) return;
+      // A timer the browser held back, as in a background tab, may fire past
+      // the cutoff.
+      if (Date.now() + RENEWAL_CUTOFF_MS >= activation.grant.expiresAt) return;
+      const expiresAt = activation.grant.expiresAt;
+      try {
+        await this.#renew(activation, signal);
+      } catch (error) {
+        if (signal.aborted) return;
+        if (!renewalRetryable(error)) {
+          mark("plan:renewal-refused");
+          return;
+        }
+      }
+      // A grant `auth()` handed back unchanged renews nothing, so it counts
+      // as a failure.
+      failures = activation.grant.expiresAt > expiresAt ? 0 : failures + 1;
+    }
+  }
+
+  /**
+   * Asks for a plan that installs nothing and continues the mount from the
+   * cursor it stands at, presenting the tables it holds and the proof of the
+   * plan in force. A renewed plan replaces the plan id and scope token every
+   * later change request and write sends.
+   */
+  async #renew(activation: Activation, signal: AbortSignal): Promise<void> {
+    let auth: ReturnType<typeof sealAuthSnapshot>;
+    try {
+      auth = sealAuthSnapshot(await this.#options.auth());
+    } catch (error) {
+      // The application's own grant endpoint may answer by the next attempt.
+      throw new SyncError(
+        "AUTH_FAILED",
+        "auth",
+        "retry",
+        "auth() failed while renewing the plan",
+        { cause: error },
+      );
+    }
+    if (signal.aborted) return;
+    const cursor = activation.cursor;
+    const plan = await requestBootstrapPlan({
+      fetch: this.#options.fetch,
+      endpoint: this.#options.endpointUrl,
+      bearerToken: auth.bearerToken,
+      transport: artifactTransportProfile(),
+      requiredTables: collectionRelations(this.#collections),
+      memoryBudgetBytes: this.#options.memoryBudgetBytes,
+      clientHeapReserveBytes: this.#options.clientHeapReserveBytes,
+      clientInstanceId: this.#clientInstanceId,
+      deviceId: this.#deviceId,
+      signal,
+      resident: {
+        proof: activation.grant.residentStateProof,
+        tables: activation.plan.tableIds,
+        cursor,
+      },
+    });
+    if (signal.aborted || this.#activation !== activation) return;
+    checkRenewal(activation.plan, plan, cursor);
+    const expiresAt = Date.parse(plan.expiresAt);
+    if (expiresAt <= activation.grant.expiresAt) return;
+    activation.grant = Object.freeze({
+      planId: plan.planId,
+      scopeToken: plan.authorization.scopeToken,
+      expiresAt,
+      residentStateProof: plan.nextResidentStateProof,
+    });
+    activation.live?.renew({
+      planId: plan.planId,
+      authorizationScopeToken: plan.authorization.scopeToken,
+    });
+    mark("plan:renewed");
+  }
+
+  /**
    * Requests the bootstrap plan, retrying a `NETWORK_ERROR` on
    * `BOOTSTRAP_RETRY_DELAYS_MS` and a `503 ARTIFACT_PREPARING` on the server's
    * `Retry-After`, up to `MAX_PREPARING_WAIT_MS` from the first such answer,
@@ -1418,9 +1722,9 @@ export class ColumnarSession {
     let transport: ReturnType<typeof artifactTransportProfile>;
     let adopted: Promise<Response> | undefined;
     try {
+      transport = artifactTransportProfile();
       auth = sealAuthSnapshot(await this.#options.auth());
       epoch.throwIfAborted();
-      transport = artifactTransportProfile();
       adopted = this.#adopt(started, auth.bearerToken, transport);
     } finally {
       if (started && adopted === undefined) discardStartedBootstrap(started);
@@ -1707,7 +2011,14 @@ export class ColumnarSession {
         cursor: artifact.snapshotCursor,
         failure: undefined,
         live: undefined,
-        scopeToken: plan.authorization.scopeToken,
+        grant: Object.freeze({
+          planId: plan.planId,
+          scopeToken: plan.authorization.scopeToken,
+          expiresAt: Date.parse(plan.expiresAt),
+          residentStateProof: plan.nextResidentStateProof,
+        }),
+        plan: renewablePlan(plan),
+        renewal: new AbortController(),
         tables,
       };
       const live = new ColumnarLiveSession(engine, {

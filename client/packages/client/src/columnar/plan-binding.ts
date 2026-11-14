@@ -273,3 +273,57 @@ export function bindColumnarPlan(
     contract: changeContract(plan, runtime),
   });
 }
+
+/** What a mount's plans keep fixed across renewals. */
+export interface RenewablePlan {
+  readonly source: BootstrapPlan["source"];
+  readonly scopeHash: string;
+  /** The wire ids of the tables the mount holds. */
+  readonly tableIds: readonly string[];
+}
+
+export function renewablePlan(plan: BootstrapPlan): RenewablePlan {
+  return Object.freeze({
+    source: plan.source,
+    scopeHash: plan.authorization.scopeHash,
+    tableIds: Object.freeze([...plan.requiredTables]),
+  });
+}
+
+/**
+ * Checks that `plan` renews `held` from `cursor`: it installs nothing, names
+ * the same source, generations, scope and tables, and continues the change
+ * stream from the cursor the request presented. Anything else throws the
+ * INVALID_RESPONSE the renewal gives up on.
+ */
+export function checkRenewal(
+  held: RenewablePlan,
+  plan: BootstrapPlan,
+  cursor: string,
+): void {
+  const { source } = plan;
+  if (plan.artifacts.length !== 0)
+    throw invalid("a renewal plan must install no artifact");
+  if (
+    source.sourceEpoch !== held.source.sourceEpoch ||
+    source.publicationGeneration !== held.source.publicationGeneration ||
+    source.schemaGeneration !== held.source.schemaGeneration ||
+    source.authorizationGeneration !== held.source.authorizationGeneration ||
+    source.authorizationPolicyHash !== held.source.authorizationPolicyHash ||
+    plan.authorization.scopeHash !== held.scopeHash
+  )
+    throw invalid("a renewal plan must keep the source and scope it renews");
+  if (
+    !sameSet(plan.requiredTables, held.tableIds) ||
+    !sameSet(plan.residentTables, held.tableIds)
+  )
+    throw invalid("a renewal plan must keep the tables it renews");
+  if (
+    plan.residentCursor !== cursor ||
+    plan.activationCursor !== cursor ||
+    plan.changeStream.fromCursorExclusive !== cursor
+  )
+    throw invalid(
+      "a renewal plan must continue from the cursor the client presented",
+    );
+}

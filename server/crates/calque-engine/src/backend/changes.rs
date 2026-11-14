@@ -286,6 +286,7 @@ pub(super) struct StreamedChanges {
     /// The request as the next build reads it: its `from_cursor_exclusive`
     /// is where the last written batch ended.
     pub(super) request: change_api::ChangeBatchRequest,
+    pub(super) held: Option<OpenedPlan>,
     pub(super) wakes: ChangeWakes,
     pub(super) parked: ParkedPoll,
     pub(super) deadline: tokio::time::Instant,
@@ -438,7 +439,10 @@ impl LocalBackend {
         let now = now_unix_micros().map_err(|_| ChangeBatchError::InvalidServerTime)?;
         let live = request.through_cursor_inclusive.is_none();
         let wait_timeout = Duration::from_millis(u64::from(request.long_poll_timeout_ms));
-        let (first, grant_expiry) = self.build_under_fence(incoming, request, now).await?;
+        let mut held = None;
+        let (first, grant_expiry) = self
+            .build_under_fence(incoming, request, &mut held, now)
+            .await?;
         // A batch that ends on a revocation barrier is the answer even when it
         // does not move the cursor: a client standing on the barrier's cursor
         // would otherwise wait out its poll for a barrier already signed.
@@ -466,7 +470,8 @@ impl LocalBackend {
         // resolved again for the same reason: a fence or a barrier that
         // arrived while it was parked applies to this build.
         let after_wait = now_unix_micros().map_err(|_| ChangeBatchError::InvalidServerTime)?;
-        self.build_under_fence(incoming, request, after_wait).await
+        self.build_under_fence(incoming, request, &mut held, after_wait)
+            .await
     }
 
     /// Answers a request that set `stream`: a batch each time the head moves,
@@ -491,8 +496,9 @@ impl LocalBackend {
         // this stream whether or not either of them ever waits.
         let parked = ParkedPoll::park(&self.inner.parked_polls, &incoming.request().plan_id);
         let now = now_unix_micros().map_err(|_| ChangeBatchError::InvalidServerTime)?;
+        let mut held = None;
         let (first, grant_expiry) = self
-            .build_under_fence(&incoming, incoming.request(), now)
+            .build_under_fence(&incoming, incoming.request(), &mut held, now)
             .await?;
         // A batch that ends on a revocation barrier is the answer even when it
         // does not move the cursor: a client standing on the barrier's cursor
@@ -518,6 +524,7 @@ impl LocalBackend {
         let stream = StreamedChanges {
             incoming,
             request,
+            held,
             wakes,
             parked,
             deadline,
@@ -564,16 +571,21 @@ impl LocalBackend {
                     woke = stream.wakes.changed(tail_fresh) => if !woke { break },
                 }
             }
-            // Each build resolves the grant, the revocation ceiling and the
-            // acknowledgeable receipts again, as a long-poll's second build
-            // does: nothing resolved for one batch is reused for the next.
+            // Each build asks again whether the grant stands, for the
+            // revocation ceiling and for the acknowledgeable receipts, as a
+            // long-poll's second build does.
             let Ok(now) = now_unix_micros() else { break };
             let built = tokio::select! {
                 biased;
                 () = sender.closed() => return,
                 () = stream.parked.superseded() => break,
                 () = &mut deadline => break,
-                built = self.build_under_fence(&stream.incoming, &stream.request, now) => built,
+                built = self.build_under_fence(
+                    &stream.incoming,
+                    &stream.request,
+                    &mut stream.held,
+                    now,
+                ) => built,
             };
             let batch = match built {
                 Ok((batch, _)) => batch,
@@ -623,13 +635,14 @@ impl LocalBackend {
         &self,
         incoming: &IncomingChangeRequest,
         request: &change_api::ChangeBatchRequest,
+        held: &mut Option<OpenedPlan>,
         now: i64,
     ) -> Result<(ChangeBatch, i64), ChangeBatchError> {
         let mut room = None;
         let mut now = now;
         loop {
             match self
-                .build_once_under_fence(incoming, request, now, &mut room)
+                .build_once_under_fence(incoming, request, held, now, &mut room)
                 .await?
             {
                 Built::Batch(batch, grant_expiry) => return Ok((batch, grant_expiry)),
@@ -650,18 +663,16 @@ impl LocalBackend {
         &self,
         incoming: &IncomingChangeRequest,
         request: &change_api::ChangeBatchRequest,
+        held: &mut Option<OpenedPlan>,
         now: i64,
         room: &mut Option<BatchRoom>,
     ) -> Result<Built, ChangeBatchError> {
         let _fence = self.inner.build_fence.build().await;
-        let grant = self
-            .inner
-            .plans
-            .resolve(&self.serving(), incoming, request, now)?;
-        let ceiling = grant
-            .revocation
-            .as_ref()
-            .map(|revocation| revocation.ceiling);
+        let (grant, revocation) =
+            self.inner
+                .plans
+                .for_build(held, &self.serving(), incoming, request, now)?;
+        let ceiling = revocation.as_ref().map(|revocation| revocation.ceiling);
         if ceiling.is_some_and(|ceiling| {
             starts_past(
                 &self.inner.activated,
@@ -676,11 +687,11 @@ impl LocalBackend {
             plan_id: request.plan_id.clone(),
             activated_scope: grant.plan.activated_scope.clone(),
             expires_at_unix_micros: grant_expiry,
-            from_cursor_exclusive: grant.claims.start_cursor()?,
-            through_cursor_inclusive: grant.claims.through_cursor()?,
-            table_starts: grant.table_starts,
+            from_cursor_exclusive: grant.from_cursor.clone(),
+            through_cursor_inclusive: grant.through_cursor.clone(),
+            table_starts: grant.table_starts.clone(),
             acknowledgeable_mutation_ids: ResolvedMutationAcknowledgements::default(),
-            revocation_barrier: grant.revocation.and_then(|revocation| revocation.signed),
+            revocation_barrier: revocation.and_then(|revocation| revocation.signed),
         };
         let acknowledgements = (!incoming.pending_mutation_ids().is_empty())
             .then(|| self.resolve_acknowledgements(incoming, &grant.plan.scope));

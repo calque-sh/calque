@@ -20,7 +20,7 @@ use crate::{dev, init, inspect, recovery, serve};
     name = "calque",
     about = "Serve complete PostgreSQL collections to browsers, with realtime changes",
     version,
-    after_long_help = "DATABASE CONNECTION:\n    Connection strings are read from an environment variable, never from a command-line argument, so credentials do not enter process listings or shell history. serve reads the variable its manifest names in sources[].connectionEnv; every other command that connects reads the one named by --database-url-env, CALQUE_DATABASE_URL by default."
+    after_long_help = "DATABASE CONNECTION:\n    Connection strings are read from an environment variable, never from a command-line argument, so credentials do not enter process listings or shell history. serve reads the variable its manifest names in sources[].databaseUrlEnv; every other command that connects reads the one named by --database-url-env, CALQUE_DATABASE_URL by default."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -57,7 +57,7 @@ pub enum Command {
 
 /// Where the served source's connection string is read from.
 ///
-/// `serve` takes it from the manifest's `sources[].connectionEnv`; every other
+/// `serve` takes it from the manifest's `sources[].databaseUrlEnv`; every other
 /// command that connects runs without a manifest, so it names the variable
 /// directly. It is never a command-line argument, so credentials do not
 /// enter process listings or shell history.
@@ -432,7 +432,10 @@ pub struct InitCommand {
     pub application_version: String,
     /// Environment variable the server reads the source connection string from.
     #[arg(long, value_name = "NAME", default_value = "CALQUE_DATABASE_URL")]
-    pub connection_env: String,
+    pub database_url_env: String,
+    /// The flag's earlier name, refused with the current one.
+    #[arg(long = "connection-env", value_name = "NAME", hide = true)]
+    pub renamed_connection_env: Option<String>,
     /// Replication slot name. Defaults to `calque_<id>_slot`, where `<id>` is
     /// the manifest's application id with each `-` replaced by `_`.
     #[arg(long, value_name = "NAME")]
@@ -461,12 +464,21 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
         Command::Inspect(command) => {
             let tables: BTreeSet<QualifiedTable> = command.tables.into_iter().collect();
-            let database = command.database.resolve()?;
+            let database = command.database.resolve_allowing_plaintext()?;
+            if let Some(host) = database.plaintext_remote_host() {
+                eprintln!("warning: {}", recovery::plaintext_warning(host));
+            }
             let output = inspect::run(&database, &command.source, &command.publication, tables)?;
             println!("{}", serde_json::to_string(&output)?);
+            if let Some(warning) = calque_engine::inspect_slot_wal_bound(&database)? {
+                let _ = writeln!(io::stderr(), "calque: warning: {warning}");
+            }
             Ok(())
         }
         Command::Init(command) => {
+            if command.renamed_connection_env.is_some() {
+                return Err("--connection-env is now --database-url-env".into());
+            }
             let raw = if command.from_inspection.as_os_str() == "-" {
                 std::io::read_to_string(std::io::stdin())?
             } else {
@@ -485,7 +497,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             let options = init::InitOptions {
                 application_id: command.application_id,
                 application_version: command.application_version,
-                connection_env: command.connection_env,
+                database_url_env: command.database_url_env,
                 slot: command.slot,
                 scope_id: command.scope_id,
                 tenants: command.tenant_column.map(|column| init::Tenants {
@@ -848,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn init_defaults_the_output_path_and_connection_environment() {
+    fn init_defaults_the_output_path_and_database_url_environment() {
         let cli = Cli::try_parse_from([
             "calque",
             "init",
@@ -862,7 +874,7 @@ mod tests {
             panic!("expected init");
         };
         assert_eq!(command.output, PathBuf::from("calque.config.json"));
-        assert_eq!(command.connection_env, "CALQUE_DATABASE_URL");
+        assert_eq!(command.database_url_env, "CALQUE_DATABASE_URL");
         assert!(!command.force);
         assert!(command.slot.is_none());
     }

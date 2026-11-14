@@ -45,6 +45,16 @@ impl CrudOperations {
         delete: true,
     };
 
+    /// These operations, less insert when the table's column list leaves
+    /// out a column an insert needs: an insert names only the columns the
+    /// publication carries.
+    pub fn without_insert_if(self, insert_needs_unlisted_column: bool) -> Self {
+        Self {
+            insert: self.insert && !insert_needs_unlisted_column,
+            ..self
+        }
+    }
+
     fn permits(self, kind: OperationKind) -> bool {
         match kind {
             OperationKind::InsertFullRow => self.insert,
@@ -68,15 +78,12 @@ impl CrudColumnRole {
     /// The role of a column with these catalog facts.
     ///
     /// A key column is never writable: the key is immutable. A generated
-    /// column cannot be written at all. A column whose PostgreSQL type has no
-    /// version-1 canonical codec cannot be bound as a parameter, so it is not
-    /// writable either.
-    pub fn of(type_schema: &str, type_name: &str, generated: bool, key: bool) -> Self {
+    /// column cannot be written at all. A column with no version-1 canonical
+    /// `codec` cannot be bound as a parameter, so it is not writable either.
+    pub fn of(codec: Option<PostgresTypeCodec>, generated: bool, key: bool) -> Self {
         Self {
             key,
-            writable: !key
-                && !generated
-                && PostgresTypeCodec::from_catalog(type_schema, type_name).is_some(),
+            writable: !key && !generated && codec.is_some(),
         }
     }
 }
@@ -154,14 +161,15 @@ impl CrudCommand {
         table: &RegisteredTable,
         operations: CrudOperations,
     ) -> Result<Self, CrudCommandError> {
+        let operations =
+            operations.without_insert_if(table.inspection.insert_needs_unlisted_column());
         if table.column_ids.len() != table.inspection.columns.len() {
             return Err(CrudCommandError::ColumnMismatch);
         }
         let mut columns = Vec::with_capacity(table.column_ids.len());
         let mut key_ordinals = Vec::new();
         for (column_id, inspection) in table.column_ids.iter().zip(&table.inspection.columns) {
-            let codec =
-                PostgresTypeCodec::from_catalog(&inspection.type_schema, &inspection.type_name);
+            let codec = inspection.codec();
             let key = inspection.primary_key_ordinal.is_some();
             if key && !codec.is_some_and(PostgresTypeCodec::is_primary_key_safe) {
                 return Err(CrudCommandError::UnsupportedKeyType {
@@ -171,12 +179,7 @@ impl CrudCommand {
             if let Some(ordinal) = inspection.primary_key_ordinal {
                 key_ordinals.push((ordinal, column_id.get()));
             }
-            let role = CrudColumnRole::of(
-                &inspection.type_schema,
-                &inspection.type_name,
-                inspection.generated,
-                key,
-            );
+            let role = CrudColumnRole::of(codec, inspection.generated, key);
             columns.push(CrudColumn {
                 column_id: column_id.get(),
                 name: inspection.name.clone(),
@@ -865,7 +868,7 @@ fn classify_postgres_error(error: postgres::Error) -> CommandFailure {
 #[cfg(test)]
 mod tests {
     use authz::{AuthorizationPolicy, PolicyDefinition, TablePermitDefinition};
-    use source_control::{QualifiedTable, TableInspection};
+    use source_control::{QualifiedTable, TableInspection, UnlistedColumn};
     use sync_protocol::{
         change::{CellValue, Delete, FullRow, PrimaryKey, RowPatch},
         encode_primary_key,
@@ -892,6 +895,7 @@ mod tests {
             primary_key_ordinal: key,
             generated,
             nondeterministic_collation: false,
+            carried_as: None,
         }
     }
 
@@ -912,6 +916,7 @@ mod tests {
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                unlisted_columns: Vec::new(),
                 columns: vec![
                     column(1, "id", "int8", false, Some(1), false),
                     column(2, "title", "text", false, None, false),
@@ -1450,6 +1455,58 @@ mod tests {
             ])),
             Err(CommandFailure::Validation)
         );
+    }
+
+    /// An enum column travels as text and is written through its own type,
+    /// so PostgreSQL checks the label. A column the publication's column list
+    /// leaves out that an insert needs takes insert away, at parse as in the
+    /// summary.
+    #[test]
+    fn enum_columns_bind_through_their_type_and_unlisted_required_columns_refuse_insert() {
+        let mut enum_table = table();
+        enum_table.inspection.columns.pop();
+        enum_table.column_ids.pop();
+        enum_table.inspection.columns[1].type_schema = "public".to_owned();
+        enum_table.inspection.columns[1].type_name = "mood".to_owned();
+        enum_table.inspection.columns[1].carried_as = Some("text".to_owned());
+        let row = operation(
+            OperationKind::InsertFullRow,
+            key(7),
+            Payload::Insert(FullRow {
+                columns: vec![
+                    cell(1, Kind::Int64Value(7)),
+                    cell(2, Kind::TextValue("calm".to_owned())),
+                    cell(3, Kind::BoolValue(false)),
+                    cell(4, Kind::NullValue(0)),
+                ],
+            }),
+        );
+        let command = CrudCommand::for_table(&enum_table, CrudOperations::ALL).unwrap();
+        assert!(command.writable_columns().any(|name| name == "title"));
+        let parsed = command.parse(&row).unwrap();
+        assert!(
+            command
+                .statement(&parsed)
+                .sql
+                .contains("($2::text)::\"public\".\"mood\""),
+            "{}",
+            command.statement(&parsed).sql
+        );
+
+        enum_table.inspection.unlisted_columns.push(UnlistedColumn {
+            name: "owner".to_owned(),
+            primary_key: false,
+            required_on_insert: true,
+        });
+        let command = CrudCommand::for_table(&enum_table, CrudOperations::ALL).unwrap();
+        assert_eq!(
+            command.summary().operations,
+            [CrudOperationName::Update, CrudOperationName::Delete]
+        );
+        assert!(matches!(
+            command.parse(&row),
+            Err(CommandFailure::Authorization)
+        ));
     }
 
     #[test]

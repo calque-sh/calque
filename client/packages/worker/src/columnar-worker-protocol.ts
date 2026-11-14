@@ -48,6 +48,11 @@ export type WorkerRequest =
       readonly batches: readonly Uint8Array[];
       /** Present for a fenced catch-up response; absent for a live poll. */
       readonly fence?: ColumnarChangeFence;
+      /**
+       * The plan the request named, which every batch must name. Absent, the
+       * plan the mount opened under.
+       */
+      readonly planId?: string;
     }
   | {
       readonly id: number;

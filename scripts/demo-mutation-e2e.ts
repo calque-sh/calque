@@ -3,8 +3,8 @@
  * Drives the demo's mutations end to end against a disposable
  * PostgreSQL 18 in Docker and a real `calque dev`: update submission-to-echo
  * timing; `insert` and `delete` accepted, echoed, committed and refused; a lost
- * `POST /v1/mutations` response recovered by `retryMutation` without writing
- * twice; and seeded randomized batches compared with a model and with
+ * `POST /v1/mutations` response recovered by the client's own resend without
+ * writing twice; and seeded randomized batches compared with a model and with
  * PostgreSQL. The packaged client runs in Node with its workers on
  * `node:worker_threads`, so the timings are directional and nothing is painted.
  *
@@ -84,13 +84,13 @@ const INSERTED_TASK_ID = 2001n;
  */
 const LOST_RESPONSE_KEY_BASE = 2100n;
 /**
- * The retry races the CDC echo, so the phase loses several responses to reach
- * a retry that lands first without depending on winning that race.
+ * The resend races the CDC echo, so the phase loses several responses to reach
+ * a resend that lands first without depending on winning that race.
  */
 const LOST_RESPONSE_ATTEMPTS = 3;
 /**
  * On a fast runner the echo can win every early attempt, so the phase keeps
- * dropping responses until one retry beats it, up to this many.
+ * dropping responses until one resend beats it, up to this many.
  */
 const LOST_RESPONSE_MAX_ATTEMPTS = 12;
 /** A project every generated row references, so no insert fails on the FK. */
@@ -124,6 +124,33 @@ interface MutationOutcome {
   readonly mutationId: string;
 }
 
+/**
+ * A write's outcome, with a refusal read from the error its call rejects
+ * with, so a refused write and an accepted one can be compared.
+ */
+async function outcomeOf(
+  write: Promise<MutationOutcome>,
+): Promise<MutationOutcome> {
+  try {
+    return await write;
+  } catch (error) {
+    const refusal = error as {
+      readonly code?: string;
+      readonly mutationId?: string;
+    };
+    if (
+      typeof refusal.mutationId === "string" &&
+      (refusal.code === "MUTATION_CONFLICT" ||
+        refusal.code === "MUTATION_REJECTED")
+    )
+      return {
+        state: refusal.code === "MUTATION_CONFLICT" ? "conflict" : "rejected",
+        mutationId: refusal.mutationId,
+      };
+    throw error;
+  }
+}
+
 interface TasksFacade {
   insert(row: Readonly<Record<string, unknown>>): Promise<MutationOutcome>;
   update(
@@ -143,12 +170,6 @@ interface HarnessClient {
   readonly db: { readonly tasks: TasksFacade };
   mutationStatus(mutationId: string): { readonly state: string } | undefined;
   subscribeMutation(mutationId: string, listener: () => void): () => void;
-  /**
-   * Resubmits a mutation whose response never arrived, under the identifier
-   * it was already submitted with. The durable receipt makes the second
-   * submission a replay rather than a second execution.
-   */
-  retryMutation(mutationId: string): Promise<MutationOutcome>;
   close(): Promise<void>;
 }
 
@@ -162,7 +183,7 @@ interface TaskRow {
 type TaskRows = ReadonlyMap<bigint, TaskRow>;
 
 mkdirSync(output, { recursive: true });
-assertChromiumArtifactProfile();
+provideBrowserFeatures();
 
 const postgresPort = process.env.CALQUE_POSTGRES_PORT ?? "55453";
 const serverPort = await availablePort();
@@ -230,6 +251,7 @@ try {
       options: Record<string, unknown>,
       workerFactory: () => unknown,
       hasherFactory: () => unknown,
+      decoderFactory: () => unknown,
     ) => HarnessClient;
   };
   const { schema } = (await import(bindingsModule)) as {
@@ -246,9 +268,12 @@ try {
       clientHeapReserveBytes: 64 * 1024 * 1024,
       deviceId: "demo-mutation-e2e",
       fetch: timedFetch,
+      // The lost-response phase needs a resend that can beat the echo.
+      mutationResendDelayMs: 1,
     },
     createNodeColumnarWorker,
     createNodeColumnarHasher,
+    createNodeColumnarDecoder,
   );
 
   await waitForReady(client, 300_000);
@@ -315,9 +340,11 @@ try {
   // server answers Conflict. The optimistic delta must be gone and the other
   // rows unchanged.
   const beforeRejection = await readTitles(client);
-  const refused = await client.db.tasks.update(
-    { id: MISSING_TASK_ID },
-    { title: "this row does not exist" },
+  const refused = await outcomeOf(
+    client.db.tasks.update(
+      { id: MISSING_TASK_ID },
+      { title: "this row does not exist" },
+    ),
   );
   assert.equal(refused.state, "conflict", JSON.stringify(refused));
   assert.equal(
@@ -395,23 +422,23 @@ try {
 }
 
 /**
- * The artifact transport profile the packaged client requires. Node has no
- * `navigator.userAgentData`, so the harness declares the profile it is
- * standing in for rather than letting the client refuse to open at all.
+ * The browser APIs the packaged client checks for before it opens. Node has
+ * all of them but module workers: this harness hands the client
+ * `worker_threads` workers for its engine, hasher and decoder workers
+ * instead, so it stands in a `Worker` constructor that reads `type` the way a
+ * browser's does and is never otherwise called.
  */
-function assertChromiumArtifactProfile(): void {
+function provideBrowserFeatures(): void {
   assert.equal(
     typeof globalThis.ReadableStreamBYOBReader,
     "function",
     "this Node build has no BYOB reader; the artifact path needs one",
   );
-  Object.defineProperty(globalThis, "navigator", {
+  Object.defineProperty(globalThis, "Worker", {
     configurable: true,
-    value: Object.freeze({
-      userAgentData: Object.freeze({
-        brands: Object.freeze([Object.freeze({ brand: "Chromium" })]),
-      }),
-    }),
+    value: function Worker(_url: unknown, options?: { type?: string }) {
+      void options?.type;
+    },
   });
 }
 
@@ -484,6 +511,14 @@ function createNodeColumnarWorker(): NodeColumnarWorker {
  */
 function createNodeColumnarHasher(): NodeColumnarWorker {
   return createNodeWorker("columnar-hasher-entry.js");
+}
+
+/**
+ * The brotli decoder worker, as a real thread. A browser has every API the
+ * decoder needs, so the client asks for the brotli encodings and spawns it.
+ */
+function createNodeColumnarDecoder(): NodeColumnarWorker {
+  return createNodeWorker("columnar-decoder-entry.js");
 }
 
 interface NodeColumnarWorker {
@@ -649,12 +684,14 @@ async function proveInsertAndDelete(current: HarnessClient): Promise<{
   // violation, which `classify_postgres_error` reports as a conflict. The
   // optimistic row must be gone and every other row untouched.
   const beforeDuplicate = printableRows(await readRows(current));
-  const duplicate = await current.db.tasks.insert({
-    id: INSERTED_TASK_ID,
-    project_id: SEEDED_PROJECT_ID,
-    title: "this key is already taken",
-    done: true,
-  });
+  const duplicate = await outcomeOf(
+    current.db.tasks.insert({
+      id: INSERTED_TASK_ID,
+      project_id: SEEDED_PROJECT_ID,
+      title: "this key is already taken",
+      done: true,
+    }),
+  );
   assert.equal(duplicate.state, "conflict", JSON.stringify(duplicate));
   assert.equal(
     current.mutationStatus(duplicate.mutationId)?.state,
@@ -696,7 +733,9 @@ async function proveInsertAndDelete(current: HarnessClient): Promise<{
   // The refused delete: no row matches, so the command affects nothing and
   // the server answers `row-missing`.
   const beforeRefusedDelete = printableRows(await readRows(current));
-  const refusedDelete = await current.db.tasks.delete({ id: MISSING_TASK_ID });
+  const refusedDelete = await outcomeOf(
+    current.db.tasks.delete({ id: MISSING_TASK_ID }),
+  );
   assert.equal(refusedDelete.state, "conflict", JSON.stringify(refusedDelete));
   assert.equal(
     current.mutationStatus(refusedDelete.mutationId)?.state,
@@ -718,14 +757,15 @@ async function proveInsertAndDelete(current: HarnessClient): Promise<{
 }
 
 /**
- * Loses a mutation response after its command committed and checks that
- * `retryMutation` replays the durable receipt instead of writing twice.
+ * Loses a mutation response after its command committed and checks that the
+ * client's own resend is answered from the durable receipt instead of writing
+ * twice, so the write's call resolves.
  *
  * The mutation is an insert because a second execution is observable: it
  * would hit the primary key and come back `conflict`, where an update would be
- * idempotent by value. The echo may land before the retry, which is also
- * correct, so the phase repeats until at least one retry is answered from the
- * receipt.
+ * idempotent by value. The echo may land before the resend, which is also
+ * correct, so the phase repeats until at least one resend is answered from
+ * the receipt.
  */
 async function proveLostResponseAppliesOnce(current: HarnessClient): Promise<{
   readonly attempts: number;
@@ -748,91 +788,49 @@ async function proveLostResponseAppliesOnce(current: HarnessClient): Promise<{
       "0",
       "the key the lost insert claims must not already exist",
     );
-    let mutationId: string | undefined;
     dropNextMutationResponse = true;
-    await assert.rejects(
-      async () => {
-        await current.db.tasks.insert({
-          id,
-          project_id: SEEDED_PROJECT_ID,
-          title,
-          done: false,
-        });
-      },
-      (error: unknown) => {
-        const failure = error as {
-          readonly code?: string;
-          readonly mutationId?: string;
-        };
-        assert.equal(failure.code, "MUTATION_AMBIGUOUS", describe(error));
-        mutationId = failure.mutationId;
-        return true;
-      },
-    );
+    const written = await current.db.tasks.insert({
+      id,
+      project_id: SEEDED_PROJECT_ID,
+      title,
+      done: false,
+    });
+    const mutationId = written.mutationId;
     assert.equal(
       dropNextMutationResponse,
       false,
       "no mutation POST was intercepted, so no response was lost",
     );
-    assert(mutationId, "the ambiguous failure did not name its mutation id");
     assert.match(
       mutationId,
       /^[A-Za-z0-9._-]{1,128}$/u,
       "the mutation id is not a safe SQL literal",
     );
-    assert.equal(
-      current.mutationStatus(mutationId)?.state,
-      "ambiguous",
-      "a lost response must leave the mutation ambiguous, not resolved",
-    );
-    // The delta survives the ambiguity: dropping it would lose a write that
-    // may already be canonical.
-    assert(
-      (await readRows(current)).has(id),
-      "the ambiguous insert dropped its optimistic row",
-    );
-
-    // The retry, before anything slow enough to lose the race with the echo.
-    let retried: MutationOutcome | undefined;
-    try {
-      retried = await current.retryMutation(mutationId);
-    } catch (error) {
-      // The echo confirmed the mutation first, so there is nothing left to
-      // resubmit. That is the other correct outcome.
-      assert.equal(
-        current.mutationStatus(mutationId)?.state,
-        "canonical",
-        `the retry failed while the mutation was not canonical: ${describe(error)}`,
-      );
-    }
-    if (retried?.state === "already_canonical") {
-      // The echo won: the page applied it before the retry could resend, or
-      // the server answered the resend from the canonical log. Neither is a
-      // replayed receipt. The session keeps the delta until the echo replaces
-      // it, so the row stays in the mount either way.
-      assert.equal(retried.mutationId, mutationId);
+    if (written.state === "already_canonical") {
+      // The echo won: the page applied it before the client resent, or the
+      // server answered the resend from the canonical log. Neither is a
+      // replayed receipt. The session keeps the delta until the echo
+      // replaces it, so the row stays in the mount either way.
       assert(
         (await readRows(current)).has(id),
         "an already_canonical answer took the row out of the mount before its echo",
       );
-      await awaitCanonical(current, mutationId, 30_000);
-    } else if (retried) {
+    } else {
       retriedBeforeEcho += 1;
       assert.equal(
-        retried.state,
+        written.state,
         "awaiting_canonical_echo",
-        `the replayed receipt did not re-accept the mutation: ${JSON.stringify(retried)}`,
+        `the resend did not re-accept the mutation: ${JSON.stringify(written)}`,
       );
-      assert.equal(retried.mutationId, mutationId);
       // `already_accepted_outcome`'s message. A re-executed insert would have
       // hit the primary key and come back a conflict instead.
       assert.equal(
-        (retried as { readonly message?: string }).message,
+        (written as { readonly message?: string }).message,
         "mutation was already committed and is awaiting canonical echo",
-        "the retry was not answered from the durable receipt",
+        "the resend was not answered from the durable receipt",
       );
-      await awaitCanonical(current, mutationId, 30_000);
     }
+    await awaitCanonical(current, mutationId, 30_000);
 
     assert.equal(
       current.mutationStatus(mutationId)?.state,
@@ -856,12 +854,12 @@ async function proveLostResponseAppliesOnce(current: HarnessClient): Promise<{
         `SELECT count(*) FROM calque_internal.mutation_receipts WHERE mutation_id = '${mutationId}'`,
       ).trim(),
       "1",
-      "the retry wrote a second receipt",
+      "the resend wrote a second receipt",
     );
   }
   assert(
     retriedBeforeEcho > 0,
-    `no attempt reached the retry before its echo in ${String(attempts)} tries`,
+    `no attempt reached the resend before its echo in ${String(attempts)} tries`,
   );
   assert.equal(droppedMutationResponses, attempts);
   return {
@@ -1025,18 +1023,22 @@ async function applyReplayStep(
   step: ReplayStep,
 ): Promise<MutationOutcome> {
   if (step.kind === "insert")
-    return current.db.tasks.insert({
-      id: step.id,
-      project_id: step.projectId,
-      title: step.title,
-      done: step.done,
-    });
-  if (step.kind === "update")
-    return current.db.tasks.update(
-      { id: step.id },
-      { title: step.title, done: step.done },
+    return outcomeOf(
+      current.db.tasks.insert({
+        id: step.id,
+        project_id: step.projectId,
+        title: step.title,
+        done: step.done,
+      }),
     );
-  return current.db.tasks.delete({ id: step.id });
+  if (step.kind === "update")
+    return outcomeOf(
+      current.db.tasks.update(
+        { id: step.id },
+        { title: step.title, done: step.done },
+      ),
+    );
+  return outcomeOf(current.db.tasks.delete({ id: step.id }));
 }
 
 function applyReplayStepToModel(

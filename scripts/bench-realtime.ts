@@ -88,6 +88,7 @@ import {
   type ClockCheck,
   clockCheck,
   closeSession,
+  DriftAtChanges,
   HOLD_MARGIN_MS,
   navigate,
   openSession,
@@ -704,6 +705,7 @@ async function probe(
   const errorsBefore = session.pageErrors.length;
   const wallShiftMs = (await readWallDriftMs(session.page)) - wallDriftAtLoadMs;
   session.network.wallShiftMs = wallShiftMs;
+  const drift = new DriftAtChanges(() => readWallDriftMs(session.page), frames);
   await prober.run(
     `BEGIN;\n${probeInsertSql(run.options.dataset, k)}`,
     `bench-probe-${String(k)}-begin`,
@@ -715,6 +717,7 @@ async function probe(
   let reference: string | null = null;
   for (;;) {
     await delay(25);
+    await drift.observe(capture.prefix());
     const now = hrtimeMs();
     const state = settle(
       capture.prefix(),
@@ -743,8 +746,14 @@ async function probe(
           fromMs: tBefore,
           signals,
         });
+  const match = window.find(
+    (frame) => frame.timestampMs === judgement?.matchMs,
+  );
   const wallDriftMs =
-    (await readWallDriftMs(session.page)) - wallDriftAtLoadMs - wallShiftMs;
+    ((match && drift.after(match.receivedMs)) ??
+      (await readWallDriftMs(session.page))) -
+    wallDriftAtLoadMs -
+    wallShiftMs;
   const gridRows = await readGridRows(session.page);
   const error = reportedError(
     await readPageState(session.page),
@@ -815,7 +824,7 @@ async function probe(
  * calque, the transport and the worker before it, the page's paint and the
  * screencast after.
  */
-async function publicationsBetween(
+export async function publicationsBetween(
   session: Session,
   fromMs: number,
   toMs: number,
@@ -827,7 +836,7 @@ async function publicationsBetween(
     }[]
   | null
 > {
-  const offset = session.network.frameOffsetSeconds();
+  const offset = session.network.monotonicMinusEpochSeconds;
   const read = await session.page.evaluate(() => ({
     timeOrigin: performance.timeOrigin,
     log:

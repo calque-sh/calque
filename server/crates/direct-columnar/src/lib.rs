@@ -42,8 +42,13 @@ extern crate self as direct_columnar;
 
 use std::{
     collections::{HashMap, HashSet},
-    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    fs::File,
+    io::{self, BufReader, BufWriter, Read, Write},
     str::FromStr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use bigdecimal::BigDecimal;
@@ -204,16 +209,26 @@ impl Encoder {
         schema: WorkspaceSchema,
         limits: EncoderLimits,
     ) -> Result<Self, EncodeError> {
+        Self::with_spool_memory(identity, schema, limits, SPOOL_MEMORY_BYTES)
+    }
+
+    fn with_spool_memory(
+        identity: ArtifactIdentity,
+        schema: WorkspaceSchema,
+        limits: EncoderLimits,
+        spool_memory_bytes: usize,
+    ) -> Result<Self, EncodeError> {
         validate_identity(&identity)?;
         validate_schema(&schema, limits)?;
         if identity.schema_hash != schema_hash(&schema)? {
             return Err(EncodeError::SchemaIdentityMismatch);
         }
+        let budget = SpoolBudget::new(spool_memory_bytes);
         let mut table_indexes = HashMap::with_capacity(schema.tables.len());
         let mut tables = Vec::with_capacity(schema.tables.len());
         for (index, table) in schema.tables.into_iter().enumerate() {
             table_indexes.insert(table.name.clone(), index);
-            tables.push(TableSpool::new(table)?);
+            tables.push(TableSpool::new(table, &budget)?);
         }
         Ok(Self {
             identity,
@@ -413,11 +428,11 @@ impl LaidOutArtifact {
             for column in &mut table.columns {
                 for part in &mut column.parts {
                     output.pad_to(payload_start + part.offset)?;
-                    part.file.as_file_mut().seek(SeekFrom::Start(0))?;
+                    let mut reader = part.file.reader()?;
                     if part.value_lengths {
-                        copy_value_lengths(part.file.as_file_mut(), &mut output)?;
+                        copy_value_lengths(&mut reader, &mut output)?;
                     } else {
-                        std::io::copy(part.file.as_file_mut(), &mut output)?;
+                        io::copy(&mut reader, &mut output)?;
                     }
                 }
             }
@@ -471,7 +486,7 @@ struct TableSpool {
 }
 
 impl TableSpool {
-    fn new(schema: TableSchema) -> Result<Self, EncodeError> {
+    fn new(schema: TableSchema, budget: &SpoolBudget) -> Result<Self, EncodeError> {
         let by_name: HashMap<_, _> = schema
             .columns
             .iter()
@@ -487,7 +502,7 @@ impl TableSpool {
             .columns
             .iter()
             .cloned()
-            .map(ColumnSpool::new)
+            .map(|column| ColumnSpool::new(column, budget))
             .collect::<Result<_, _>>()?;
         Ok(Self {
             schema,
@@ -542,18 +557,153 @@ impl TableSpool {
     }
 }
 
-/// A spool file written one value at a time. Unbuffered, each value would be
-/// its own `write(2)`, which makes spooling, not decoding, the cost of a build.
-type SpoolFile = BufWriter<NamedTempFile>;
+/// What one encoder's spools hold in memory before the rest move to temporary
+/// files. A 100k-row artifact fits, and spends no build time on the hundred
+/// files, and the `write(2)`s behind them, that made spooling the cost of a
+/// build once several ran at once.
+const SPOOL_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+const SPOOL_FIRST_ALLOCATION_BYTES: usize = 8 * 1024;
+const SPOOL_FILE_BUFFER_BYTES: usize = 64 * 1024;
 
-fn spool_file() -> Result<SpoolFile, EncodeError> {
-    Ok(BufWriter::new(NamedTempFile::new()?))
+/// The memory left for one encoder's spools.
+#[derive(Clone)]
+struct SpoolBudget(Arc<AtomicUsize>);
+
+impl SpoolBudget {
+    fn new(bytes: usize) -> Self {
+        Self(Arc::new(AtomicUsize::new(bytes)))
+    }
+
+    fn take(&self, bytes: usize) -> bool {
+        self.0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(bytes)
+            })
+            .is_ok()
+    }
+
+    fn give_back(&self, bytes: usize) {
+        self.0.fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
-fn finish_spool(spool: SpoolFile) -> Result<NamedTempFile, EncodeError> {
-    spool
-        .into_inner()
-        .map_err(|error| EncodeError::Io(error.into_error()))
+/// Spooled bytes in memory, charged to their encoder's budget until dropped.
+struct SpoolMemory {
+    bytes: Vec<u8>,
+    budget: SpoolBudget,
+    charged: usize,
+}
+
+impl SpoolMemory {
+    /// Grows the allocation to hold `extra` more bytes, or says the budget
+    /// cannot pay for it.
+    fn make_room(&mut self, extra: usize) -> bool {
+        let needed = self.bytes.len().saturating_add(extra);
+        if needed <= self.charged {
+            return true;
+        }
+        let capacity = needed
+            .max(self.charged.saturating_mul(2))
+            .max(SPOOL_FIRST_ALLOCATION_BYTES);
+        if !self.budget.take(capacity - self.charged) {
+            return false;
+        }
+        self.bytes.reserve_exact(capacity - self.bytes.len());
+        self.charged = capacity;
+        true
+    }
+}
+
+impl Drop for SpoolMemory {
+    fn drop(&mut self) {
+        self.budget.give_back(self.charged);
+    }
+}
+
+/// One part of a column as rows arrive: in memory while its encoder's budget
+/// lasts, then in a temporary file.
+enum SpoolFile {
+    Memory(SpoolMemory),
+    File(BufWriter<NamedTempFile>),
+}
+
+fn spool_file(budget: &SpoolBudget) -> SpoolFile {
+    SpoolFile::Memory(SpoolMemory {
+        bytes: Vec::new(),
+        budget: budget.clone(),
+        charged: 0,
+    })
+}
+
+impl Write for SpoolFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Self::Memory(memory) = self {
+            if memory.make_room(bytes.len()) {
+                memory.bytes.extend_from_slice(bytes);
+                return Ok(bytes.len());
+            }
+            let mut file = BufWriter::with_capacity(SPOOL_FILE_BUFFER_BYTES, NamedTempFile::new()?);
+            file.write_all(&memory.bytes)?;
+            *self = Self::File(file);
+        }
+        match self {
+            Self::File(file) => file.write(bytes),
+            Self::Memory(_) => Err(io::Error::other("the spool did not move to its file")),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::File(file) => file.flush(),
+            Self::Memory(_) => Ok(()),
+        }
+    }
+}
+
+/// A finished spool, read back as often as its column needs.
+enum Spooled {
+    Memory(SpoolMemory),
+    File(NamedTempFile),
+}
+
+fn finish_spool(spool: SpoolFile) -> Result<Spooled, EncodeError> {
+    Ok(match spool {
+        SpoolFile::Memory(memory) => Spooled::Memory(memory),
+        SpoolFile::File(file) => Spooled::File(
+            file.into_inner()
+                .map_err(|error| EncodeError::Io(error.into_error()))?,
+        ),
+    })
+}
+
+impl Spooled {
+    fn length(&self) -> Result<u64, EncodeError> {
+        Ok(match self {
+            Self::Memory(memory) => memory.bytes.len() as u64,
+            Self::File(file) => file.as_file().metadata()?.len(),
+        })
+    }
+
+    fn reader(&self) -> Result<SpooledReader<'_>, EncodeError> {
+        Ok(match self {
+            Self::Memory(memory) => SpooledReader::Memory(&memory.bytes),
+            Self::File(file) => SpooledReader::File(BufReader::new(file.reopen()?)),
+        })
+    }
+}
+
+enum SpooledReader<'a> {
+    Memory(&'a [u8]),
+    File(BufReader<File>),
+}
+
+impl Read for SpooledReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Memory(memory) => memory.read(bytes),
+            Self::File(file) => file.read(bytes),
+        }
+    }
 }
 
 struct ColumnSpool {
@@ -563,10 +713,11 @@ struct ColumnSpool {
     offsets: Option<SpoolFile>,
     variable_bytes: u64,
     dictionary: Option<DictionarySpool>,
+    budget: SpoolBudget,
 }
 
 impl ColumnSpool {
-    fn new(schema: ColumnSchema) -> Result<Self, EncodeError> {
+    fn new(schema: ColumnSchema, budget: &SpoolBudget) -> Result<Self, EncodeError> {
         let mut offsets = matches!(
             schema.kind,
             ColumnKind::Utf8
@@ -577,19 +728,20 @@ impl ColumnSpool {
                 | ColumnKind::Time
                 | ColumnKind::Interval
         )
-        .then(spool_file)
-        .transpose()?;
+        .then(|| spool_file(budget));
         if let Some(offsets) = &mut offsets {
             offsets.write_all(&0_u32.to_le_bytes())?;
         }
-        let dictionary = (schema.kind == ColumnKind::Dict).then(DictionarySpool::new);
+        let dictionary =
+            (schema.kind == ColumnKind::Dict).then(|| DictionarySpool::new(budget.clone()));
         Ok(Self {
-            validity: schema.nullable.then(ValiditySpool::default),
+            validity: schema.nullable.then(|| ValiditySpool::new(budget.clone())),
             schema,
-            data: spool_file()?,
+            data: spool_file(budget),
             offsets,
             variable_bytes: 0,
             dictionary,
+            budget: budget.clone(),
         })
     }
 
@@ -688,7 +840,7 @@ impl ColumnSpool {
             ColumnKind::Int64 | ColumnKind::Uint64 | ColumnKind::Timestamp => {
                 let validity = self.schema.nullable.then(|| &parts[0]);
                 let (numeric_parts, numeric_encoding) =
-                    encode_numeric(values, self.schema.kind, validity)?;
+                    encode_numeric(values, self.schema.kind, validity, &self.budget)?;
                 parts.extend(numeric_parts);
                 return Ok(FinishedColumn {
                     schema: self.schema,
@@ -724,7 +876,7 @@ impl ColumnSpool {
                     .ok_or(EncodeError::Internal("dictionary spool missing"))?;
                 let (count, offsets, data, remap) = dictionary.finish()?;
                 let width = bit_width(u64::from(count.saturating_sub(1)));
-                let codes = remap_codes(values, &remap, width)?;
+                let codes = remap_codes(values, &remap, width, &self.budget)?;
                 parts.push(FinishedPart::new(codes)?);
                 parts.push(offsets);
                 parts.push(data);
@@ -747,14 +899,23 @@ impl ColumnSpool {
     }
 }
 
-#[derive(Default)]
 struct ValiditySpool {
     file: Option<SpoolFile>,
+    budget: SpoolBudget,
     byte: u8,
     bit: u8,
 }
 
 impl ValiditySpool {
+    fn new(budget: SpoolBudget) -> Self {
+        Self {
+            file: None,
+            budget,
+            byte: 0,
+            bit: 0,
+        }
+    }
+
     fn push(&mut self, present: bool) -> Result<(), EncodeError> {
         if present {
             self.byte |= 1 << self.bit;
@@ -763,7 +924,7 @@ impl ValiditySpool {
         if self.bit == 8 {
             let file = match &mut self.file {
                 Some(file) => file,
-                None => self.file.insert(spool_file()?),
+                None => self.file.insert(spool_file(&self.budget)),
             };
             file.write_all(&[self.byte])?;
             self.byte = 0;
@@ -775,7 +936,7 @@ impl ValiditySpool {
     fn finish(mut self, rows: u32) -> Result<FinishedPart, EncodeError> {
         let mut file = match self.file.take() {
             Some(file) => file,
-            None => spool_file()?,
+            None => spool_file(&self.budget),
         };
         if self.bit != 0 {
             file.write_all(&[self.byte])?;
@@ -798,13 +959,15 @@ impl ValiditySpool {
 struct DictionarySpool {
     values: HashMap<String, u32>,
     bytes: u64,
+    budget: SpoolBudget,
 }
 
 impl DictionarySpool {
-    fn new() -> Self {
+    fn new(budget: SpoolBudget) -> Self {
         Self {
             values: HashMap::new(),
             bytes: 0,
+            budget,
         }
     }
 
@@ -840,8 +1003,8 @@ impl DictionarySpool {
         sorted.sort_unstable_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
 
         let mut remap = vec![0_u32; sorted.len()];
-        let mut offsets = spool_file()?;
-        let mut data = spool_file()?;
+        let mut offsets = spool_file(&self.budget);
+        let mut data = spool_file(&self.budget);
         offsets.write_all(&0_u32.to_le_bytes())?;
         let mut bytes = 0_u32;
         for (sorted_code, (value, first_seen)) in sorted.into_iter().enumerate() {
@@ -878,7 +1041,7 @@ struct FinishedColumn {
 }
 
 struct FinishedPart {
-    file: NamedTempFile,
+    file: Spooled,
     length: u64,
     offset: u64,
     /// A variable-width column's cumulative offsets, which
@@ -887,8 +1050,8 @@ struct FinishedPart {
 }
 
 impl FinishedPart {
-    fn new(file: NamedTempFile) -> Result<Self, EncodeError> {
-        let length = file.as_file().metadata()?.len();
+    fn new(file: Spooled) -> Result<Self, EncodeError> {
+        let length = file.length()?;
         Ok(Self {
             file,
             length,
@@ -1247,11 +1410,12 @@ fn push_key_variable(result: &mut Vec<u8>, tag: u8, value: &[u8]) -> Result<(), 
 /// Streams in bounded chunks; the code column is the only dictionary part whose
 /// size scales with rows.
 fn remap_codes(
-    codes: NamedTempFile,
+    codes: Spooled,
     remap: &[u32],
     width: u8,
-) -> Result<NamedTempFile, EncodeError> {
-    let mut source = BufReader::new(codes.reopen()?);
+    budget: &SpoolBudget,
+) -> Result<Spooled, EncodeError> {
+    let mut source = codes.reader()?;
     let mut values = Vec::new();
     let mut buffer = [0_u8; 8 * 1024];
     loop {
@@ -1270,7 +1434,7 @@ fn remap_codes(
             values.push(u64::from(sorted));
         }
     }
-    pack_values(values, width)
+    pack_values(values, width, budget)
 }
 
 fn bit_width(maximum: u64) -> u8 {
@@ -1288,12 +1452,13 @@ fn packed_bytes(count: usize, width: u8) -> Result<usize, EncodeError> {
 fn pack_values(
     values: impl IntoIterator<Item = u64>,
     width: u8,
-) -> Result<NamedTempFile, EncodeError> {
+    budget: &SpoolBudget,
+) -> Result<Spooled, EncodeError> {
     let mut packed = Vec::new();
     pack_into(values, width, &mut packed)?;
-    let mut output = NamedTempFile::new()?;
+    let mut output = spool_file(budget);
     output.write_all(&packed)?;
-    Ok(output)
+    finish_spool(output)
 }
 
 /// Appends `values` to `output`, `width` bits apiece, least significant bit
@@ -1359,11 +1524,12 @@ fn unpack_bits(bytes: &[u8], width: u8, count: usize) -> Result<Vec<u64>, Encode
 }
 
 fn encode_numeric(
-    source: NamedTempFile,
+    source: Spooled,
     kind: ColumnKind,
     validity: Option<&FinishedPart>,
+    budget: &SpoolBudget,
 ) -> Result<(Vec<FinishedPart>, Option<NumericEncoding>), EncodeError> {
-    let raw_length = source.as_file().metadata()?.len();
+    let raw_length = source.length()?;
     if !raw_length.is_multiple_of(8) {
         return Err(EncodeError::Internal("numeric column is misaligned"));
     }
@@ -1372,16 +1538,16 @@ fn encode_numeric(
         return Ok((vec![FinishedPart::new(source)?], None));
     }
 
-    let mut reader = BufReader::new(source.reopen()?);
+    let mut reader = source.reader()?;
     let validity = validity
         .map(|part| {
             let mut bytes = Vec::with_capacity(part.length as usize);
-            part.file.reopen()?.read_to_end(&mut bytes)?;
+            part.file.reader()?.read_to_end(&mut bytes)?;
             Ok::<_, EncodeError>(bytes)
         })
         .transpose()?;
-    let mut metadata = spool_file()?;
-    let mut data = spool_file()?;
+    let mut metadata = spool_file(budget);
+    let mut data = spool_file(budget);
     let mut packed = Vec::with_capacity(NUMERIC_BLOCK_ROWS * 8);
     let mut data_length = 0_usize;
     for start in (0..rows).step_by(NUMERIC_BLOCK_ROWS) {
@@ -1480,16 +1646,14 @@ fn encode_numeric(
     let metadata = finish_spool(metadata)?;
     let data = finish_spool(data)?;
     let encoded_length = metadata
-        .as_file()
-        .metadata()?
-        .len()
-        .checked_add(data.as_file().metadata()?.len())
+        .length()?
+        .checked_add(data.length()?)
         .ok_or(EncodeError::SizeOverflow)?;
     let expected_metadata = rows
         .div_ceil(NUMERIC_BLOCK_ROWS)
         .checked_mul(NUMERIC_BLOCK_HEADER_BYTES)
         .ok_or(EncodeError::SizeOverflow)? as u64;
-    if metadata.as_file().metadata()?.len() != expected_metadata {
+    if metadata.length()? != expected_metadata {
         return Err(EncodeError::Internal("numeric metadata length mismatch"));
     }
     if encoded_length >= raw_length {
@@ -2051,12 +2215,62 @@ mod tests {
             let values = (0..37_u64)
                 .map(|index| index.wrapping_mul(0x9e37_79b9_7f4a_7c15) & limit)
                 .collect::<Vec<_>>();
-            let packed = pack_values(values.clone(), width).unwrap();
+            let packed = pack_values(values.clone(), width, &SpoolBudget::new(usize::MAX)).unwrap();
             let mut bytes = Vec::new();
-            packed.reopen().unwrap().read_to_end(&mut bytes).unwrap();
+            packed.reader().unwrap().read_to_end(&mut bytes).unwrap();
             assert_eq!(bytes.len(), packed_bytes(values.len(), width).unwrap());
             assert_eq!(unpack_bits(&bytes, width, values.len()).unwrap(), values);
         }
+    }
+
+    #[test]
+    fn an_artifact_is_the_same_whether_its_spools_stay_in_memory_or_spill() {
+        let encode = |spool_memory_bytes| {
+            let mut encoder = Encoder::with_spool_memory(
+                identity(),
+                schema(),
+                EncoderLimits::default(),
+                spool_memory_bytes,
+            )
+            .unwrap();
+            for index in 0..5_000 {
+                let label = if index % 7 == 0 {
+                    Value::Null
+                } else {
+                    Value::Text(format!("label {index}"))
+                };
+                encoder
+                    .push_row(
+                        "items",
+                        &row(&format!("id-{index}"), Value::F64(f64::from(index)), label),
+                    )
+                    .unwrap();
+            }
+            let mut bytes = Vec::new();
+            let report = encoder.finish(&mut bytes).unwrap();
+            (bytes, report.sha256)
+        };
+        let in_memory = encode(SPOOL_MEMORY_BYTES);
+        assert_eq!(encode(0), in_memory);
+        assert_eq!(encode(20 * 1024), in_memory);
+    }
+
+    #[test]
+    fn a_spool_moves_to_a_file_past_its_budget_and_gives_its_memory_back() {
+        let budget = SpoolBudget::new(16 * 1024);
+        let mut spool = spool_file(&budget);
+        spool.write_all(&[7; 8 * 1024]).unwrap();
+        assert!(matches!(spool, SpoolFile::Memory(_)));
+        spool.write_all(&[8; 64 * 1024]).unwrap();
+        assert!(matches!(spool, SpoolFile::File(_)));
+        assert_eq!(budget.0.load(Ordering::Relaxed), 16 * 1024);
+
+        let finished = finish_spool(spool).unwrap();
+        assert_eq!(finished.length().unwrap(), 72 * 1024);
+        let mut read = Vec::new();
+        finished.reader().unwrap().read_to_end(&mut read).unwrap();
+        assert_eq!(read[..8 * 1024], [7; 8 * 1024]);
+        assert_eq!(read[8 * 1024..], [8; 64 * 1024]);
     }
 
     #[test]

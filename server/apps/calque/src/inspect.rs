@@ -7,8 +7,8 @@ use std::{collections::BTreeSet, error::Error};
 use calque_engine::{inspect_local_source, DatabaseUrl};
 use serde::{Deserialize, Serialize};
 use source_control::{
-    validate_enrollment, EnrollmentRequirements, PgoutputLaunchProfile, QualifiedTable,
-    SchemaRegistry,
+    validate_enrollment, EnrollmentRequirements, PgoutputLaunchProfile, PostgresTypeCodec,
+    QualifiedTable, SchemaRegistry,
 };
 
 /// Schema version of the document this command prints and `calque init`
@@ -33,6 +33,10 @@ pub struct RelationOutput {
     pub table: String,
     pub replica_identity: String,
     pub columns: Vec<ColumnOutput>,
+    /// Columns the publication's column list leaves out that an insert must
+    /// give a value, so the table takes no insert through Calque.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unlisted_required_columns: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,6 +49,23 @@ pub struct ColumnOutput {
     pub generated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_key_position: Option<u32>,
+    /// The pg_catalog type an enum or domain column travels as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_as: Option<String>,
+}
+
+impl ColumnOutput {
+    /// The pg_catalog type name this column's values travel as.
+    pub fn carried_type_name(&self) -> &str {
+        self.carried_as.as_deref().unwrap_or(&self.type_name)
+    }
+
+    pub fn codec(&self) -> Option<PostgresTypeCodec> {
+        match &self.carried_as {
+            Some(carried) => PostgresTypeCodec::from_catalog("pg_catalog", carried),
+            None => PostgresTypeCodec::from_catalog(&self.type_schema, &self.type_name),
+        }
+    }
 }
 
 /// Build the inspection document for `tables` in `publication`.
@@ -98,7 +119,14 @@ pub fn run(
                         nullable: column.nullable,
                         generated: column.generated,
                         primary_key_position: column.primary_key_ordinal,
+                        carried_as: column.carried_as.clone(),
                     })
+                    .collect(),
+                unlisted_required_columns: inspection
+                    .unlisted_columns
+                    .iter()
+                    .filter(|column| column.required_on_insert)
+                    .map(|column| column.name.clone())
                     .collect(),
             })
         })

@@ -1,43 +1,40 @@
 # Calque
 
-> Calque syncs the complete, authorized contents of PostgreSQL 18 tables into the browser, keeps them current through logical replication, and answers the page's queries locally through TypeScript bindings generated from the tables. It is pre-alpha: PostgreSQL 18 is the only source and Chromium-based browsers the only client.
+> Calque syncs the complete, authorized contents of PostgreSQL 18 tables into the browser, keeps them current through logical replication, and answers the page's queries locally through TypeScript bindings generated from the tables. It is pre-alpha: PostgreSQL 18 is the only source, and Chrome the only browser with benchmark evidence.
 
 This file walks a coding agent through adding Calque to a web application, from an empty database to a page with a live query. Run the steps in order.
 
 ## Before you start
 
 - There is no SQL API and no server-side pagination. The page holds every row of each collection its grant allows, and every query runs locally through `client.db.<collection>`.
+- Calque is built and measured for working sets of about 100,000 rows. Every page load downloads the whole working set again, so its load time grows with its bytes.
 - A collection is one PostgreSQL table with a primary key. `calque inspect` refuses any table or column Calque cannot serve and names the reason; [docs/postgresql.md](docs/postgresql.md) lists the supported types.
-- Every column of an enrolled table reaches the browser. If a table holds anything a user must not read, such as a password hash or an internal note, enroll a projection table that leaves it out.
+- Every column a collection names reaches the browser. If a table holds anything a user must not read, such as a password hash or an internal note, delete that column from the collection's `columns` and its command's `writableColumns` in `calque.config.json`: `calque serve` then publishes the table with a column list that leaves it out, as in `CREATE PUBLICATION calque_app FOR TABLE public.users (id, name)`, so PostgreSQL never sends it. `calque dev` publishes every column of the tables it names.
 - A grant gives a page whole tables, or one tenant's rows of them by a tenant column that leads the primary key. Visibility per user or per team needs a projection table the application maintains.
 - `int8` columns are `bigint` in TypeScript, so a key is `1n`, not `1`, and `sum()` over any integer column is a `bigint`.
 - `query().run()` returns the whole result or rejects with `RESULT_TOO_LARGE`: by default over 1,000 rows or 4 MiB, and at most 10,000 rows and 16 MiB with `run({ maxRows, maxBytes })`. For more, read a window with `window(offset, count)` or subscribe to one.
 - A write shows at once and stays optimistic until its change comes back from PostgreSQL.
 - The page must be bundled, because the client starts module workers. With Vite, use the `calque()` plugin from `@calque/client/vite`.
-- Other browsers, Firefox and Safari among them, get `UNSUPPORTED_BROWSER`.
+- A browser missing an API the client calls gets `UNSUPPORTED_BROWSER`, naming it. The client's browser suites pass in Chromium and Firefox.
 
 ## 1. PostgreSQL
 
-The database must be PostgreSQL 18 with `wal_level=logical`, a free replication slot and WAL sender for each Calque server, UTF-8, ISO dates, `timezone=UTC` and hex `bytea` output. Calque connects as a role that is not a superuser, has `REPLICATION` and `CREATE` on the database, and owns the tables it serves. `calque inspect` reads the tables through a publication you create. For a database on this machine, write `127.0.0.1` in the connection string: any host name, `localhost` included, needs `sslmode=verify-full&sslrootcert=<absolute path of a CA file>`, as [docs/postgresql.md](docs/postgresql.md#the-database-url) shows. A managed database needs logical replication turned on and its direct endpoint, not a transaction pooler.
+The database must be PostgreSQL 18 with `wal_level=logical`, a free replication slot and WAL sender for each Calque server, and UTF-8. Calque connects as a role that is not a superuser, has `REPLICATION` (on Amazon RDS and Aurora, membership in `rds_replication`) and `CREATE` on the database. `calque serve` reads a publication the tables' owner creates, and its role needs only `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the tables. `calque dev` creates its own publication, so its role owns the tables it serves or is a member of the role that does. For a database on this machine, write `127.0.0.1` in the connection string: any host name, `localhost` included, needs `sslmode=verify-full&sslrootcert=<absolute path of a CA file>`, as [docs/postgresql.md](docs/postgresql.md#the-database-url) shows. A managed database needs logical replication turned on and its direct endpoint, not a transaction pooler.
 
-As a superuser, in the application's database:
-
-```sql
-CREATE ROLE calque_sync LOGIN PASSWORD 'calque_sync' REPLICATION;
-GRANT CREATE ON DATABASE app TO calque_sync;
-GRANT CREATE, USAGE ON SCHEMA public TO calque_sync;
-```
-
-Then as `calque_sync`, so that it owns the tables (an existing table takes `ALTER TABLE ... OWNER TO calque_sync`):
+Create the role as [docs/postgresql.md](docs/postgresql.md#the-role) shows. For a new table that `calque dev` will serve, as `calque_sync`:
 
 ```sql
 CREATE TABLE tasks (id bigint PRIMARY KEY, title text NOT NULL, done boolean NOT NULL DEFAULT false);
 CREATE PUBLICATION calque_app FOR TABLE public.tasks;
 ```
 
+Set `max_slot_wal_keep_size` on the server, as [docs/postgresql.md](docs/postgresql.md#protecting-the-primarys-disk) shows, so a stopped Calque's replication slot cannot fill the disk.
+
+A collection takes its table's name, which must match `^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$`; rename a table such as `User`, or enroll a projection table. When `calque inspect` refuses something, [docs/postgresql.md](docs/postgresql.md#when-calque-refuses-a-table-or-a-setting) gives the fix for each code. [docs/getting-started.md](docs/getting-started.md) walks these steps for a person, with an existing database and Vite app.
+
 ## 2. The server
 
-`calque` is one Rust binary built from the repository. It needs Rust through rustup, a C compiler, and libpq with `pg_config` on `PATH`.
+`calque` is one Rust binary built from the repository. It needs Rust through rustup, a C compiler, and libpq with `pg_config` on `PATH`. The published image `ghcr.io/calque-sh/calque` runs the same binary: [docs/cli.md](docs/cli.md#running-in-a-container) shows it.
 
 ```sh
 git clone https://github.com/calque-sh/calque
@@ -51,7 +48,7 @@ npm install @calque/client @calque/react
 npm install -D @calque/config
 ```
 
-`@calque/react` is only for React pages. `@calque/config` renders the typed schema, for the Vite plugin and as `calque-bindings`.
+`@calque/react` is only for React pages. The Vite plugin needs Vite 8.1.4 or newer, and `@calque/react` React 19 or newer. `@calque/config` renders the typed schema, for the Vite plugin and as `calque-bindings`.
 
 ## 4. The typed schema
 
@@ -86,7 +83,7 @@ import { defineConfig } from "vite";
 
 export default defineConfig({
   plugins: [calque()],
-  server: { host: "127.0.0.1", port: 5173 },
+  server: { host: "127.0.0.1", port: 5173, strictPort: true },
 });
 ```
 
@@ -120,7 +117,7 @@ In React, put the client in `SyncProvider` and read with `useLiveQuery`; see [cl
 
 ## 7. Production
 
-`calque serve` replaces `calque dev`. It verifies short-lived grants that the application's backend signs with an Ed25519 key, and mints none. The page's `auth()` returns the grant as `bearerToken`, and the client is created with `grantVerificationKey`, the public half of that signing key, so a revocation empties the page at once. [docs/self-host.md](docs/self-host.md) runs it behind HTTPS from a clean checkout; [spec/dataset-grant-v1.md](spec/dataset-grant-v1.md) defines the grant, and [client/examples/grant-issuer](client/examples/grant-issuer) signs one with `node:crypto`.
+`calque serve` replaces `calque dev`. It verifies short-lived grants that the application's backend signs with an Ed25519 key, and mints none. The page's `auth()` returns the grant as `bearerToken`, and the client is created with `grantVerificationKey`, the public half of that signing key, so a revocation empties the page at once. [docs/self-host.md](docs/self-host.md) runs it behind HTTPS from a clean checkout; [spec/dataset-grant-v1.md](spec/dataset-grant-v1.md) defines the grant, and `npm install @calque/grant` gives a Node backend `calque-grant keygen` to create the signing key and `mintGrant` to sign a grant ([client/packages/grant](client/packages/grant)).
 
 ## Docs
 

@@ -453,8 +453,6 @@ pub enum PolicyError {
     UnknownTable,
     #[error("publication row filters are not supported; authorization is source-wide")]
     PublicationRowFilter,
-    #[error("publication column lists are not supported; authorization is source-wide")]
-    PublicationColumnList,
     #[error("registered table/column mapping is incomplete")]
     InvalidSchemaMapping,
     #[error("authorization policy must permit at least one column")]
@@ -897,9 +895,6 @@ fn compile_table(
     let table = schema.get(&table_id).ok_or(PolicyError::UnknownTable)?;
     if table.inspection.has_publication_row_filter {
         return Err(PolicyError::PublicationRowFilter);
-    }
-    if table.inspection.has_publication_column_list {
-        return Err(PolicyError::PublicationColumnList);
     }
     if table.column_ids.len() != table.inspection.columns.len() || table.column_ids.is_empty() {
         return Err(PolicyError::InvalidSchemaMapping);

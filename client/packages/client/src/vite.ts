@@ -214,6 +214,17 @@ function bindingsPlugin(
   let out: string;
   let logger: Logger;
   let renderer: Promise<BindingsRenderer | undefined> | undefined;
+  /** The configuration the last render read, undefined when it could not. */
+  let rendered: string | undefined;
+  let recheck: ReturnType<typeof setTimeout> | undefined;
+
+  function configText(): string | undefined {
+    try {
+      return readFileSync(config, "utf8");
+    } catch {
+      return undefined;
+    }
+  }
 
   /** `@calque/config`, or undefined when it is not installed, said once. */
   function loadRenderer(): Promise<BindingsRenderer | undefined> {
@@ -232,6 +243,7 @@ function bindingsPlugin(
    * what is wrong with a configuration that cannot be rendered.
    */
   async function render(): Promise<string | undefined> {
+    rendered = configText();
     if (options.config === undefined && !existsSync(config)) return undefined;
     const bindings = await loadRenderer();
     if (bindings === undefined) return undefined;
@@ -288,15 +300,27 @@ function bindingsPlugin(
       server.ws.on("vite:client:connect", (_data, client) => {
         if (failure !== undefined) client.send(failure);
       });
-      const changed = (path: string): void => {
-        if (resolve(path) !== config) return;
+      const refresh = (): void => {
         render().then(report, (error: unknown) => {
           report(error instanceof Error ? error.message : String(error));
         });
       };
+      const changed = (path: string): void => {
+        if (resolve(path) !== config) return;
+        refresh();
+        // The watcher drops a change that follows another within 50 ms and
+        // never sends it later, so the configuration is read again after that.
+        clearTimeout(recheck);
+        recheck = setTimeout(() => {
+          if (configText() !== rendered) refresh();
+        }, 100);
+      };
       server.watcher.add(config);
       server.watcher.on("add", changed).on("change", changed);
       report(await render());
+    },
+    closeBundle() {
+      clearTimeout(recheck);
     },
   };
 }

@@ -27,6 +27,7 @@ pub(crate) fn column(
         primary_key_ordinal,
         generated: false,
         nondeterministic_collation: false,
+        carried_as: None,
     }
 }
 
@@ -48,6 +49,7 @@ pub(crate) fn inspection(
         is_partition: false,
         has_publication_row_filter: false,
         has_publication_column_list: false,
+        unlisted_columns: Vec::new(),
         columns,
     }
 }

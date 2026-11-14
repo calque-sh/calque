@@ -18,7 +18,7 @@ use std::{
 
 use postgres::{Client, NoTls};
 
-const TLS_REQUIRED: &str = "is reached only over verified TLS";
+const TLS_REQUIRED: &str = "is reached over verified TLS";
 
 /// Runs `calque inspect` on `public.issues` with `CALQUE_DATABASE_URL` set to
 /// `database_url` and returns `(status success, stderr)`.
@@ -69,6 +69,8 @@ fn counting_listener() -> (u16, Arc<AtomicUsize>) {
 /// resolving it would land the connection on the counting listener. A
 /// numeric loopback address on the same listener is the control: it is
 /// connected to, so the listener does see a connection when one is made.
+/// An explicit `sslmode=disable` on the host name is connected to as well,
+/// after a warning that names the host.
 #[test]
 fn inspect_refuses_a_host_name_before_connecting() {
     let (success, stderr) = inspect("postgresql://db.example.com/app");
@@ -89,6 +91,17 @@ fn inspect_refuses_a_host_name_before_connecting() {
     assert!(!success);
     assert!(!stderr.contains(TLS_REQUIRED), "{stderr}");
     assert_eq!(accepted.load(Ordering::SeqCst), 1, "{stderr}");
+
+    let (success, stderr) = inspect(&format!(
+        "postgresql://localhost:{port}/app?sslmode=disable"
+    ));
+    assert!(!success);
+    assert!(!stderr.contains(TLS_REQUIRED), "{stderr}");
+    assert!(
+        stderr.contains("warning:") && stderr.contains("localhost"),
+        "{stderr}"
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), 2, "{stderr}");
 }
 
 /// A table and its publication on the live source, dropped when the test ends.
@@ -174,11 +187,40 @@ fn inspect_names_each_blocker_and_its_fix() {
         format!(
             "GENERATED_COLUMN_UNSUPPORTED: generated columns are not supported, \
              because logical replication does not carry their values by default; \
-             replace the column with an ordinary one, or compute the value in the \
-             application [{table}.title_length]"
+             leave the column out of the publication's column list, replace it with \
+             an ordinary one, or compute the value in the application \
+             [{table}.title_length]"
         ),
     ] {
         assert!(stderr.contains(&blocker), "{blocker}\n{stderr}");
     }
     assert!(!stderr.contains("EnrollmentDiagnostic"), "{stderr}");
+}
+
+/// `inspect` warns on stderr, after a successful inspection, exactly when the
+/// server bounds neither the WAL a slot may hold back nor how long it may sit
+/// idle.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn inspect_warns_when_nothing_bounds_the_wal_a_slot_holds() {
+    let mut relation = LiveRelation::create("id bigint PRIMARY KEY, title text");
+    let table = format!("public.{}", relation.table);
+    let unbounded: bool = relation
+        .client
+        .query_one(
+            "SELECT current_setting('max_slot_wal_keep_size')::text = '-1' \
+                AND current_setting('idle_replication_slot_timeout')::text = '0'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    let (success, stderr) = inspect_table(
+        &std::env::var("TEST_DATABASE_URL").unwrap(),
+        &relation.publication,
+        &table,
+    );
+    assert!(success, "{stderr}");
+    let warning = "calque: warning: neither max_slot_wal_keep_size nor \
+                   idle_replication_slot_timeout is set on this PostgreSQL";
+    assert_eq!(stderr.contains(warning), unbounded, "{stderr}");
 }

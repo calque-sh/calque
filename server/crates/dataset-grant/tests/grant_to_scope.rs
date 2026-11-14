@@ -31,6 +31,7 @@ fn column(
         primary_key_ordinal,
         generated: false,
         nondeterministic_collation: false,
+        carried_as: None,
     }
 }
 
@@ -51,6 +52,7 @@ fn table() -> RegisteredTable {
             is_partition: false,
             has_publication_row_filter: false,
             has_publication_column_list: false,
+            unlisted_columns: Vec::new(),
             columns: vec![
                 column(1, "tenant_id", "uuid", Some(1)),
                 column(2, "id", "uuid", Some(2)),

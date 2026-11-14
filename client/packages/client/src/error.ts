@@ -105,27 +105,38 @@ export type SyncErrorCode =
    */
   | "SERVER_ERROR"
   /**
-   * The browser does not report the Chromium brand, or lacks the byte-stream
-   * reader the artifact download uses. The client refuses before it sends any
-   * request. Recovery `none`.
+   * The browser lacks an API the client calls, and the message names it:
+   * `Response`, `ReadableStreamBYOBReader`, module workers, `crypto.subtle`
+   * (secure contexts only), `crypto.randomUUID`, `structuredClone`,
+   * `Promise.withResolvers` or `String.prototype.isWellFormed`. The client
+   * refuses before it sends any request or starts any worker. Recovery
+   * `none`.
    */
   | "UNSUPPORTED_BROWSER"
   /**
-   * A mutation ended without a decided outcome and may have committed: no
+   * A mutation ended without a decided outcome and may have committed. The
+   * client resent it under the same id on its own, and every attempt got no
    * response, an unreadable or malformed one, a status other than 400, 401,
-   * 403, 404 or 422, or a reset, rebuild, lock or failure that tore down the
-   * mount holding it. Recovery `retry` while that mount is current:
-   * `retryMutation(mutationId)` resends it under the same id. Recovery `none`
-   * once the mount is gone, since nothing is left to resend; the rebuilt rows
-   * show whether it landed.
+   * 403, 404 or 422, or the server's answer that it is temporarily
+   * unavailable; or a reset, rebuild, lock or failure tore down the mount
+   * holding it. Recovery `retry` while that mount is current:
+   * `retryMutation(mutationId)` resends it again. Recovery `none` once the
+   * mount is gone, since nothing is left to resend; the rebuilt rows show
+   * whether it landed.
    */
   | "MUTATION_AMBIGUOUS"
   /**
-   * The mutation was refused before anything committed: the server answered
-   * 400, 404 or 422, the client could not apply it locally, or
-   * `retryMutation` found nothing to resend. Recovery `none`. A server that
-   * decides against a mutation resolves the call with a `rejected` or
-   * `conflict` result instead.
+   * The server decided against the mutation because it conflicts with the
+   * rows PostgreSQL holds; nothing committed, and the page dropped its
+   * optimistic change. `conflict` names the rule. Recovery `none`.
+   */
+  | "MUTATION_CONFLICT"
+  /**
+   * The mutation was refused and nothing committed: the server found its
+   * input invalid or the grant does not allow it, the server answered 400,
+   * 404 or 422, the client could not apply it locally, or `retryMutation`
+   * found nothing to resend. The page dropped its optimistic change.
+   * Recovery `none`.
    */
   | "MUTATION_REJECTED";
 

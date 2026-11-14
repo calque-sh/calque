@@ -52,6 +52,10 @@ impl PlanClaims {
             .ok()
     }
 
+    pub(crate) fn expired_at(&self, now: i64) -> bool {
+        self.expires_at_unix_micros <= now
+    }
+
     pub(crate) fn tenant(&self) -> Result<Option<PartitionValue>, ()> {
         self.tenant.as_deref().map(parse_tenant).transpose()
     }
@@ -172,7 +176,7 @@ impl PlanTokens {
         }
         if claims.source_id != self.source_id.as_str()
             || claims.source_epoch != self.source_epoch.as_str()
-            || claims.expires_at_unix_micros <= now
+            || claims.expired_at(now)
         {
             return Err(TokenRefusal::Stale);
         }

@@ -452,7 +452,15 @@ pub(crate) async fn follow<R>(
             }
         };
         match read {
-            Ok(true) => held.notify(),
+            Ok(true) => {
+                tracing::debug!(
+                    target: "calque::delivery",
+                    event = "tail",
+                    head = held.head(),
+                    at = crate::backend::delivery_stamp(),
+                );
+                held.notify();
+            }
             Ok(false) => {}
             Err(error) => {
                 tracing::debug!(%error, "the change tail could not read the canonical log");

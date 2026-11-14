@@ -71,24 +71,19 @@ describe("compileConfig", () => {
     }
   });
 
-  test("rejects source mixing and an unselected primary key", async () => {
+  test("rejects a second source and an unselected primary key", async () => {
     const definition = clone(await load()) as unknown as {
       sources: unknown[];
-      collections: Array<Record<string, unknown>>;
     };
     definition.sources.push({
       id: "other",
-      connectionEnv: "OTHER_DATABASE_URL",
+      databaseUrlEnv: "OTHER_DATABASE_URL",
       publication: "other",
       slot: "other",
     });
-    definition.collections[0] = {
-      ...definition.collections[0],
-      source: "other",
-    };
     expect(() =>
       compileConfig(definition as unknown as CalqueConfigDefinition),
-    ).toThrow(/collection issues and scope organization use different sources/);
+    ).toThrow("$.sources: must hold exactly one source");
 
     const missingKey = clone(await load()) as unknown as {
       collections: Array<Record<string, unknown>>;
@@ -470,13 +465,26 @@ describe("compileConfig", () => {
     ).not.toThrow();
   });
 
+  test("names databaseUrlEnv when a source carries its earlier name", async () => {
+    const definition = clone(await load()) as unknown as {
+      sources: [Record<string, unknown>];
+    };
+    const { databaseUrlEnv, ...rest } = definition.sources[0];
+    definition.sources[0] = { ...rest, connectionEnv: databaseUrlEnv };
+    expect(() =>
+      compileConfig(definition as unknown as CalqueConfigDefinition),
+    ).toThrow(
+      "$.sources[0].connectionEnv: is now databaseUrlEnv; rename the field",
+    );
+  });
+
   test("rejects secrets, functions, custom prototypes, and unknown fields", async () => {
     const secret = clone(await load()) as unknown as {
       sources: Array<Record<string, unknown>>;
     };
     secret.sources[0] = {
       ...secret.sources[0],
-      connectionEnv: "postgres://secret@host/db",
+      databaseUrlEnv: "postgres://secret@host/db",
     };
     expect(() =>
       compileConfig(secret as unknown as CalqueConfigDefinition),
@@ -534,5 +542,94 @@ describe("compileConfig", () => {
     expect(() =>
       compileConfig(unsupported as unknown as CalqueConfigDefinition),
     ).toThrow(/not a supported configured format/);
+  });
+});
+
+type JsonPatchOperation =
+  | { op: "add" | "replace"; path: string; value: unknown }
+  | { op: "remove"; path: string }
+  | { op: "copy"; path: string; from: string };
+
+/**
+ * Applies the `add`, `replace`, `remove` and `copy` operations of an RFC 6902
+ * JSON Patch whose paths need no escaping.
+ */
+function applyJsonPatch(document: unknown, patch: JsonPatchOperation[]): void {
+  const at = (pointer: string): unknown =>
+    pointer
+      .split("/")
+      .slice(1)
+      .reduce<unknown>((value, key) => {
+        const next = (value as Record<string, unknown>)[key];
+        if (next === undefined) throw new Error(`no value at ${pointer}`);
+        return next;
+      }, document);
+  for (const operation of patch) {
+    const slash = operation.path.lastIndexOf("/");
+    const parent = at(operation.path.slice(0, slash));
+    const last = operation.path.slice(slash + 1);
+    const value =
+      operation.op === "copy"
+        ? structuredClone(at(operation.from))
+        : operation.op === "remove"
+          ? undefined
+          : operation.value;
+    if (Array.isArray(parent)) {
+      if (operation.op === "remove") parent.splice(Number(last), 1);
+      else if (last === "-") parent.push(value);
+      else if (operation.op === "replace") parent[Number(last)] = value;
+      else parent.splice(Number(last), 0, value);
+    } else {
+      const object = parent as Record<string, unknown>;
+      if (operation.op === "remove") {
+        if (!(last in object)) throw new Error(`no value at ${operation.path}`);
+        Reflect.deleteProperty(object, last);
+      } else object[last] = value;
+    }
+  }
+}
+
+describe("the refusals compileConfig shares with calque serve", () => {
+  const fixturePath = (name: string) =>
+    new URL(`../../../../tests/fixtures/config/${name}`, import.meta.url);
+  const read = async (name: string): Promise<unknown> =>
+    JSON.parse(await readFile(fixturePath(name), "utf8"));
+
+  test("refuses every manifest the shared fixture lists, and accepts its bases", async () => {
+    type Case = { name: string; base: string; patch: JsonPatchOperation[] };
+    const fixture = (await read("refusals.json")) as {
+      bases: Record<string, string>;
+      cases: Case[];
+      accepted: Case[];
+    };
+    const bases = new Map<string, unknown>();
+    for (const [name, file] of Object.entries(fixture.bases)) {
+      const base = await read(file);
+      expect(() =>
+        compileConfig(structuredClone(base) as CalqueConfigDefinition),
+      ).not.toThrow();
+      bases.set(name, base);
+    }
+    const accepted = fixture.cases
+      .filter(({ base, patch }) => {
+        const manifest = structuredClone(bases.get(base));
+        applyJsonPatch(manifest, patch);
+        try {
+          compileConfig(manifest as CalqueConfigDefinition);
+          return true;
+        } catch (error) {
+          if (!(error instanceof ConfigError)) throw error;
+          return false;
+        }
+      })
+      .map(({ name }) => name);
+    expect(accepted).toEqual([]);
+    for (const { base, patch } of fixture.accepted) {
+      const manifest = structuredClone(bases.get(base));
+      applyJsonPatch(manifest, patch);
+      expect(() =>
+        compileConfig(manifest as CalqueConfigDefinition),
+      ).not.toThrow();
+    }
   });
 });

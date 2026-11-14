@@ -5,12 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import {
-  createPrivateKey,
-  generateKeyPairSync,
-  randomBytes,
-  type KeyObject,
-} from "node:crypto";
+import { generateKeyPairSync, randomBytes, type KeyObject } from "node:crypto";
 import {
   cpSync,
   mkdirSync,
@@ -25,7 +20,7 @@ import process from "node:process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { mintGrant } from "../client/examples/grant-issuer/dataset-grant.mts";
+import { loadSigningKey, mintGrant } from "@calque/grant";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const FIXTURE = "spec/fixtures/dataset-grant-v1";
@@ -107,8 +102,8 @@ function randomKey(layout: "v1" | "v2"): Buffer {
           Buffer.from("812100", "hex"),
           publicRaw,
         ]);
-  // A real key, not a lookalike: OpenSSL parses it.
-  createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+  // A real key, not a lookalike: the package parses it.
+  loadSigningKey(der);
   return der;
 }
 

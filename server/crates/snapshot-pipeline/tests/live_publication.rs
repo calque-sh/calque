@@ -2103,10 +2103,7 @@ async fn supervisor_mid_copy_cancellation_rolls_back_and_joins_every_backend() {
             .unwrap()
             .get(0),
     ];
-    let journal_path = workspace
-        .path()
-        .join("build-status")
-        .join(format!("{}.json", build_id.as_str()));
+    let copy_worker_pid = owned_backend_pids[2];
     let cancellation = tokio_util::sync::CancellationToken::new();
     let monitor_cancellation = cancellation.clone();
     let monitor_database_url = database_url.clone();
@@ -2124,19 +2121,28 @@ async fn supervisor_mid_copy_cancellation_rolls_back_and_joins_every_backend() {
         let mut max_rows = 0_u64;
         let mut samples = 0_u64;
 
-        // Phase 1: wait for the pipeline's own progress signal. `rowsCopied`
-        // moving off zero means the builder has committed at least one batch,
-        // so the COPY is open and rows are flowing through it.
+        // Phase 1: wait for the copy worker's COPY to have sent some of the
+        // table's rows and not all of them. The build's journal reaches the
+        // disk only at admission, cleanup and the end, so the count
+        // is PostgreSQL's own for the worker's backend.
         let rows_before_cancel = loop {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the build never reported a partial rowsCopied after {samples} samples \
+                "the copy worker's COPY never reported a partial count after {samples} samples \
                  (last {last_rows}, max {max_rows}); the copy phase was never entered"
             );
             samples += 1;
-            if let Ok(bytes) = tokio::fs::read(&journal_path).await {
-                let progress: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                let rows = progress["rowsCopied"].as_u64().unwrap_or(0);
+            if let Some(row) = client
+                .query_opt(
+                    "SELECT tuples_processed
+                       FROM pg_catalog.pg_stat_progress_copy
+                      WHERE pid = $1 AND command = 'COPY TO'",
+                    &[&copy_worker_pid],
+                )
+                .await
+                .unwrap()
+            {
+                let rows = u64::try_from(row.get::<_, i64>(0)).unwrap();
                 last_rows = rows;
                 max_rows = max_rows.max(rows);
                 if rows > 0 && rows < 20_000 {
@@ -2146,10 +2152,10 @@ async fn supervisor_mid_copy_cancellation_rolls_back_and_joins_every_backend() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         };
 
-        // Phase 2: an assertion, not a trigger. The consumer has taken one
-        // batch of the 78 MB `setup_wide_copy_fixture` produces, far more than
-        // the path from the backend to this process can buffer, so the backend
-        // is still inside the COPY. The retry covers only this task's round
+        // Phase 2: an assertion, not a trigger. The backend has sent only part
+        // of the 78 MB `setup_wide_copy_fixture` produces, and the rest is far
+        // more than the path from the backend to this process can buffer, so
+        // the backend is still inside the COPY. The retry covers only this task's round
         // trips; running out of deadline means the construction broke, and the
         // panic prints what `pg_stat_activity` held.
         let observation_deadline = tokio::time::Instant::now() + observation_budget;
@@ -2268,7 +2274,6 @@ async fn supervisor_mid_copy_cancellation_rolls_back_and_joins_every_backend() {
         progress.failure_code,
         Some(SnapshotBuildFailureCode::CallerCancelled)
     );
-    assert!(progress.rows_copied >= rows_before_cancel);
     assert!(progress.rows_copied < 20_000);
     assert_no_supervisor_residue(
         &database_url,
@@ -4450,6 +4455,7 @@ fn test_supervisor_with_limits(
             catalog_lease_renewal_interval: Duration::from_secs(5),
             publication_cleanup_timeout,
             max_encoded_representation_bytes: 16 * 1024 * 1024,
+            shared_build_zstd: None,
             admission: None,
         },
     })

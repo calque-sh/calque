@@ -14,6 +14,14 @@ probe from its PostgreSQL commit to the stable paint that shows it, under a
 background write load. Every sample's working set is compared with PostgreSQL
 row by row, and a run with a sample that differs fails.
 
+A cold load is read against the time its own bytes need on the link. In the
+published run, each of 30 cold loads moved a median 7.7 MB, which takes 618 ms
+at 100 Mbit/s, and reached a complete stable paint in a median 747 ms. The
+summary's `above_wire_ms` is that difference for each sample: a median 129 ms
+and a p95 of 142 ms, spent on request round trips, digest checks, decoding,
+indexing and painting. The run was directional, and Chrome's emulation
+serializes decode with the wire, so the emulated figure errs pessimistic.
+
 ## Running it
 
 Fetch the pinned browser once, then run it:
@@ -74,7 +82,7 @@ artifact and no other is not judged.
 
 ## What a run reports besides its thresholds
 
-Three readings sit in `summary.json` beside the threshold table and enter no
+Four readings sit in `summary.json` beside the threshold table and enter no
 verdict.
 
 - `post_load_query_ms`: after each judged cold sample has reached its complete
@@ -93,6 +101,13 @@ verdict.
   the page has read it, and counts at its declared length. `bytes.wire` is the
   ledger's lower bound and reads well below this total. A page with its plan rendered into the document
   asks no bootstrap request.
+- `above_wire_ms`: each cold sample's complete stable paint minus the time its
+  `bytes.byPurpose.total` need on the run's link, at 8 bits a byte over the
+  Mbit/s of the emulation or the kernel shaper. What remains is the request
+  round trips, the digest checks, the decode, the index build and the paint.
+  The distribution is p50, p95, p99 and the slowest over the cold samples, with
+  failures ranking above every number. It is `null` under `--network off`,
+  which sets no link rate. It enters no verdict.
 - `empty_page_peak_rss_bytes`: peak browser process-tree RSS of five sessions
   that load `about:blank` in the same Chrome with the same flags, edge
   arguments and network profile, for 5 s each, to read beside

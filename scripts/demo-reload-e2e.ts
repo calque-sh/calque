@@ -16,9 +16,10 @@
  */
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Page } from "playwright";
+import type { Browser, Page } from "playwright";
 
 import {
   demoBrowserChannel,
@@ -70,7 +71,9 @@ const [uiPort, serverPort] = await Promise.all([
   availablePort(),
   availablePort(),
 ]);
-const browser = await launchDemoBrowser();
+/** `chromium` or `chrome` as the other harnesses run it, or `firefox`. */
+const browserName = process.env.CALQUE_DEMO_BROWSER ?? demoBrowserChannel();
+const browser = await launchBrowser();
 let demo: DemoProcess | undefined;
 let page: Page | undefined;
 try {
@@ -96,8 +99,9 @@ try {
   );
 
   assert.deepEqual(pageErrors, []);
-  // The only expected console error: the browser reports the mutation POST it
-  // was told to abort.
+  // Chromium reports the mutation POST it was told to abort as the only
+  // console error; Firefox reports nothing.
+  const expectedConsoleErrors = browserName === "firefox" ? 0 : 1;
   assert.deepEqual(
     consoleErrors.filter(
       (message) => !message.includes("net::ERR_CONNECTION_FAILED"),
@@ -106,13 +110,13 @@ try {
   );
   assert.equal(
     consoleErrors.length,
-    1,
+    expectedConsoleErrors,
     `the aborted mutation POST should be the only console error: ${JSON.stringify(consoleErrors)}`,
   );
   const report = {
     outcome: "passed",
     scenario: "reload-with-a-mutation-in-flight",
-    browser: demoBrowserChannel(),
+    browser: browserName,
     postgresPort: Number(postgresPort),
     ...reload,
   };
@@ -135,6 +139,18 @@ try {
   await page?.close().catch(() => undefined);
   await browser.close().catch(() => undefined);
   if (demo) await stopDemo(demo);
+}
+
+/** The demo harness's browser, or Firefox where `CALQUE_DEMO_BROWSER` says so. */
+function launchBrowser(): Promise<Browser> {
+  if (browserName !== "firefox") return launchDemoBrowser();
+  const requireFromClient = createRequire(
+    join(root, "client/packages/client/package.json"),
+  );
+  const { firefox } = requireFromClient(
+    "playwright",
+  ) as typeof import("playwright");
+  return firefox.launch({ headless: true });
 }
 
 /**

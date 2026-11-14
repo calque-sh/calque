@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     panic::{catch_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
@@ -20,7 +20,7 @@ use postgres::{error::SqlState, Client};
 use source_control::quote_identifier;
 use source_control::{
     inspect_source, ActivatedSource, EnrollmentRequirements, EnrollmentSnapshot,
-    PgoutputLaunchProfile, QualifiedTable, SchemaRegistry, SourceIdentity,
+    PgoutputLaunchProfile, QualifiedTable, SchemaRegistry, SourceIdentity, TableInspection,
 };
 use source_runtime::{
     establish_persistent_source, establish_persistent_source_interruptible,
@@ -89,6 +89,13 @@ pub struct PreparedLocalSource {
 pub fn inspect_local_identity(
     database_url: &DatabaseUrl,
 ) -> Result<SourceIdentity, LocalSourceError> {
+    inspect_local_identity_unexplained(database_url)
+        .map_err(|error| SourceContext::of(database_url, None).explained(error))
+}
+
+fn inspect_local_identity_unexplained(
+    database_url: &DatabaseUrl,
+) -> Result<SourceIdentity, LocalSourceError> {
     let mut client = connect_owned(
         database_url,
         PostgresConnectionFamily::Inspect,
@@ -98,6 +105,15 @@ pub fn inspect_local_identity(
 }
 
 pub fn inspect_local_source(
+    database_url: &DatabaseUrl,
+    publication: &str,
+    tables: &BTreeSet<QualifiedTable>,
+) -> Result<EnrollmentSnapshot, LocalSourceError> {
+    inspect_local_source_unexplained(database_url, publication, tables)
+        .map_err(|error| SourceContext::of(database_url, None).explained(error))
+}
+
+fn inspect_local_source_unexplained(
     database_url: &DatabaseUrl,
     publication: &str,
     tables: &BTreeSet<QualifiedTable>,
@@ -129,11 +145,46 @@ fn inspect_identity(client: &mut Client) -> Result<SourceIdentity, LocalSourceEr
     })
 }
 
+/// The columns `calque serve`'s manifest selects of each table.
+pub type SelectedColumns = BTreeMap<QualifiedTable, BTreeSet<String>>;
+
+/// Prepares a source from its publication as it stands, creating it whole
+/// when it is missing.
 pub fn prepare_local_source(
     database_url: &DatabaseUrl,
     state: &LocalState,
     secrets: &LocalSecrets,
     persisted_registry: Option<SchemaRegistry>,
+) -> Result<PreparedLocalSource, LocalSourceError> {
+    prepare_local_source_unexplained(database_url, state, secrets, persisted_registry, None)
+        .map_err(|error| SourceContext::of(database_url, None).explained(error))
+}
+
+/// Prepares a source whose publication publishes exactly `columns` of each
+/// table, creating it with those column lists when it is missing.
+pub fn prepare_selected_local_source(
+    database_url: &DatabaseUrl,
+    state: &LocalState,
+    secrets: &LocalSecrets,
+    persisted_registry: Option<SchemaRegistry>,
+    columns: &SelectedColumns,
+) -> Result<PreparedLocalSource, LocalSourceError> {
+    prepare_local_source_unexplained(
+        database_url,
+        state,
+        secrets,
+        persisted_registry,
+        Some(columns),
+    )
+    .map_err(|error| SourceContext::of(database_url, None).explained(error))
+}
+
+fn prepare_local_source_unexplained(
+    database_url: &DatabaseUrl,
+    state: &LocalState,
+    secrets: &LocalSecrets,
+    persisted_registry: Option<SchemaRegistry>,
+    columns: Option<&SelectedColumns>,
 ) -> Result<PreparedLocalSource, LocalSourceError> {
     let mut client = connect_owned(
         database_url,
@@ -143,7 +194,16 @@ pub fn prepare_local_source(
     if inspect_identity(&mut client)? != state.source_identity {
         return Err(LocalSourceError::SourceIdentityChanged);
     }
-    ensure_owned_publication(&mut client, &state.names.publication_name, &state.tables)?;
+    if slot_wal_unbounded(&mut client)? {
+        tracing::warn!("{UNBOUNDED_SLOT_WAL_WARNING}");
+    }
+    ensure_owned_publication(
+        database_url,
+        &mut client,
+        &state.names.publication_name,
+        &state.tables,
+        columns,
+    )?;
 
     let tables = state.tables.iter().cloned().collect::<BTreeSet<_>>();
     let snapshot = inspect_source(&mut client, &state.names.publication_name, &tables)?;
@@ -157,6 +217,11 @@ pub fn prepare_local_source(
     );
     let registry = match persisted_registry {
         Some(registry) => {
+            if column_list_changed(&registry, &snapshot) {
+                return Err(LocalSourceError::PublicationDrift {
+                    publication: state.names.publication_name.clone(),
+                });
+            }
             registry.verify_live(&mut client)?;
             if registry.source_identity() != &state.source_identity
                 || registry.publication().name != state.names.publication_name
@@ -183,10 +248,61 @@ pub fn prepare_local_source(
     })
 }
 
+/// Whether the publication's column list on an enrolled table changed since
+/// `registry` was enrolled while the table kept its columns. A start reports
+/// that as drift of the publication, which names its remedy, rather than as
+/// drift of the schema.
+fn column_list_changed(registry: &SchemaRegistry, live: &EnrollmentSnapshot) -> bool {
+    fn names(table: &TableInspection) -> (BTreeSet<&str>, BTreeSet<&str>) {
+        let listed = table
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let all = table
+            .unlisted_columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .chain(listed.iter().copied())
+            .collect();
+        (listed, all)
+    }
+    registry.tables().iter().any(|registered| {
+        let enrolled = &registered.inspection;
+        live.tables
+            .iter()
+            .find(|table| table.table == enrolled.table)
+            .is_some_and(|table| {
+                let (enrolled_listed, enrolled_all) = names(enrolled);
+                let (live_listed, live_all) = names(table);
+                enrolled_all == live_all
+                    && (enrolled_listed != live_listed
+                        || enrolled.has_publication_column_list
+                            != table.has_publication_column_list)
+            })
+    })
+}
+
+/// What [`destroy_local_source`] left on the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Destroyed {
+    /// The publication, when another role owns it. Calque drops only a
+    /// publication its own role owns, so an operator's stays as it was.
+    pub kept_publication: Option<String>,
+}
+
 pub fn destroy_local_source(
     database_url: &DatabaseUrl,
     state: &LocalState,
-) -> Result<(), LocalSourceError> {
+) -> Result<Destroyed, LocalSourceError> {
+    destroy_local_source_unexplained(database_url, state)
+        .map_err(|error| SourceContext::of(database_url, None).explained(error))
+}
+
+fn destroy_local_source_unexplained(
+    database_url: &DatabaseUrl,
+    state: &LocalState,
+) -> Result<Destroyed, LocalSourceError> {
     let mut client = connect_owned(
         database_url,
         PostgresConnectionFamily::Destroy,
@@ -196,13 +312,15 @@ pub fn destroy_local_source(
         return Err(LocalSourceError::SourceIdentityChanged);
     }
 
-    let publication_exists = client
+    let publication_owned: Option<bool> = client
         .query_opt(
-            "SELECT 1 FROM pg_catalog.pg_publication WHERE pubname = $1",
+            "SELECT pg_catalog.pg_has_role(current_user, pubowner, 'USAGE')
+               FROM pg_catalog.pg_publication WHERE pubname = $1",
             &[&state.names.publication_name],
         )?
-        .is_some();
-    if publication_exists {
+        .map(|row| row.get(0));
+    let drop_publication = publication_owned == Some(true);
+    if drop_publication {
         validate_owned_publication(&mut client, &state.names.publication_name, &state.tables)?;
     }
 
@@ -251,7 +369,7 @@ pub fn destroy_local_source(
     }
 
     let mut transaction = client.transaction()?;
-    if publication_exists {
+    if drop_publication {
         transaction.batch_execute(&format!(
             "DROP PUBLICATION {}",
             quote_identifier(&state.names.publication_name)
@@ -277,7 +395,10 @@ pub fn destroy_local_source(
         }
     }
     transaction.commit()?;
-    Ok(())
+    Ok(Destroyed {
+        kept_publication: (publication_owned == Some(false))
+            .then(|| state.names.publication_name.clone()),
+    })
 }
 
 fn relation_exists(
@@ -368,7 +489,7 @@ impl HealthFailure {
         }
     }
 
-    fn stopped_on(error: &LocalSourceError) -> Self {
+    fn stopped_on(error: &LocalSourceError, source: &SourceContext) -> Self {
         let remedy = if error.requires_destroying_state() {
             CdcStopRemedy::DestroyState
         } else if error.publication_drifted() {
@@ -377,7 +498,7 @@ impl HealthFailure {
             CdcStopRemedy::Rerun
         };
         Self {
-            detail: cdc_failure_detail(error),
+            detail: cdc_failure_detail(error, source),
             remedy,
         }
     }
@@ -648,8 +769,9 @@ impl Drop for LocalSourceRuntime {
 }
 
 pub struct LocalSourceRuntimeConfig<'a> {
-    pub source_database_url: &'a DatabaseUrl,
-    pub control_database_url: &'a DatabaseUrl,
+    /// The source, which also holds the control store and canonical log: a
+    /// trim reads the slot in the transaction that locks the lease.
+    pub database_url: &'a DatabaseUrl,
     pub state: &'a LocalState,
     /// The state directory this runtime serves, named in the refusal of a
     /// canonical log an earlier release wrote.
@@ -659,11 +781,13 @@ pub struct LocalSourceRuntimeConfig<'a> {
     pub ingest_timeout: Duration,
     pub max_transactions_per_batch: usize,
     pub metrics: OperationsMetrics,
+    /// The environment variable `database_url` was read from, which a
+    /// refusal names so the operator knows what to correct.
+    pub database_url_env: Option<String>,
 }
 
 impl<'a> LocalSourceRuntimeConfig<'a> {
-    /// A runtime whose source and control database are both `database_url`,
-    /// with the default lease, ingest timeout and batch bound.
+    /// A runtime with the default lease, ingest timeout and batch bound.
     pub fn new(
         database_url: &'a DatabaseUrl,
         state: &'a LocalState,
@@ -671,8 +795,7 @@ impl<'a> LocalSourceRuntimeConfig<'a> {
         owner_id: impl Into<String>,
     ) -> Self {
         Self {
-            source_database_url: database_url,
-            control_database_url: database_url,
+            database_url,
             state,
             state_dir,
             owner_id: owner_id.into(),
@@ -680,7 +803,13 @@ impl<'a> LocalSourceRuntimeConfig<'a> {
             ingest_timeout: DEFAULT_INGEST_TIMEOUT,
             max_transactions_per_batch: DEFAULT_MAX_TRANSACTIONS,
             metrics: OperationsMetrics::new(),
+            database_url_env: None,
         }
+    }
+
+    pub fn with_database_url_env(mut self, name: impl Into<String>) -> Self {
+        self.database_url_env = Some(name.into());
+        self
     }
 
     pub fn with_metrics(mut self, metrics: OperationsMetrics) -> Self {
@@ -730,8 +859,10 @@ pub fn start_local_source_runtime(
     config: LocalSourceRuntimeConfig<'_>,
     head_signal: snapshot_pipeline::CanonicalHeadSignal,
 ) -> Result<LocalSourceRuntime, LocalSourceError> {
-    let slot_lag_source = config.source_database_url.clone();
+    let slot_lag_source = config.database_url.clone();
+    let source = SourceContext::of(config.database_url, config.database_url_env.as_deref());
     start_local_source_runtime_sampling(prepared, config, head_signal, slot_lag_source)
+        .map_err(|error| source.explained(error))
 }
 
 /// `start_local_source_runtime`, with the slot-lag sampler reading from
@@ -746,8 +877,8 @@ fn start_local_source_runtime_sampling(
     // first bounded ingest runs inside this one owner thread. The caller starts
     // its deadline immediately after spawn and never exposes an HTTP listener
     // until the owner returns the exact providers it initialized.
-    let source_database_url = config.source_database_url.clone();
-    let control_database_url = config.control_database_url.clone();
+    let database_url = config.database_url.clone();
+    let source_context = SourceContext::of(config.database_url, config.database_url_env.as_deref());
     let state = config.state.clone();
     let state_dir = config.state_dir.to_path_buf();
     let owner_id = OwnerId::new(config.owner_id)?;
@@ -785,7 +916,7 @@ fn start_local_source_runtime_sampling(
             let setup = catch_unwind(AssertUnwindSafe(|| -> Result<_, LocalSourceError> {
                 startup_not_cancelled(&stop_rx)?;
                 let store = PostgresFenceStore::connect(
-                    control_database_url.connection_url(PostgresConnectionFamily::FenceControl),
+                    database_url.connection_url(PostgresConnectionFamily::FenceControl),
                 )?;
                 match store.enroll_source(&state.names.source_id, &state.source_epoch) {
                     Ok(()) | Err(FenceError::SourceAlreadyEnrolled(_)) => {}
@@ -807,7 +938,7 @@ fn start_local_source_runtime_sampling(
                 match provision_persistent_slot(
                     &authority,
                     &provisional,
-                    source_database_url.connection_url(PostgresConnectionFamily::SlotProvisioning),
+                    database_url.connection_url(PostgresConnectionFamily::SlotProvisioning),
                     &prepared.activated,
                     &slot,
                 ) {
@@ -823,12 +954,11 @@ fn start_local_source_runtime_sampling(
                     authority.release_after_failure(&provisional);
                     return Err(error);
                 }
-                let replication_url = replication_database_url(&source_database_url)?;
+                let replication_url = replication_database_url(&database_url)?;
                 let session = establish_persistent_source_interruptible(
                     Arc::clone(&authority),
                     provisional,
-                    source_database_url
-                        .connection_url(PostgresConnectionFamily::SourceSessionControl),
+                    database_url.connection_url(PostgresConnectionFamily::SourceSessionControl),
                     &replication_url,
                     &prepared.activated,
                     Arc::clone(&thread_startup_shutdown),
@@ -844,7 +974,7 @@ fn start_local_source_runtime_sampling(
                     startup_not_cancelled(&stop_rx)?;
                     let identity = startup_guard.session().lease().identity();
                     let mut control = connect_owned(
-                        &control_database_url,
+                        &database_url,
                         PostgresConnectionFamily::FenceControl,
                         "calque-control-identity",
                     )?;
@@ -856,20 +986,18 @@ fn start_local_source_runtime_sampling(
                         datastore.clone(),
                     )?;
                     let provider = Arc::new(Mutex::new(PostgresFencedCanonicalLog::connect(
-                        control_database_url
-                            .connection_url(PostgresConnectionFamily::CanonicalWriter),
+                        database_url.connection_url(PostgresConnectionFamily::CanonicalWriter),
                         writer.clone(),
                         &state_dir,
                     )?));
                     let barrier_provider =
                         Arc::new(StdMutex::new(PostgresFencedCanonicalLog::connect(
-                            control_database_url
-                                .connection_url(PostgresConnectionFamily::CanonicalBarrier),
+                            database_url.connection_url(PostgresConnectionFamily::CanonicalBarrier),
                             writer.clone(),
                             &state_dir,
                         )?));
                     let log_readers = {
-                        let url = control_database_url.clone();
+                        let url = database_url.clone();
                         let state_dir = state_dir.clone();
                         SourceLogReaders::new(move || {
                             PostgresCanonicalLogReader::connect(
@@ -901,8 +1029,7 @@ fn start_local_source_runtime_sampling(
                         log_readers,
                         ingest,
                         SessionReestablisher {
-                            source_database_url: source_database_url.clone(),
-                            control_database_url: control_database_url.clone(),
+                            database_url: database_url.clone(),
                             replication_url,
                             activated: prepared.activated.clone(),
                             lease_ttl,
@@ -975,7 +1102,7 @@ fn start_local_source_runtime_sampling(
             match &outcome {
                 Ok(Ok(())) => health_guard.record_failure("cdc-runtime-stopped"),
                 Ok(Err(error)) => {
-                    let failure = HealthFailure::stopped_on(error);
+                    let failure = HealthFailure::stopped_on(error, &source_context);
                     // A startup failure reaches the caller instead. After
                     // startup nothing else reports the cause until the
                     // process exits.
@@ -1030,8 +1157,7 @@ fn start_local_source_runtime_sampling(
 
 /// What re-establishing a session needs that startup already resolved.
 struct SessionReestablisher {
-    source_database_url: DatabaseUrl,
-    control_database_url: DatabaseUrl,
+    database_url: DatabaseUrl,
     replication_url: String,
     activated: ActivatedSource,
     lease_ttl: Duration,
@@ -1140,7 +1266,7 @@ impl CdcLoop<'_> {
         // A fresh control connection for every attempt: after a restart the
         // one startup opened is closed.
         let store = PostgresFenceStore::connect(
-            plan.control_database_url
+            plan.database_url
                 .connection_url(PostgresConnectionFamily::FenceControl),
         )?;
         let authority = Arc::new(FenceAuthority::new(store));
@@ -1151,7 +1277,7 @@ impl CdcLoop<'_> {
         let session = establish_persistent_source(
             authority,
             provisional,
-            plan.source_database_url
+            plan.database_url
                 .connection_url(PostgresConnectionFamily::SourceSessionControl),
             &plan.replication_url,
             &plan.activated,
@@ -1165,13 +1291,13 @@ impl CdcLoop<'_> {
             plan.datastore.clone(),
         )?;
         let provider = PostgresFencedCanonicalLog::connect(
-            plan.control_database_url
+            plan.database_url
                 .connection_url(PostgresConnectionFamily::CanonicalWriter),
             writer.clone(),
             &plan.state_dir,
         )?;
         let barrier_provider = PostgresFencedCanonicalLog::connect(
-            plan.control_database_url
+            plan.database_url
                 .connection_url(PostgresConnectionFamily::CanonicalBarrier),
             writer,
             &plan.state_dir,
@@ -1216,11 +1342,11 @@ fn session_error(error: SourceRuntimeError, activated: &ActivatedSource) -> Loca
     }
 }
 
-/// The readiness detail of a runtime that stopped on `error`. A refusal names
-/// its class alone.
-fn cdc_failure_detail(error: &LocalSourceError) -> String {
+/// The readiness detail of a runtime that stopped on `error`. A refusal says
+/// what to change on the source.
+fn cdc_failure_detail(error: &LocalSourceError, source: &SourceContext) -> String {
     match postgres_refusal(error) {
-        Some(refusal) => format!("cdc-refused: {refusal}"),
+        Some(refusal) => format!("cdc-refused: {}", source.advice(refusal)),
         None => format!("persistent CDC failed: {error}"),
     }
 }
@@ -1228,6 +1354,7 @@ fn cdc_failure_detail(error: &LocalSourceError) -> String {
 fn postgres_refusal(error: &LocalSourceError) -> Option<PostgresRefusal> {
     match error {
         LocalSourceError::Fence(FenceError::ControlStoreRefused(refusal))
+        | LocalSourceError::SourceRefused { refusal, .. }
         | LocalSourceError::Runtime(
             SourceRuntimeError::SourceRefused(refusal)
             | SourceRuntimeError::Fence(FenceError::ControlStoreRefused(refusal)),
@@ -1236,6 +1363,111 @@ fn postgres_refusal(error: &LocalSourceError) -> Option<PostgresRefusal> {
             FenceError::ControlStoreRefused(refusal),
         )) => Some(*refusal),
         _ => None,
+    }
+}
+
+/// Who calque connects as and where, for the refusals that tell an operator
+/// what to change. The password and the URL never appear in a message.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SourceContext {
+    role: Option<String>,
+    database: Option<String>,
+    /// The environment variable the database URL was read from, when the
+    /// caller says so.
+    url_env: Option<String>,
+}
+
+impl SourceContext {
+    pub(crate) fn of(database_url: &DatabaseUrl, url_env: Option<&str>) -> Self {
+        let decoded = |value: &str| {
+            let value = percent_encoding::percent_decode_str(value)
+                .decode_utf8_lossy()
+                .into_owned();
+            (!value.is_empty()).then_some(value)
+        };
+        let url = url::Url::parse(database_url.expose()).ok();
+        Self {
+            role: url.as_ref().and_then(|url| decoded(url.username())),
+            database: url
+                .as_ref()
+                .and_then(|url| decoded(url.path().trim_start_matches('/'))),
+            url_env: url_env.map(str::to_owned),
+        }
+    }
+
+    fn role_phrase(&self) -> String {
+        self.role.as_deref().map_or_else(
+            || "the connecting role".to_owned(),
+            |role| format!("role {}", quote_identifier(role)),
+        )
+    }
+
+    fn role_name(&self) -> String {
+        self.role
+            .as_deref()
+            .map_or_else(|| "<role>".to_owned(), quote_identifier)
+    }
+
+    fn database_name(&self) -> String {
+        self.database
+            .as_deref()
+            .map_or_else(|| "<database>".to_owned(), quote_identifier)
+    }
+
+    fn url_phrase(&self) -> String {
+        self.url_env.as_deref().map_or_else(
+            || "the database URL".to_owned(),
+            |name| format!("the database URL in {name}"),
+        )
+    }
+
+    /// What PostgreSQL refused and what an administrator changes to get past
+    /// it.
+    pub(crate) fn advice(&self, refusal: PostgresRefusal) -> String {
+        let role = self.role_phrase();
+        let url = self.url_phrase();
+        match refusal {
+            PostgresRefusal::AuthenticationFailed => format!(
+                "PostgreSQL refused to authenticate {role}. Check the password in {url}, that the role may log in, and that pg_hba.conf lets it connect to database {} from this host",
+                self.database_name()
+            ),
+            PostgresRefusal::InsufficientPrivilege => format!(
+                "{role} lacks a privilege calque needs on the source. It needs CONNECT and CREATE on database {db} (GRANT CONNECT, CREATE ON DATABASE {db} TO {}) and SELECT on the enrolled tables, with INSERT, UPDATE and DELETE when pages write (GRANT SELECT, INSERT, UPDATE, DELETE ON <table> TO {})",
+                self.role_name(),
+                self.role_name(),
+                db = self.database_name()
+            ),
+            PostgresRefusal::DatabaseMissing => format!(
+                "database {} does not exist on the source. Check the database name in {url}",
+                self.database_name()
+            ),
+            PostgresRefusal::ReplicationPrivilegeMissing => format!(
+                "{role} cannot start replication, which needs the REPLICATION attribute. Run ALTER ROLE {} REPLICATION as a superuser; on RDS, run GRANT rds_replication TO {} instead",
+                self.role_name(),
+                self.role_name()
+            ),
+        }
+    }
+
+    /// `error` as the refusal it carries, worded with this context, so the
+    /// caller of a start that PostgreSQL refused reads what to change instead
+    /// of the refusal's class.
+    fn explained(&self, error: LocalSourceError) -> LocalSourceError {
+        if matches!(error, LocalSourceError::SourceRefused { .. }) {
+            return error;
+        }
+        let refusal = postgres_refusal(&error).or_else(|| match &error {
+            LocalSourceError::Postgres(error) => PostgresRefusal::of(error)
+                .filter(|refusal| *refusal != PostgresRefusal::InsufficientPrivilege),
+            _ => None,
+        });
+        match refusal {
+            Some(refusal) => LocalSourceError::SourceRefused {
+                refusal,
+                advice: self.advice(refusal),
+            },
+            None => error,
+        }
     }
 }
 
@@ -1258,6 +1490,7 @@ fn transient_ingest_failure(error: &PersistentIngestError) -> bool {
     match error {
         PersistentIngestError::SessionClosed
         | PersistentIngestError::ReplicationUnavailable
+        | PersistentIngestError::ReplicationSilent(_)
         | PersistentIngestError::MutationReceiptUnavailable => true,
         PersistentIngestError::CanonicalLog(error)
         | PersistentIngestError::Ingest(IngestError::Append(AppendFailure::CanonicalLog(error))) => {
@@ -1577,33 +1810,66 @@ fn replication_database_url_with_environment(
         .append_pair("hostaddr", &hostaddr)
         .append_pair("replication", "database")
         .append_pair("application_name", "calque");
+    // Appended by hand: the form encoder writes a space as `+`, which libpq
+    // reads literally.
+    let query = format!(
+        "{}&options={}",
+        url.query().unwrap_or_default(),
+        postgres_connect::session_options_url_value()
+    );
+    url.set_query(Some(&query));
     Ok(url.to_string())
 }
 
 // Every statement on a connection from `connect_owned` runs under these,
 // except the waits in `lock_for_publication`.
-const OWNED_STATEMENT_TIMEOUT: &str = "2s";
-const OWNED_LOCK_TIMEOUT: &str = "1s";
+const OWNED_STATEMENT_TIMEOUT: Duration = Duration::from_secs(2);
+const OWNED_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// A connection to the source whose statements run under its 2 s
+/// `statement_timeout`. A request that hears nothing from the server for
+/// longer than that, plus `postgres_connect::REPLY_MARGIN`, fails it.
 pub(crate) fn connect_owned(
     database_url: &DatabaseUrl,
     family: PostgresConnectionFamily,
     application_name: &str,
 ) -> Result<Client, LocalSourceError> {
+    connect_owned_waiting(
+        database_url,
+        family,
+        application_name,
+        OWNED_STATEMENT_TIMEOUT,
+    )
+}
+
+/// `connect_owned`, for a connection one of whose statements raises its
+/// `statement_timeout` to `longest_statement`.
+fn connect_owned_waiting(
+    database_url: &DatabaseUrl,
+    family: PostgresConnectionFamily,
+    application_name: &str,
+    longest_statement: Duration,
+) -> Result<Client, LocalSourceError> {
     let mut endpoint = database_url.endpoint(family)?;
-    endpoint.config_mut().application_name(application_name);
+    endpoint
+        .bound_replies(longest_statement)
+        .config_mut()
+        .application_name(application_name);
     let mut client = endpoint.connect()?;
     client.batch_execute(&format!(
-        "SET statement_timeout = '{OWNED_STATEMENT_TIMEOUT}'; \
-         SET lock_timeout = '{OWNED_LOCK_TIMEOUT}';"
+        "SET statement_timeout = {}; SET lock_timeout = {};",
+        OWNED_STATEMENT_TIMEOUT.as_millis(),
+        OWNED_LOCK_TIMEOUT.as_millis()
     ))?;
     Ok(client)
 }
 
 fn ensure_owned_publication(
+    database_url: &DatabaseUrl,
     client: &mut Client,
     publication: &str,
     tables: &[QualifiedTable],
+    columns: Option<&SelectedColumns>,
 ) -> Result<(), LocalSourceError> {
     if tables.is_empty() {
         return Err(LocalSourceError::EmptyTableSet);
@@ -1613,47 +1879,311 @@ fn ensure_owned_publication(
                FROM pg_catalog.pg_publication WHERE pubname = $1",
         &[&publication],
     )?;
+    let selection = match columns {
+        Some(columns) => select_publication_columns(client, publication, tables, columns)?,
+        None => SelectedPublication {
+            clauses: quoted_tables(tables),
+            published: BTreeMap::new(),
+        },
+    };
     if existing.is_none() {
-        let quoted = tables
-            .iter()
-            .map(|table| {
-                format!(
-                    "{}.{}",
-                    quote_identifier(&table.schema),
-                    quote_identifier(&table.table)
-                )
-            })
-            .collect::<Vec<_>>();
-        let bound = publication_lock_bound(client, tables.len())?;
-        let deadline = Instant::now() + bound;
-        let mut transaction = client.transaction()?;
-        // Every table that is free is held before any wait begins. An
-        // autovacuum cancelled on one table moves on to the next in its list,
-        // but skips a table it cannot lock at once, so it cannot reach an
-        // enrolled table ahead of enrollment and cost a second cancellation.
-        let mut held_elsewhere = Vec::new();
-        for (table, quoted_table) in tables.iter().zip(&quoted) {
-            if !try_lock_for_publication(&mut transaction, quoted_table)? {
-                held_elsewhere.push((table, quoted_table));
+        if let Some(table) = first_table_not_owned(client, tables)? {
+            return Err(LocalSourceError::PublicationMissing {
+                publication: publication.to_owned(),
+                table,
+                statement: format!(
+                    "CREATE PUBLICATION {} FOR TABLE {};",
+                    quote_identifier(publication),
+                    selection.clauses.join(", ")
+                ),
+            });
+        }
+        return match create_owned_publication(
+            database_url,
+            client,
+            publication,
+            tables,
+            &selection.clauses,
+        ) {
+            Err(LocalSourceError::Postgres(error))
+                if error.code() == Some(&SqlState::INSUFFICIENT_PRIVILEGE) =>
+            {
+                Err(publication_privilege_refusal(
+                    database_url,
+                    client,
+                    publication,
+                ))
             }
-        }
-        for (table, quoted_table) in held_elsewhere {
-            lock_for_publication(&mut transaction, table, quoted_table, deadline, bound)?;
-        }
-        // Every table is held by now. CREATE PUBLICATION goes back to the
-        // connection's own timeouts, not what was left of the last wait,
-        // which can be a millisecond.
-        transaction.batch_execute(&format!(
-            "SET LOCAL statement_timeout = '{OWNED_STATEMENT_TIMEOUT}'; \
-             SET LOCAL lock_timeout = '{OWNED_LOCK_TIMEOUT}'; \
-             CREATE PUBLICATION {} FOR TABLE {}",
-            quote_identifier(publication),
-            quoted.join(", ")
-        ))?;
-        transaction.commit()?;
-        return Ok(());
+            created => created,
+        };
     }
-    validate_owned_publication(client, publication, tables)
+    validate_owned_publication(client, publication, tables)?;
+    let Some(columns) = columns else {
+        return Ok(());
+    };
+    for (table, published) in &selection.published {
+        let selected = &columns[table];
+        if published.iter().collect::<BTreeSet<_>>() != selected.iter().collect() {
+            return Err(LocalSourceError::PublishedColumnsDiffer {
+                publication: publication.to_owned(),
+                table: table.display_name(),
+                published: published.clone(),
+                selected: selected.iter().cloned().collect(),
+                statement: format!(
+                    "CREATE PUBLICATION {} FOR TABLE {};",
+                    quote_identifier(publication),
+                    selection.clauses.join(", ")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The publication a manifest's selected columns call for.
+struct SelectedPublication {
+    /// The `FOR TABLE` entries that create it.
+    clauses: Vec<String>,
+    /// The columns the publication publishes now of each selected table, in
+    /// table order, when it exists.
+    published: BTreeMap<QualifiedTable, Vec<String>>,
+}
+
+/// Each table with a column list naming its selected columns in table order,
+/// also when they are all of its columns, so a column added later is never
+/// published. PostgreSQL refuses UPDATE and DELETE on a table with REPLICA
+/// IDENTITY FULL under any column list, so such a table is published whole,
+/// which it can be only when every column is selected.
+fn select_publication_columns(
+    client: &mut Client,
+    publication: &str,
+    tables: &[QualifiedTable],
+    columns: &SelectedColumns,
+) -> Result<SelectedPublication, LocalSourceError> {
+    let mut selection = SelectedPublication {
+        clauses: Vec::with_capacity(tables.len()),
+        published: BTreeMap::new(),
+    };
+    for (table, quoted) in tables.iter().zip(quoted_tables(tables)) {
+        let Some(selected) = columns.get(table) else {
+            selection.clauses.push(quoted);
+            continue;
+        };
+        // A table that does not exist is left for CREATE PUBLICATION and
+        // enrollment to refuse, as without a selection.
+        let Some(row) = client.query_opt(
+            "SELECT class.relreplident = 'f',
+                    ARRAY(SELECT attribute.attname::text
+                            FROM pg_catalog.pg_attribute AS attribute
+                           WHERE attribute.attrelid = class.oid
+                             AND attribute.attnum > 0
+                             AND NOT attribute.attisdropped
+                           ORDER BY attribute.attnum),
+                    CASE WHEN publication.oid IS NOT NULL THEN
+                      ARRAY(SELECT attribute.attname::text
+                              FROM pg_catalog.pg_attribute AS attribute
+                             WHERE attribute.attrelid = class.oid
+                               AND attribute.attnum > 0
+                               AND NOT attribute.attisdropped
+                               AND (listed.prattrs IS NULL
+                                    OR attribute.attnum = ANY(listed.prattrs::int2[]))
+                             ORDER BY attribute.attnum)
+                    END
+               FROM pg_catalog.pg_class AS class
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.oid = class.relnamespace
+          LEFT JOIN pg_catalog.pg_publication AS publication
+                 ON publication.pubname = $3
+          LEFT JOIN pg_catalog.pg_publication_rel AS listed
+                 ON listed.prpubid = publication.oid AND listed.prrelid = class.oid
+              WHERE namespace.nspname = $1 AND class.relname = $2",
+            &[&table.schema, &table.table, &publication],
+        )?
+        else {
+            selection.clauses.push(quoted);
+            continue;
+        };
+        let full_identity: bool = row.get(0);
+        let existing: Vec<String> = row.get(1);
+        if let Some(missing) = selected.iter().find(|name| !existing.contains(name)) {
+            return Err(LocalSourceError::SelectedColumnMissing {
+                table: table.display_name(),
+                column: missing.clone(),
+            });
+        }
+        if let Some(published) = row.get::<_, Option<Vec<String>>>(2) {
+            selection.published.insert(table.clone(), published);
+        }
+        if full_identity {
+            if existing.len() != selected.len() {
+                return Err(LocalSourceError::SelectedColumnsUnderFullIdentity {
+                    publication: publication.to_owned(),
+                    table: table.display_name(),
+                });
+            }
+            selection.clauses.push(quoted);
+            continue;
+        }
+        let list = existing
+            .iter()
+            .filter(|name| selected.contains(*name))
+            .map(|name| quote_identifier(name))
+            .collect::<Vec<_>>();
+        selection
+            .clauses
+            .push(format!("{quoted} ({})", list.join(", ")));
+    }
+    Ok(selection)
+}
+
+fn quoted_tables(tables: &[QualifiedTable]) -> Vec<String> {
+    tables
+        .iter()
+        .map(|table| {
+            format!(
+                "{}.{}",
+                quote_identifier(&table.schema),
+                quote_identifier(&table.table)
+            )
+        })
+        .collect()
+}
+
+/// The first of `tables` the connected role does not own. `CREATE
+/// PUBLICATION ... FOR TABLE` needs ownership of every table it names, so
+/// enrollment creates a missing publication only for a role that owns them all.
+fn first_table_not_owned(
+    client: &mut Client,
+    tables: &[QualifiedTable],
+) -> Result<Option<String>, LocalSourceError> {
+    let schemas: Vec<&str> = tables.iter().map(|table| table.schema.as_str()).collect();
+    let names: Vec<&str> = tables.iter().map(|table| table.table.as_str()).collect();
+    Ok(client
+        .query_opt(
+            "SELECT format('%I.%I', namespace.nspname, class.relname)
+               FROM unnest($1::name[], $2::name[])
+                    WITH ORDINALITY AS required(schema_name, table_name, ordinality)
+               JOIN pg_catalog.pg_namespace AS namespace
+                 ON namespace.nspname = required.schema_name
+               JOIN pg_catalog.pg_class AS class
+                 ON class.relnamespace = namespace.oid
+                AND class.relname = required.table_name
+              WHERE NOT pg_catalog.pg_has_role(current_user, class.relowner, 'USAGE')
+              ORDER BY required.ordinality
+              LIMIT 1",
+            &[&schemas, &names],
+        )?
+        .map(|row| row.get(0)))
+}
+
+/// What a source deserves to hear when nothing bounds the WAL its replication
+/// slot holds back. While Calque is stopped, PostgreSQL keeps every WAL
+/// segment from the slot's position on, until the disk fills.
+pub const UNBOUNDED_SLOT_WAL_WARNING: &str = "neither max_slot_wal_keep_size nor idle_replication_slot_timeout is set on this PostgreSQL, so while Calque is stopped its replication slot keeps every WAL segment written since, until the disk fills; set one of them, as docs/postgresql.md describes under \"Protecting the primary's disk\"";
+
+/// Whether the source leaves the WAL a slot holds back unbounded: neither
+/// `max_slot_wal_keep_size` nor `idle_replication_slot_timeout` is set.
+fn slot_wal_unbounded(client: &mut impl postgres::GenericClient) -> Result<bool, postgres::Error> {
+    let unbounded: Option<bool> = client
+        .query_one(
+            "SELECT (SELECT setting::int8 < 0 FROM pg_catalog.pg_settings
+                      WHERE name = 'max_slot_wal_keep_size')
+                AND (SELECT setting::int8 = 0 FROM pg_catalog.pg_settings
+                      WHERE name = 'idle_replication_slot_timeout')",
+            &[],
+        )?
+        .get(0);
+    Ok(unbounded == Some(true))
+}
+
+/// [`UNBOUNDED_SLOT_WAL_WARNING`] when the source at `database_url` deserves
+/// it, for `calque inspect` to print.
+pub fn inspect_slot_wal_bound(
+    database_url: &DatabaseUrl,
+) -> Result<Option<&'static str>, LocalSourceError> {
+    let mut client = connect_owned(
+        database_url,
+        PostgresConnectionFamily::Inspect,
+        "calque-inspect",
+    )?;
+    Ok(slot_wal_unbounded(&mut client)?.then_some(UNBOUNDED_SLOT_WAL_WARNING))
+}
+
+fn create_owned_publication(
+    database_url: &DatabaseUrl,
+    client: &mut Client,
+    publication: &str,
+    tables: &[QualifiedTable],
+    clauses: &[String],
+) -> Result<(), LocalSourceError> {
+    let quoted = quoted_tables(tables);
+    let bound = publication_lock_bound(client, tables.len())?;
+    // A lock wait sends nothing until it ends, so its replies get a
+    // connection bounded past the longest wait.
+    let mut creator = connect_owned_waiting(
+        database_url,
+        PostgresConnectionFamily::Enroll,
+        "calque-enroll",
+        bound + Duration::from_secs(1),
+    )?;
+    let deadline = Instant::now() + bound;
+    let mut transaction = creator.transaction()?;
+    // Every table that is free is held before any wait begins. An
+    // autovacuum cancelled on one table moves on to the next in its list,
+    // but skips a table it cannot lock at once, so it cannot reach an
+    // enrolled table ahead of enrollment and cost a second cancellation.
+    let mut held_elsewhere = Vec::new();
+    for (table, quoted_table) in tables.iter().zip(&quoted) {
+        if !try_lock_for_publication(&mut transaction, quoted_table)? {
+            held_elsewhere.push((table, quoted_table));
+        }
+    }
+    for (table, quoted_table) in held_elsewhere {
+        lock_for_publication(&mut transaction, table, quoted_table, deadline, bound)?;
+    }
+    // Every table is held by now. CREATE PUBLICATION goes back to the
+    // connection's own timeouts, not what was left of the last wait,
+    // which can be a millisecond.
+    transaction.batch_execute(&format!(
+        "SET LOCAL statement_timeout = {}; SET LOCAL lock_timeout = {}; \
+         CREATE PUBLICATION {} FOR TABLE {}",
+        OWNED_STATEMENT_TIMEOUT.as_millis(),
+        OWNED_LOCK_TIMEOUT.as_millis(),
+        quote_identifier(publication),
+        clauses.join(", ")
+    ))?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// What PostgreSQL's `permission denied` leaves out when enrollment cannot
+/// create the publication of tables its role owns: CREATE on the database,
+/// which `CREATE PUBLICATION` needs beside ownership.
+fn publication_privilege_refusal(
+    database_url: &DatabaseUrl,
+    client: &mut Client,
+    publication: &str,
+) -> LocalSourceError {
+    let refusal = PostgresRefusal::InsufficientPrivilege;
+    let diagnosis = client.query_one(
+        "SELECT current_user::text,
+                pg_catalog.current_database()::text,
+                pg_catalog.has_database_privilege(
+                    current_user, pg_catalog.current_database(), 'CREATE')",
+        &[],
+    );
+    let advice = match diagnosis {
+        Ok(row) if !row.get::<_, bool>(2) => {
+            let role = quote_identifier(&row.get::<_, String>(0));
+            let database = quote_identifier(&row.get::<_, String>(1));
+            format!(
+                "role {role} cannot create publication {} on database {database}: it lacks CREATE on the database; run GRANT CREATE ON DATABASE {database} TO {role}",
+                quote_identifier(publication)
+            )
+        }
+        _ => SourceContext::of(database_url, None).advice(refusal),
+    };
+    LocalSourceError::SourceRefused { refusal, advice }
 }
 
 /// How long enrollment waits, in total, for the table locks `CREATE
@@ -1796,6 +2326,13 @@ fn validate_owned_publication(
 pub enum LocalSourceError {
     #[error("PostgreSQL source operation failed: {0}")]
     Postgres(#[from] postgres::Error),
+    /// PostgreSQL refused the role, its privileges or the database, which no
+    /// retry gets past; `advice` says what to change.
+    #[error("{advice}")]
+    SourceRefused {
+        refusal: PostgresRefusal,
+        advice: String,
+    },
     #[error(transparent)]
     Guard(#[from] crate::GuardError),
     #[error(transparent)]
@@ -1835,8 +2372,26 @@ pub enum LocalSourceError {
     EnrolledByAnotherState,
     #[error("the configured table set is empty")]
     EmptyTableSet,
-    #[error("the PostgreSQL publication {publication} no longer publishes exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root, and without row filters or column lists.")]
+    #[error("the PostgreSQL publication {publication} was altered, or an enum its columns use gained or renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists and enum values it had at enrollment.")]
     PublicationDrift { publication: String },
+    #[error("the PostgreSQL publication {publication} does not exist, and Calque's role cannot create it because it does not own {table}. Have the tables' owner create it: {statement}")]
+    PublicationMissing {
+        publication: String,
+        table: String,
+        statement: String,
+    },
+    #[error("the PostgreSQL publication {publication} publishes columns {published} of {table}, and the manifest selects {selected}; Calque publishes exactly the selected columns, as {statement}", published = .published.join(", "), selected = .selected.join(", "))]
+    PublishedColumnsDiffer {
+        publication: String,
+        table: String,
+        published: Vec<String>,
+        selected: Vec<String>,
+        statement: String,
+    },
+    #[error("the manifest selects column {column} of {table}, which has no such column.")]
+    SelectedColumnMissing { table: String, column: String },
+    #[error("the manifest selects some columns of {table}, whose replica identity is FULL, and PostgreSQL refuses UPDATE and DELETE on such a table under any column list; select every column of {table}, or run ALTER TABLE {table} REPLICA IDENTITY DEFAULT so that publication {publication} can list only the selected ones.")]
+    SelectedColumnsUnderFullIdentity { publication: String, table: String },
     #[error("a lock on {table} was not granted within {bound:?}, so the publication was not created; another session holds a conflicting lock on it (VACUUM, ANALYZE, CREATE INDEX or other DDL, or an autovacuum preventing wraparound, which PostgreSQL never cancels); retry once that finishes")]
     PublicationLockTimeout { table: String, bound: Duration },
     #[error("the logical replication slot no longer matches local state.")]
@@ -1867,8 +2422,12 @@ impl LocalSourceError {
     /// Whether only `calque destroy` gets past this refusal: a canonical log
     /// an earlier release wrote, whether connecting the log refused it or an
     /// ingest step met it, a schema registry that does not match the state
-    /// beside it, or a source another state directory enrolled. A failed
-    /// session cleanup after one of them needs it too, since the cause
+    /// beside it, a source another state directory enrolled, a publication
+    /// whose columns are not the selected ones, which destroy drops so the
+    /// next start creates it with them, or a replication slot that was
+    /// dropped or that PostgreSQL invalidated, since the changes it held
+    /// cannot be replayed and the working set has to be prepared anew. A
+    /// failed session cleanup after one of them needs it too, since the cause
     /// stands.
     pub fn requires_destroying_state(&self) -> bool {
         match self {
@@ -1879,16 +2438,21 @@ impl LocalSourceError {
                     error,
                 ))),
             ) => error.requires_destroying_state(),
-            Self::RegistryStateMismatch | Self::EnrolledByAnotherState => true,
+            Self::Runtime(
+                SourceRuntimeError::SlotMissing { .. } | SourceRuntimeError::SlotLost { .. },
+            )
+            | Self::RegistryStateMismatch
+            | Self::EnrolledByAnotherState
+            | Self::PublishedColumnsDiffer { .. } => true,
             Self::SessionCleanupFailedAfter(cause) => cause.requires_destroying_state(),
             _ => false,
         }
     }
 
-    /// Whether this is the app-owned publication no longer having its
-    /// enrolled definition, which restoring that definition gets past and
-    /// `calque destroy` does not. A start meets it during enrollment and a
-    /// reconnect when it opens a session. A failed session cleanup after it
+    /// Whether this is the publication no longer having its enrolled
+    /// definition, or an enum its columns use having changed. Restoring the
+    /// definition and then `calque destroy` gets past it. A start meets it
+    /// during enrollment and a reconnect when it opens a session. A failed session cleanup after it
     /// is one too, since the cause stands.
     pub fn publication_drifted(&self) -> bool {
         match self {
@@ -1917,6 +2481,38 @@ mod tests {
             .or_else(|| std::env::var("TEST_DATABASE_URL").ok())
     }
 
+    /// A request on a connection to the source whose server stops answering,
+    /// such as a mutation's, fails once the connection's reply bound runs out
+    /// instead of holding its caller on the socket.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_source_request_whose_server_stops_answering_fails_at_its_reply_bound() {
+        let url = live_database_url().expect("live source database URL");
+        let relay = postgres_connect::relay::SilenceableRelay::start(&url);
+        let mut client = connect_owned(
+            &DatabaseUrl::parse(relay.url()).unwrap(),
+            PostgresConnectionFamily::MutationWriter,
+            "calque-mutations",
+        )
+        .unwrap();
+        client.batch_execute("SELECT 1").unwrap();
+        relay.silence();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let failed = client.batch_execute("SELECT 1").is_err();
+            let _ = sender.send((failed, started.elapsed()));
+        });
+        let (failed, elapsed) = receiver
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the request on a silent socket had not returned after 15 s");
+        assert!(failed);
+        assert!(
+            elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(8),
+            "the request returned after {elapsed:?}"
+        );
+    }
+
     /// A refusal whose remedy names the state directory or the source's
     /// variable states the refusal alone, as a sentence the command's remedy
     /// can follow. One a retry gets past names the retry.
@@ -1935,7 +2531,7 @@ mod tests {
                 publication: "calque_0123456789abcdef01234567".to_owned(),
             }
             .to_string(),
-            "the PostgreSQL publication calque_0123456789abcdef01234567 no longer publishes exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root, and without row filters or column lists."
+            "the PostgreSQL publication calque_0123456789abcdef01234567 was altered, or an enum its columns use gained or renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists and enum values it had at enrollment."
         );
         assert_eq!(
             LocalSourceError::SlotOwnershipMismatch.to_string(),
@@ -2009,6 +2605,16 @@ mod tests {
         assert_eq!(
             query.get("application_name").map(|value| value.as_ref()),
             Some("calque")
+        );
+        assert_eq!(
+            query.get("options").map(|value| value.as_ref()),
+            Some(
+                "-c TimeZone=UTC -c DateStyle=ISO,MDY -c bytea_output=hex -c extra_float_digits=1"
+            )
+        );
+        assert!(
+            !url.contains('+') && url.contains("options=%2Dc%20TimeZone%3DUTC%20%2Dc%20"),
+            "libpq reads a `+` in the URL literally: {url}"
         );
     }
 
@@ -2137,7 +2743,10 @@ mod tests {
         });
         let (guard, health) = guard_and_health(true);
         assert_eq!(health.failure_remedy(), CdcStopRemedy::Rerun);
-        guard.record(HealthFailure::stopped_on(&refusal));
+        guard.record(HealthFailure::stopped_on(
+            &refusal,
+            &SourceContext::default(),
+        ));
         assert!(!health.is_healthy());
         assert_eq!(
             health.failure(),
@@ -2157,7 +2766,7 @@ mod tests {
             publication: "calque_pub".to_owned(),
         };
         let (guard, health) = guard_and_health(true);
-        guard.record(HealthFailure::stopped_on(&drift));
+        guard.record(HealthFailure::stopped_on(&drift, &SourceContext::default()));
         assert_eq!(
             health.failure(),
             Some(format!("persistent CDC failed: {drift}"))
@@ -2167,9 +2776,10 @@ mod tests {
         assert_eq!(health.failure_remedy(), CdcStopRemedy::RestorePublication);
 
         let (guard, health) = guard_and_health(true);
-        guard.record(HealthFailure::stopped_on(&LocalSourceError::Canonical(
-            LogError::PostgresUnavailable,
-        )));
+        guard.record(HealthFailure::stopped_on(
+            &LocalSourceError::Canonical(LogError::PostgresUnavailable),
+            &SourceContext::default(),
+        ));
         guard.record_cleanup_failure();
         assert_eq!(health.failure_remedy(), CdcStopRemedy::Rerun);
 
@@ -2338,6 +2948,12 @@ mod tests {
             (ingest(PersistentIngestError::SessionClosed), Transient),
             (
                 ingest(PersistentIngestError::ReplicationUnavailable),
+                Transient,
+            ),
+            (
+                ingest(PersistentIngestError::ReplicationSilent(
+                    Duration::from_secs(60),
+                )),
                 Transient,
             ),
             (
@@ -2538,11 +3154,16 @@ mod tests {
                 Fatal,
             ),
             (
-                LocalSourceError::Runtime(SourceRuntimeError::SlotMissingReseedRequired),
+                LocalSourceError::Runtime(SourceRuntimeError::SlotMissing {
+                    slot_name: "calque_slot".to_owned(),
+                }),
                 Fatal,
             ),
             (
-                LocalSourceError::Runtime(SourceRuntimeError::SlotLostReseedRequired),
+                LocalSourceError::Runtime(SourceRuntimeError::SlotLost {
+                    slot_name: "calque_slot".to_owned(),
+                    reason: "reason wal_removed".to_owned(),
+                }),
                 Fatal,
             ),
             (
@@ -2625,31 +3246,36 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_runtime_names_a_refusal_by_its_class() {
-        let detail = |error: LocalSourceError| cdc_failure_detail(&error);
+    fn a_stopped_runtime_names_what_to_change_for_a_refusal() {
+        let source = SourceContext {
+            role: Some("calque_sync".to_owned()),
+            database: Some("app".to_owned()),
+            url_env: Some("APP_DATABASE_URL".to_owned()),
+        };
+        let detail = |error: LocalSourceError| cdc_failure_detail(&error, &source);
         assert_eq!(
             detail(LocalSourceError::Fence(FenceError::ControlStoreRefused(
                 PostgresRefusal::AuthenticationFailed
             ))),
-            "cdc-refused: authentication failed"
+            "cdc-refused: PostgreSQL refused to authenticate role \"calque_sync\". Check the password in the database URL in APP_DATABASE_URL, that the role may log in, and that pg_hba.conf lets it connect to database \"app\" from this host"
         );
         assert_eq!(
             detail(LocalSourceError::Runtime(
                 SourceRuntimeError::SourceRefused(PostgresRefusal::ReplicationPrivilegeMissing)
             )),
-            "cdc-refused: replication privilege missing"
+            "cdc-refused: role \"calque_sync\" cannot start replication, which needs the REPLICATION attribute. Run ALTER ROLE \"calque_sync\" REPLICATION as a superuser; on RDS, run GRANT rds_replication TO \"calque_sync\" instead"
         );
         assert_eq!(
             detail(LocalSourceError::Runtime(SourceRuntimeError::Fence(
                 FenceError::ControlStoreRefused(PostgresRefusal::DatabaseMissing)
             ))),
-            "cdc-refused: database does not exist"
+            "cdc-refused: database \"app\" does not exist on the source. Check the database name in the database URL in APP_DATABASE_URL"
         );
         assert_eq!(
             detail(LocalSourceError::Ingest(PersistentIngestError::Fence(
                 FenceError::ControlStoreRefused(PostgresRefusal::InsufficientPrivilege)
             ))),
-            "cdc-refused: insufficient privilege"
+            "cdc-refused: role \"calque_sync\" lacks a privilege calque needs on the source. It needs CONNECT and CREATE on database \"app\" (GRANT CONNECT, CREATE ON DATABASE \"app\" TO \"calque_sync\") and SELECT on the enrolled tables, with INSERT, UPDATE and DELETE when pages write (GRANT SELECT, INSERT, UPDATE, DELETE ON <table> TO \"calque_sync\")"
         );
         assert_eq!(
             detail(LocalSourceError::Fence(FenceError::LeaseSuperseded)),
@@ -2657,6 +3283,42 @@ mod tests {
                 "persistent CDC failed: {}",
                 LocalSourceError::Fence(FenceError::LeaseSuperseded)
             )
+        );
+    }
+
+    #[test]
+    fn a_refused_start_is_worded_with_the_role_and_never_carries_the_password() {
+        let url =
+            DatabaseUrl::parse("postgresql://calque%20sync:s3cret%21pw@127.0.0.1:5432/my%20db")
+                .unwrap();
+        let source = SourceContext::of(&url, Some("APP_DATABASE_URL"));
+        let explained = source.explained(LocalSourceError::Fence(FenceError::ControlStoreRefused(
+            PostgresRefusal::AuthenticationFailed,
+        )));
+        let text = explained.to_string();
+        assert_eq!(
+            text,
+            "PostgreSQL refused to authenticate role \"calque sync\". Check the password in the database URL in APP_DATABASE_URL, that the role may log in, and that pg_hba.conf lets it connect to database \"my db\" from this host"
+        );
+        assert!(!text.contains("s3cret"), "{text}");
+        assert_eq!(
+            postgres_refusal(&explained),
+            Some(PostgresRefusal::AuthenticationFailed)
+        );
+        assert!(!explained.requires_destroying_state());
+        let unrelated = source.explained(LocalSourceError::Fence(FenceError::LeaseSuperseded));
+        assert!(matches!(
+            unrelated,
+            LocalSourceError::Fence(FenceError::LeaseSuperseded)
+        ));
+        let no_role = SourceContext::default().advice(PostgresRefusal::ReplicationPrivilegeMissing);
+        assert!(
+            no_role.starts_with("the connecting role cannot start replication"),
+            "{no_role}"
+        );
+        assert!(
+            no_role.contains("ALTER ROLE <role> REPLICATION"),
+            "{no_role}"
         );
     }
 
@@ -2680,9 +3342,19 @@ mod tests {
         let earlier = || LogError::EarlierEntryFormat {
             state_dir: state_dir().to_path_buf(),
         };
+        let slot_gone = [
+            LocalSourceError::Runtime(SourceRuntimeError::SlotMissing {
+                slot_name: "calque_slot".to_owned(),
+            }),
+            LocalSourceError::Runtime(SourceRuntimeError::SlotLost {
+                slot_name: "calque_slot".to_owned(),
+                reason: "reason wal_removed".to_owned(),
+            }),
+        ];
         for error in paths(earlier)
             .into_iter()
             .chain([LocalSourceError::RegistryStateMismatch])
+            .chain(slot_gone)
         {
             assert!(error.requires_destroying_state(), "{error:?}");
             let after = LocalSourceError::SessionCleanupFailedAfter(Box::new(error));
@@ -3029,8 +3701,7 @@ mod tests {
         let runtime = start_local_source_runtime(
             prepared,
             LocalSourceRuntimeConfig {
-                source_database_url: &database_url,
-                control_database_url: &database_url,
+                database_url: &database_url,
                 state: &state,
                 state_dir: state_dir(),
                 owner_id: format!("cdc-wake-owner-{suffix}"),
@@ -3041,6 +3712,7 @@ mod tests {
                 ingest_timeout: Duration::from_secs(2),
                 max_transactions_per_batch: DEFAULT_MAX_TRANSACTIONS,
                 metrics: OperationsMetrics::new(),
+                database_url_env: None,
             },
             head_signal,
         )
@@ -3405,6 +4077,125 @@ mod tests {
         fixture.remove();
     }
 
+    /// Selected columns become the publication's column list, in table
+    /// order, so a column added later is never published and needs no
+    /// restart. A selection that differs from the published list, names a
+    /// column the table lacks, or leaves out a column of a REPLICA IDENTITY
+    /// FULL table is refused before anything is created.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn selected_columns_become_the_publication_column_list() {
+        let mut fixture = EnrollmentLockFixture::create("pub_cols");
+        let relation = fixture.relation(0);
+        fixture
+            .source
+            .batch_execute(&format!("ALTER TABLE {relation} ADD COLUMN secret text"))
+            .unwrap();
+        let table = fixture.state.tables[0].clone();
+        let select = |names: &[&str]| -> SelectedColumns {
+            BTreeMap::from([(
+                table.clone(),
+                names.iter().map(|name| (*name).to_owned()).collect(),
+            )])
+        };
+        let start =
+            |fixture: &EnrollmentLockFixture, registry: Option<SchemaRegistry>, names: &[&str]| {
+                prepare_selected_local_source(
+                    &fixture.database_url,
+                    &fixture.state,
+                    &LocalSecrets::generate().unwrap(),
+                    registry,
+                    &select(names),
+                )
+            };
+        let published = |fixture: &mut EnrollmentLockFixture| -> Vec<String> {
+            fixture
+                .source
+                .query_one(
+                    "SELECT attnames::text[] FROM pg_catalog.pg_publication_tables
+                     WHERE pubname = $1",
+                    &[&fixture.state.names.publication_name],
+                )
+                .unwrap()
+                .get(0)
+        };
+
+        let registry = start(&fixture, None, &["value", "id"])
+            .unwrap_or_else(|error| panic!("enrollment failed: {error:?}"))
+            .registry;
+        assert_eq!(published(&mut fixture), ["id", "value"]);
+        let enrolled = registry.tables()[0]
+            .inspection
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(enrolled, ["id", "value"]);
+
+        fixture
+            .source
+            .batch_execute(&format!("ALTER TABLE {relation} ADD COLUMN later text"))
+            .unwrap();
+        start(&fixture, Some(registry.clone()), &["id", "value"])
+            .unwrap_or_else(|error| panic!("an added column stopped the source: {error:?}"));
+        assert_eq!(published(&mut fixture), ["id", "value"]);
+
+        match start(&fixture, Some(registry), &["id"]) {
+            Err(LocalSourceError::PublishedColumnsDiffer {
+                published,
+                selected,
+                ..
+            }) => {
+                assert_eq!(published, ["id", "value"]);
+                assert_eq!(selected, ["id"]);
+            }
+            other => panic!(
+                "a narrower selection was not refused as differing: {:?}",
+                other.err()
+            ),
+        }
+
+        destroy_local_source(&fixture.database_url, &fixture.state).unwrap();
+        match start(&fixture, None, &["id", "missing"]) {
+            Err(LocalSourceError::SelectedColumnMissing { column, .. }) => {
+                assert_eq!(column, "missing");
+            }
+            other => panic!(
+                "a missing selected column was not refused: {:?}",
+                other.err()
+            ),
+        }
+        assert!(!fixture.publication_exists());
+
+        fixture
+            .source
+            .batch_execute(&format!("ALTER TABLE {relation} REPLICA IDENTITY FULL"))
+            .unwrap();
+        match start(&fixture, None, &["id", "value"]) {
+            Err(LocalSourceError::SelectedColumnsUnderFullIdentity { .. }) => {}
+            other => panic!(
+                "a partial selection under FULL identity was accepted: {:?}",
+                other.err()
+            ),
+        }
+        assert!(!fixture.publication_exists());
+        start(&fixture, None, &["id", "value", "secret", "later"])
+            .unwrap_or_else(|error| panic!("a whole FULL table was refused: {error:?}"));
+        let listed: bool = fixture
+            .source
+            .query_one(
+                "SELECT rel.prattrs IS NOT NULL
+                 FROM pg_catalog.pg_publication_rel AS rel
+                 JOIN pg_catalog.pg_publication AS publication ON publication.oid = rel.prpubid
+                 WHERE publication.pubname = $1",
+                &[&fixture.state.names.publication_name],
+            )
+            .unwrap()
+            .get(0);
+        assert!(!listed, "a FULL table was published with a column list");
+        fixture.remove();
+    }
+
     /// Mounting mutations takes no lock that an autovacuum of the receipt
     /// table holds. Nothing deletes receipts, so that table and its
     /// autovacuum grow with every mutation; the holder here keeps its lock
@@ -3577,6 +4368,15 @@ mod tests {
                 .unwrap();
         }
 
+        /// Runs `sql` as the suite's administrator inside the fixture's database.
+        fn admin_in_database(&self, sql: &str) {
+            let (base, _) = self.admin_url.rsplit_once('/').unwrap();
+            Client::connect(&format!("{base}/{}", self.database_name), postgres::NoTls)
+                .unwrap()
+                .batch_execute(sql)
+                .unwrap();
+        }
+
         fn start(&self, metrics: OperationsMetrics) -> LocalSourceRuntime {
             self.try_start(metrics).unwrap()
         }
@@ -3603,8 +4403,7 @@ mod tests {
             )
             .unwrap();
             let config = LocalSourceRuntimeConfig {
-                source_database_url: &self.database_url,
-                control_database_url: &self.database_url,
+                database_url: &self.database_url,
                 state: &self.state,
                 state_dir: state_dir(),
                 owner_id: format!("cdc-reconnect-{}", uuid::Uuid::new_v4().simple()),
@@ -3614,6 +4413,7 @@ mod tests {
                 ingest_timeout: Duration::from_millis(200),
                 max_transactions_per_batch: DEFAULT_MAX_TRANSACTIONS,
                 metrics,
+                database_url_env: None,
             };
             let head_signal = snapshot_pipeline::CanonicalHeadSignal::new();
             match slot_lag_source {
@@ -3748,6 +4548,29 @@ mod tests {
                 .collect()
         }
 
+        /// Every operation of the canonical log's transactions, in sequence
+        /// order, as JSON.
+        fn canonical_operations(&mut self) -> Vec<serde_json::Value> {
+            self.client
+                .query(
+                    "SELECT entry_bytes FROM calque_control.canonical_log_record
+                      WHERE source_id = $1 ORDER BY sequence",
+                    &[&self.state.names.source_id.as_str()],
+                )
+                .unwrap()
+                .iter()
+                .flat_map(|row| {
+                    let entry =
+                        canonical_log::CanonicalEntry::decode(row.get::<_, &[u8]>(0)).unwrap();
+                    let entry = serde_json::to_value(entry).unwrap();
+                    entry["record"]["operations"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .collect()
+        }
+
         /// Rewrites record `sequence` in JSON, the form an earlier release
         /// stored every entry in, with a checksum that matches the new bytes.
         fn rewrite_as_an_earlier_release(&mut self, sequence: i64) {
@@ -3796,6 +4619,13 @@ mod tests {
                 let _ = admin.batch_execute(&format!("DROP ROLE IF EXISTS {role}"));
             }
         }
+    }
+
+    fn database_url_endpoint(
+        database_url: &DatabaseUrl,
+        family: PostgresConnectionFamily,
+    ) -> Client {
+        database_url.endpoint(family).unwrap().connect().unwrap()
     }
 
     fn wait_until(timeout: Duration, what: &str, mut condition: impl FnMut() -> bool) {
@@ -4067,12 +4897,12 @@ mod tests {
         assert_eq!(reconnects(&metrics), 0);
     }
 
-    /// A publication given a row filter while the runtime ran is refused at
-    /// the next reconnect as a start refuses it, naming the publication, and
-    /// the stop names restoring it. No reconnect follows.
+    /// A publication given a row filter while the runtime ran stops it as a
+    /// start refuses it, naming the publication, and the stop names restoring
+    /// it. No reconnect follows.
     #[test]
     #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
-    fn a_publication_altered_while_running_stops_the_reconnect_as_a_start_refuses_it() {
+    fn a_publication_altered_while_running_stops_the_runtime_as_a_start_refuses_it() {
         let mut fixture = ReconnectFixture::create("cdc_drift");
         let metrics = OperationsMetrics::new();
         let runtime = fixture.start(metrics.clone());
@@ -4089,12 +4919,11 @@ mod tests {
                 quote_identifier(&publication)
             ))
             .unwrap();
-        assert_eq!(fixture.terminate("walsender"), vec![true]);
 
         wait_until(Duration::from_secs(30), "the runtime to stop", || {
             !health.is_healthy()
         });
-        let refusal = format!("the PostgreSQL publication {publication} no longer publishes exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root, and without row filters or column lists.");
+        let refusal = format!("the PostgreSQL publication {publication} was altered, or an enum its columns use gained or renamed a value: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists and enum values it had at enrollment.");
         assert_eq!(
             health.failure(),
             Some(format!("persistent CDC failed: {refusal}"))
@@ -4109,6 +4938,205 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(reconnects(&metrics), 0);
+    }
+
+    /// A table dropped from the publication while the runtime streams stops
+    /// the runtime within seconds, with no reconnect to notice it: pgoutput
+    /// would otherwise leave out that table's changes while the cursor moved
+    /// past them.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_table_dropped_from_the_publication_while_streaming_stops_the_runtime() {
+        let mut fixture = ReconnectFixture::create("cdc_drop");
+        let metrics = OperationsMetrics::new();
+        let runtime = fixture.start(metrics.clone());
+        let health = runtime.health();
+        wait_until(Duration::from_secs(10), "a current runtime", || {
+            health.is_current()
+        });
+
+        let publication = fixture.state.names.publication_name.clone();
+        fixture
+            .client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION {} DROP TABLE public.items",
+                quote_identifier(&publication)
+            ))
+            .unwrap();
+        fixture.commit_row(1);
+
+        wait_until(Duration::from_secs(10), "the runtime to stop", || {
+            !health.is_healthy()
+        });
+        assert_eq!(health.failure_remedy(), CdcStopRemedy::RestorePublication);
+        let error = runtime.shutdown().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                LocalSourceError::PublicationDrift { publication: named } if *named == publication
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// A publication altered while nothing ran and put back before the next
+    /// start is still refused: the slot would decode the changes made in
+    /// between under the altered definition.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_publication_altered_and_restored_while_stopped_refuses_the_next_start() {
+        let mut fixture = ReconnectFixture::create("cdc_restored");
+        let runtime = fixture.start(OperationsMetrics::new());
+        let health = runtime.health();
+        wait_until(Duration::from_secs(10), "a current runtime", || {
+            health.is_current()
+        });
+        runtime.shutdown().unwrap();
+
+        let publication = quote_identifier(&fixture.state.names.publication_name);
+        fixture
+            .client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION {publication} DROP TABLE public.items"
+            ))
+            .unwrap();
+        fixture.commit_row(1);
+        fixture
+            .client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION {publication} ADD TABLE public.items"
+            ))
+            .unwrap();
+
+        let refused = match fixture.try_start(OperationsMetrics::new()) {
+            Err(error) => error,
+            Ok(runtime) => {
+                let health = runtime.health();
+                wait_until(Duration::from_secs(10), "the runtime to stop", || {
+                    !health.is_healthy()
+                });
+                runtime.shutdown().unwrap_err()
+            }
+        };
+        assert!(refused.publication_drifted(), "{refused:?}");
+    }
+
+    /// An enrollment made before enrollments recorded the publication's
+    /// fingerprint records it at its next start, and is held to it from then.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn an_older_enrollment_records_its_fingerprint_at_the_next_start() {
+        let mut fixture = ReconnectFixture::create("cdc_adopt");
+        let current = |fixture: &ReconnectFixture| {
+            let runtime = fixture.start(OperationsMetrics::new());
+            let health = runtime.health();
+            wait_until(Duration::from_secs(10), "a current runtime", || {
+                health.is_current()
+            });
+            runtime.shutdown().unwrap();
+        };
+        current(&fixture);
+        let source_id = fixture.state.names.source_id.as_str().to_owned();
+        let fingerprint = |fixture: &mut ReconnectFixture| -> Option<String> {
+            fixture
+                .client
+                .query_one(
+                    "SELECT publication_fingerprint FROM calque_control.source_slot_enrollment
+                      WHERE source_id = $1",
+                    &[&source_id],
+                )
+                .unwrap()
+                .get(0)
+        };
+        let enrolled = fingerprint(&mut fixture).expect("enrollment records a fingerprint");
+        fixture
+            .client
+            .execute(
+                "UPDATE calque_control.source_slot_enrollment
+                    SET publication_fingerprint = NULL WHERE source_id = $1",
+                &[&source_id],
+            )
+            .unwrap();
+
+        current(&fixture);
+        assert_eq!(fingerprint(&mut fixture), Some(enrolled));
+
+        let publication = quote_identifier(&fixture.state.names.publication_name);
+        fixture
+            .client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION {publication} DROP TABLE public.items;
+                 ALTER PUBLICATION {publication} ADD TABLE public.items;"
+            ))
+            .unwrap();
+        let refused = match fixture.try_start(OperationsMetrics::new()) {
+            Err(error) => error,
+            Ok(runtime) => {
+                let health = runtime.health();
+                wait_until(Duration::from_secs(10), "the runtime to stop", || {
+                    !health.is_healthy()
+                });
+                runtime.shutdown().unwrap_err()
+            }
+        };
+        assert!(refused.publication_drifted(), "{refused:?}");
+    }
+
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn enrollment_names_what_a_role_lacks_to_create_the_publication() {
+        let mut fixture = ReconnectFixture::create_with_own_role("create_denied");
+        let role = fixture.role.clone().unwrap();
+        let database = fixture.database_name.clone();
+        let publication = fixture.state.names.publication_name.clone();
+        let prepare = |fixture: &ReconnectFixture| {
+            prepare_local_source(
+                &fixture.database_url,
+                &fixture.state,
+                &LocalSecrets::generate().unwrap(),
+                None,
+            )
+            .map(|_| ())
+        };
+
+        fixture.admin_in_database(&format!("REVOKE CREATE ON DATABASE {database} FROM {role}"));
+        let error = prepare(&fixture).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("role \"{role}\" cannot create publication \"{publication}\" on database \"{database}\": it lacks CREATE on the database; run GRANT CREATE ON DATABASE \"{database}\" TO \"{role}\""),
+        );
+        assert_eq!(
+            postgres_refusal(&error),
+            Some(PostgresRefusal::InsufficientPrivilege)
+        );
+
+        fixture.admin_in_database(&format!("GRANT CREATE ON DATABASE {database} TO {role}"));
+        fixture
+            .client
+            .batch_execute("GRANT CREATE ON SCHEMA public TO CURRENT_USER")
+            .unwrap();
+        fixture.admin_in_database(&format!(
+            "GRANT CREATE ON SCHEMA public TO CURRENT_USER;
+             ALTER TABLE public.items OWNER TO CURRENT_USER;
+             GRANT ALL ON public.items TO {role}"
+        ));
+        let error = prepare(&fixture).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("the PostgreSQL publication {publication} does not exist, and Calque's role cannot create it because it does not own public.items. Have the tables' owner create it: CREATE PUBLICATION \"{publication}\" FOR TABLE \"public\".\"items\";"),
+        );
+
+        fixture.admin_in_database(&format!("ALTER TABLE public.items OWNER TO {role}"));
+        prepare(&fixture).unwrap();
+
+        // The control schema is created when the runtime starts, and the same
+        // missing CREATE refuses it there.
+        fixture.admin_in_database(&format!("REVOKE CREATE ON DATABASE {database} FROM {role}"));
+        let error = fixture.try_start(OperationsMetrics::new()).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            format!("role \"{role}\" lacks a privilege calque needs on the source. It needs CONNECT and CREATE on database \"{database}\" (GRANT CONNECT, CREATE ON DATABASE \"{database}\" TO \"{role}\") and SELECT on the enrolled tables, with INSERT, UPDATE and DELETE when pages write (GRANT SELECT, INSERT, UPDATE, DELETE ON <table> TO \"{role}\")"),
+        );
     }
 
     #[test]
@@ -4130,9 +5158,13 @@ mod tests {
         wait_until(Duration::from_secs(10), "the runtime to stop", || {
             !health.is_healthy()
         });
+        let role = fixture.role.clone().unwrap();
         assert_eq!(
             health.failure().as_deref(),
-            Some("cdc-refused: replication privilege missing")
+            Some(
+                format!("cdc-refused: role \"{role}\" cannot start replication, which needs the REPLICATION attribute. Run ALTER ROLE \"{role}\" REPLICATION as a superuser; on RDS, run GRANT rds_replication TO \"{role}\" instead")
+                    .as_str()
+            )
         );
         assert_eq!(reconnects(&metrics), 0);
         assert_eq!(fixture.backends("walsender"), 0);
@@ -4146,6 +5178,69 @@ mod tests {
             ),
             "{error:?}"
         );
+    }
+
+    /// Amazon RDS and Aurora grant replication through membership in
+    /// `rds_replication` and leave the REPLICATION attribute unset. A stock
+    /// PostgreSQL refuses such a role a walsender, which stands in here for a
+    /// refusal RDS would lift by itself, such as every WAL sender being busy.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_role_replicating_through_rds_replication_is_inspected_ready_and_retried() {
+        let mut fixture = ReconnectFixture::create_with_own_role("cdc_rds_role");
+        let metrics = OperationsMetrics::new();
+        let runtime = fixture.start(metrics.clone());
+        let health = runtime.health();
+        wait_until(Duration::from_secs(10), "a current runtime", || {
+            health.is_current()
+        });
+        let tables = fixture.state.tables.iter().cloned().collect();
+        let may_replicate = || {
+            inspect_local_source(
+                &fixture.database_url,
+                &fixture.state.names.publication_name,
+                &tables,
+            )
+            .unwrap()
+            .settings
+            .current_user_has_replication
+        };
+
+        fixture.alter_role("NOREPLICATION");
+        assert!(!may_replicate());
+        let role = fixture.role.clone().unwrap();
+        Client::connect(&fixture.admin_url, postgres::NoTls)
+            .unwrap()
+            .batch_execute(&format!(
+                "DO $$ BEGIN
+                   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles
+                                   WHERE rolname = 'rds_replication') THEN
+                     CREATE ROLE rds_replication NOLOGIN;
+                   END IF;
+                 END $$;
+                 GRANT rds_replication TO {role};"
+            ))
+            .unwrap();
+        assert!(may_replicate());
+
+        assert_eq!(fixture.terminate("walsender"), vec![true]);
+        // Attempts start 100 ms apart and double, so several are refused here.
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(health.is_healthy(), "{:?}", health.failure());
+        assert!(
+            health
+                .failure()
+                .is_some_and(|failure| failure.starts_with("cdc-reconnecting: ")),
+            "{:?}",
+            health.failure()
+        );
+        assert_eq!(reconnects(&metrics), 0);
+
+        fixture.alter_role("REPLICATION");
+        wait_until(Duration::from_secs(30), "a current runtime again", || {
+            health.is_current()
+        });
+        runtime.shutdown().unwrap();
     }
 
     #[test]
@@ -4166,9 +5261,14 @@ mod tests {
         wait_until(Duration::from_secs(10), "the runtime to stop", || {
             !health.is_healthy()
         });
+        let role = fixture.role.clone().unwrap();
+        let database = fixture.database_name.clone();
         assert_eq!(
             health.failure().as_deref(),
-            Some("cdc-refused: authentication failed")
+            Some(
+                format!("cdc-refused: PostgreSQL refused to authenticate role \"{role}\". Check the password in the database URL, that the role may log in, and that pg_hba.conf lets it connect to database \"{database}\" from this host")
+                    .as_str()
+            )
         );
         assert_eq!(reconnects(&metrics), 0);
         assert_eq!(fixture.backends("walsender"), 0);
@@ -4178,6 +5278,166 @@ mod tests {
             Some(PostgresRefusal::AuthenticationFailed),
             "{error:?}"
         );
+    }
+
+    /// A role whose defaults would make every text value unreadable to the
+    /// decoders enrolls anyway, because calque opens each connection with the
+    /// settings it needs. The snapshot's binary COPY and the CDC stream's text
+    /// then carry exactly what PostgreSQL holds.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_role_with_its_own_session_settings_enrolls_and_its_values_arrive_exact() {
+        let mut fixture = ReconnectFixture::create_with_own_role("session_settings");
+        fixture
+            .client
+            .batch_execute(
+                "CREATE TABLE public.moments (
+                     id bigint PRIMARY KEY,
+                     at timestamptz NOT NULL,
+                     day date NOT NULL,
+                     payload bytea NOT NULL,
+                     ratio float8 NOT NULL
+                 );
+                 INSERT INTO public.moments VALUES
+                     (1, '2024-07-14 23:30:15.123456+02', '2024-12-31',
+                      decode('00ff5c7800', 'hex'), 0.1::float8 + 0.2::float8);",
+            )
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        fixture.state = LocalState::new(
+            inspect_local_identity(&fixture.database_url).unwrap(),
+            sync_types::SourceEpoch::new(format!("epoch-{suffix}")).unwrap(),
+            LocalNames {
+                source_id: sync_types::SourceId::new(format!("session-settings-{suffix}")).unwrap(),
+                publication_name: "session_settings_pub".to_owned(),
+                slot_name: format!("session_settings_slot_{suffix}"),
+            },
+            vec![QualifiedTable {
+                schema: "public".to_owned(),
+                table: "moments".to_owned(),
+            }],
+        )
+        .unwrap();
+        for setting in [
+            "SET timezone = 'Europe/Paris'",
+            "SET datestyle = 'SQL, DMY'",
+            "SET bytea_output = 'escape'",
+            "SET extra_float_digits = 0",
+        ] {
+            fixture.alter_role(setting);
+        }
+
+        let prepared = prepare_local_source(
+            &fixture.database_url,
+            &fixture.state,
+            &LocalSecrets::generate().unwrap(),
+            None,
+        )
+        .expect("a role whose defaults differ enrolls");
+        let held = |client: &mut Client, id: i64| -> (i64, String, String, f64) {
+            let row = client
+                .query_one(
+                    "SELECT (extract(epoch FROM at) * 1000000)::bigint,
+                            to_char(day, 'YYYY-MM-DD'), encode(payload, 'hex'), ratio
+                       FROM public.moments WHERE id = $1",
+                    &[&id],
+                )
+                .unwrap();
+            (row.get(0), row.get(1), row.get(2), row.get(3))
+        };
+        assert_eq!(held(&mut fixture.client, 1).0, 1_720_992_615_123_456);
+        assert_eq!(held(&mut fixture.client, 1).3, 0.1_f64 + 0.2_f64);
+
+        let snapshot =
+            snapshot_builder::SnapshotBuildPlan::from_registry(&prepared.registry, &prepared.scope)
+                .unwrap();
+        let table = &snapshot.tables()[0];
+        let mut copier = database_url_endpoint(
+            &fixture.database_url,
+            PostgresConnectionFamily::SnapshotCopy,
+        );
+        let types = table.copy_types();
+        let reader = copier.copy_out(table.copy_sql()).unwrap();
+        use postgres::fallible_iterator::FallibleIterator as _;
+        let mut rows = postgres::binary_copy::BinaryCopyOutIter::new(reader, &types);
+        let row = rows.next().unwrap().unwrap();
+        let copied = snapshot_builder::decode_direct_columnar_row(
+            table,
+            &row,
+            snapshot_builder::CopyLoadLimits::default(),
+        )
+        .unwrap()
+        .0;
+        assert!(rows.next().unwrap().is_none());
+        drop(rows);
+        let (at, day, payload, ratio) = held(&mut fixture.client, 1);
+        assert_eq!(
+            copied[1..],
+            [
+                direct_columnar::Value::TimestampMicros(at),
+                direct_columnar::Value::DateText(day),
+                direct_columnar::Value::Bytes(hex::decode(payload).unwrap()),
+                direct_columnar::Value::F64(ratio),
+            ]
+        );
+
+        let runtime = fixture.start(OperationsMetrics::new());
+        let health = runtime.health();
+        wait_until(Duration::from_secs(10), "a current runtime", || {
+            health.is_current()
+        });
+        fixture
+            .client
+            .batch_execute(
+                "INSERT INTO public.moments VALUES
+                     (2, '2031-01-02 03:04:05.000001-08', '2031-02-03',
+                      decode('5c5c5c', 'hex'), 1e-7::float8);
+                 UPDATE public.moments SET at = '1999-12-31 23:59:59.999999+05:30',
+                     ratio = 123456789.123456789::float8 WHERE id = 1;",
+            )
+            .unwrap();
+        wait_until(
+            Duration::from_secs(10),
+            "the transaction to be logged",
+            || fixture.canonical_operations().len() >= 2,
+        );
+        let operations = fixture.canonical_operations();
+        let cell = |operation: &serde_json::Value, column: u64| -> serde_json::Value {
+            let columns = operation
+                .get("columns")
+                .or_else(|| operation.get("changed_columns"))
+                .unwrap();
+            columns
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|cell| cell["columnId"] == column)
+                .map_or(serde_json::Value::Null, |cell| cell["value"].clone())
+        };
+        let (insert, update) = (&operations[0], &operations[1]);
+        assert_eq!(insert["kind"], "INSERT_FULL_ROW", "{insert}");
+        assert_eq!(update["kind"], "UPDATE_PATCH", "{update}");
+        let (at, day, payload, ratio) = held(&mut fixture.client, 2);
+        assert_eq!(
+            cell(insert, 2),
+            serde_json::json!({"kind": "TIMESTAMP_UNIX_MICROS", "value": at})
+        );
+        assert_eq!(
+            cell(insert, 3),
+            serde_json::json!({"kind": "DATE_ISO8601", "value": day})
+        );
+        assert_eq!(
+            cell(insert, 4)["value"],
+            serde_json::json!(hex::decode(payload).unwrap())
+        );
+        assert_eq!(cell(insert, 5)["value"].as_f64(), Some(ratio));
+        let (at, _, _, ratio) = held(&mut fixture.client, 1);
+        assert_eq!(
+            cell(update, 2),
+            serde_json::json!({"kind": "TIMESTAMP_UNIX_MICROS", "value": at})
+        );
+        assert_eq!(cell(update, 5)["value"].as_f64(), Some(ratio));
+        runtime.shutdown().unwrap();
     }
 
     #[test]

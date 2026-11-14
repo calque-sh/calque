@@ -33,18 +33,17 @@ The rest of this document is the target. These parts of it are not built:
   and a partitioned grant names exactly one tenant (`scope` in
   `client/packages/config/src/compiler.ts`, `partition_scope` in
   `server/crates/authz/src/lib.rs`).
-- Selected columns: a collection carries every column of its table, and a
-  publication column list is refused (`PolicyError::PublicationColumnList` in
-  `server/crates/authz/src/lib.rs`), so an application hides a column only
-  through a projection table.
+- Selected columns per grant: a collection carries every column its
+  publication publishes, for every grant. Leaving a column out of the
+  collection keeps it out of the publication's column list for all of them
+  ([Publishing only some columns](../postgresql.md#publishing-only-some-columns));
+  one grant cannot see fewer columns than another.
 - Collection eviction: a plan over the memory budget fails with
   `CAPACITY_EXCEEDED`, and nothing is evicted (`#mount` in `session.ts`).
 - The active/standby swap: a rebuild closes the old engine before the new one
   opens, so INV-VIS-008 is not met (`#restart` in `session.ts`).
 - Backend commands and the `CommandExecutor` contract: the compiler refuses a
   backend command (`command` in `compiler.ts`).
-- Automatic resend of writes: the application calls `retryMutation`
-  (`SyncClient` in `client/packages/client/src/client.ts`).
 - HTTP Range, artifact caching and a long-lived change stream: the artifact
   route answers `200` with `private, no-store` (`serve_artifact` in
   `server/crates/calque-engine/src/artifacts.rs`), and the change stream holds
@@ -75,11 +74,6 @@ The rest of this document is the target. These parts of it are not built:
   interval and one build, but no experiment admitted it: live updates were
   slower while re-cuts ran. `--recut-tail-ratio 0` turns it off
   ([operations](operations.md#re-cutting-the-artifact-and-trimming-the-change-log)).
-- Compaction of retired log identities: trimming the canonical log keeps one
-  row per trimmed transaction in `calque_control.canonical_log_retired_record`,
-  which CDC reads to recognize a transaction it replays, and nothing removes
-  those rows before `calque destroy` (`retain_from` in
-  `server/crates/canonical-log/src/lib.rs`).
 
 ## Product and data model
 
@@ -189,7 +183,7 @@ revocation leaves facades locked. After a pointer swap there is no rollback;
 cleanup and observer failures are reported separately, and reentrant work joins
 a later epoch. Discarded graph microtasks cannot mutate active state or cursor.
 
-Multiple tabs must remain correct but may independently materialize columnar state. The artifact route sends `Cache-Control: private, no-store` today, so HTTP caching does not avoid a repeated artifact transfer. The one-million-row performance and memory target applies to one active tab; shared cross-tab materialization is future research.
+Multiple tabs must remain correct but may independently materialize columnar state. The artifact route sends `Cache-Control: private, no-store` today, so HTTP caching does not avoid a repeated artifact transfer. The 100,000-row performance and memory target applies to one active tab; shared cross-tab materialization is future research.
 
 Runtime choice is local to a component. Rust is a candidate for PostgreSQL CDC/COPY, encoding, compression and integrity hot paths; TypeScript/JavaScript is a candidate for configuration, SDK, routing and browser integration. No language or infrastructure product is mandatory without measured value. The core cannot require Cloudflare or another single provider.
 
@@ -205,7 +199,7 @@ The intended first-run path is `calque init`, schema inspection and generated ty
 
 These are product targets, not measurements. Architecture work must preserve them:
 
-- Realistic incident-operations dataset: 500,000 to 1,000,000 mixed rows.
+- Realistic incident-operations dataset: about 100,000 mixed rows.
 - Client cold/server warm target: strictly below 2,000 ms p95 to complete
   stable grid paint on the 16 GiB reference machine, headed Chrome,
   and 1 Gbps low-latency profile.
@@ -220,9 +214,8 @@ The benchmark, `pnpm bench`, judges a narrower profile: 100,007 rows of
 the content-v1 dataset, below 2,000 ms p95 over 30 cold samples to complete
 stable paint, in headless Chrome for Testing at Chrome-emulated 100 Mbit/s and
 30 ms. A run on a loaded machine counts, labelled directional.
-The 500,000 to 1,000,000-row dataset, the 16 GiB reference machine, headed
-Chrome, the 1 Gbps profile and the 200 Mbps office result above are not
-judged. The README's [benchmark](../../README.md#the-benchmark)
+The 16 GiB reference machine, headed Chrome, the 1 Gbps profile and the
+200 Mbps office result above are not judged. The README's [benchmark](../../README.md#the-benchmark)
 section has its thresholds and its most recent full run.
 
 The target for every reported run is to separate download, decode, materialization, indexing, query and stable paint, and to publish transfer bytes, CPU, RSS, JS heap, ArrayBuffer use, GC and long tasks. The benchmark records the browser's process-tree RSS, `calque`'s RSS, the benchmark's CPU time, long tasks and GC, and no JS heap or ArrayBuffer figure. Server-cold process recovery, server-warm client load, client-warm load, dataset preparation and live update are distinct scenarios.

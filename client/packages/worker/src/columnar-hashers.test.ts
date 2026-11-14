@@ -141,9 +141,7 @@ describe("the page's hasher workers", () => {
 
   test("a constructor that throws terminates the hashers already spawned and throws", () => {
     let constructed = 0;
-    const refused = new TypeError(
-      "this runtime has no Worker constructor; Calque runs only in Chromium-based browsers",
-    );
+    const refused = new TypeError("this runtime has no Worker constructor");
     expect(
       () =>
         new ArtifactHashers(() => {

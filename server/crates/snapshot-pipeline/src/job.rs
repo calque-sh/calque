@@ -47,11 +47,18 @@ pub struct SnapshotBuildConnections {
     pub pressure: Option<Client>,
 }
 
+/// How long a build may go without a pressure sample when samples time out
+/// before its watchdog stops it. A host stall of a few seconds then delays
+/// the next sample instead of failing a build that may have copied for
+/// minutes; a source whose lease lapses after as long loses the build anyway.
+const PRESSURE_BLIND_LIMIT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, Copy)]
 pub struct SnapshotBuildSafetyPolicy {
     pub watchdog: SnapshotWatchdogConfig,
     pub pressure_interval: Duration,
     pub pressure_sample_timeout: Duration,
+    pub pressure_blind_limit: Duration,
     pub pressure: SnapshotPressurePolicy,
 }
 
@@ -69,6 +76,7 @@ impl SnapshotBuildSafetyPolicy {
             watchdog,
             pressure_interval,
             pressure_sample_timeout,
+            pressure_blind_limit: PRESSURE_BLIND_LIMIT,
             pressure,
         })
     }
@@ -386,9 +394,9 @@ impl SnapshotBuildSupervisor {
     /// cleanup journal reaches its durable terminal boundary.
     ///
     /// `on_stage` is the test/operations observer boundary for exact lifecycle
-    /// failpoints. The observer runs immediately after each durable stage
-    /// transition. It may cancel the caller token, but it cannot mint progress
-    /// or bypass cleanup.
+    /// failpoints. The observer runs immediately after each stage transition
+    /// the journal records. It may cancel the caller token, but it cannot mint
+    /// progress or bypass cleanup.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_controlled<P, S, O>(
         &self,
@@ -790,6 +798,7 @@ impl SnapshotBuildSupervisor {
         let pressure_monitor = SnapshotPressureMonitor::postgres(
             self.config.safety.pressure_interval,
             self.config.safety.pressure_sample_timeout,
+            self.config.safety.pressure_blind_limit,
             connections
                 .pressure
                 .take()
@@ -933,6 +942,8 @@ impl SnapshotBuildSupervisor {
             cancellation,
             before_publish,
             on_phase,
+            self.config.safety.watchdog.no_progress_timeout() / 4,
+            || watchdog.heartbeat(),
         )
         .await
         .map_err(Into::into)

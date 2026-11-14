@@ -2,6 +2,7 @@
 //! artifact grants it is answered with.
 
 use super::*;
+use crate::plans::TokenRefusal;
 
 /// The scope a request may be planned against: the one this process built its
 /// artifact set for, and no other.
@@ -118,6 +119,38 @@ impl Plans {
         (claims.generation == self.retirements().generation).then(|| self.tokens.sign(claims))
     }
 
+    /// The plan one build of `request` is served from, and the fence it is
+    /// served under. The first build opens the plan into `held`. A later one
+    /// reads what the token proved from `held`, since the token, this
+    /// process's key and the request's client and tables stay as they were,
+    /// and asks again only what time and a fence can change.
+    pub(super) fn for_build<'held>(
+        &self,
+        held: &'held mut Option<OpenedPlan>,
+        current: &Arc<ServingAuthorization>,
+        incoming: &IncomingChangeRequest,
+        request: &change_api::ChangeBatchRequest,
+        now: i64,
+    ) -> Result<(&'held OpenedPlan, Option<PlanRevocation>), ChangeBatchError> {
+        match held {
+            Some(opened) => {
+                if opened.claims.expired_at(now) {
+                    return Err(TokenRefusal::Stale.into());
+                }
+                let (_, revocation) = self.retirements().resolve(
+                    opened.claims.generation,
+                    &opened.scope_hash,
+                    current,
+                )?;
+                Ok((opened, revocation))
+            }
+            None => {
+                let resolved = self.resolve(current, incoming, request, now)?;
+                Ok((held.insert(resolved.opened), resolved.revocation))
+            }
+        }
+    }
+
     /// The plan one change request's token signs, checked against the
     /// request and the fence state, with its scope as this process rebuilds
     /// it from `current` or from the retired generation's policy.
@@ -166,10 +199,17 @@ impl Plans {
                     room: PlanRoom::new(),
                 })
             })?;
+        let from_cursor = claims.start_cursor()?;
+        let through_cursor = claims.through_cursor()?;
         Ok(ResolvedPlan {
-            claims,
-            plan,
-            table_starts,
+            opened: OpenedPlan {
+                claims,
+                scope_hash,
+                plan,
+                table_starts,
+                from_cursor,
+                through_cursor,
+            },
             revocation,
         })
     }
@@ -207,11 +247,21 @@ impl Plans {
     }
 }
 
-/// A plan as one change build resolved it from its token.
-pub(super) struct ResolvedPlan {
+/// What a change request's token proved about it. The stream that opened it
+/// keeps it for its life, so a commit does not verify a signature and take the
+/// verified plans' lock once per connection.
+pub(super) struct OpenedPlan {
     pub(super) claims: PlanClaims,
+    pub(super) scope_hash: [u8; 32],
     pub(super) plan: Arc<VerifiedPlan>,
     pub(super) table_starts: BTreeMap<TableId, Option<OpaqueCursor>>,
+    pub(super) from_cursor: OpaqueCursor,
+    pub(super) through_cursor: OpaqueCursor,
+}
+
+/// A plan as one change request's token signs it, and its fence as it stands.
+pub(super) struct ResolvedPlan {
+    pub(super) opened: OpenedPlan,
     pub(super) revocation: Option<PlanRevocation>,
 }
 
@@ -316,6 +366,7 @@ pub(super) fn map_bootstrap_error(error: BootstrapError) -> BootstrapHttpError {
             BootstrapHttpError::CapacityExceeded
         }
         BootstrapError::ResidentCursorWindow(_)
+        | BootstrapError::ResidentProof(bootstrap_api::ResidentProofError::Compatibility)
         | BootstrapError::NoArtifactCover(_)
         | BootstrapError::NoCatchUpStart => BootstrapHttpError::ResnapshotRequired,
         BootstrapError::UnknownTable
@@ -329,7 +380,9 @@ pub(super) fn map_bootstrap_error(error: BootstrapError) -> BootstrapHttpError {
         | BootstrapError::ResidentCursor(_)
         | BootstrapError::ResidentProof(_)
         | BootstrapError::ResidentProofOutsideRegistry
-        | BootstrapError::ResidentClaimOutsideProof => BootstrapHttpError::InvalidRequest,
+        | BootstrapError::ResidentClaimOutsideProof
+        | BootstrapError::ResidentCursorMissing
+        | BootstrapError::ResidentCursorBeforeProof => BootstrapHttpError::InvalidRequest,
         BootstrapError::SourceCompatibilityMismatch
         | BootstrapError::InvalidAuthorizationToken
         | BootstrapError::AuthorizationExpiresBeforePlan
@@ -404,7 +457,15 @@ impl LocalBackend {
             let tenant = scope
                 .partition_value()
                 .ok_or(BootstrapHttpError::Forbidden)?;
-            tenants.admit(serving.generation(), tenant).await?;
+            // A page that holds every table it asks for renews its plan,
+            // which installs no artifact and so waits on no build.
+            if !request.resident_tables.is_empty()
+                && required_tables.is_subset(&request.resident_tables)
+            {
+                tenants.renewed(serving.generation(), tenant)?;
+            } else {
+                tenants.admit(serving.generation(), tenant).await?;
+            }
         }
         // A bootstrap waits for a planner rather than being refused one. The
         // in-flight request bound limits how many can wait, and a refusal would
@@ -451,6 +512,7 @@ impl LocalBackend {
             required_tables,
             resident_state_proof: request.resident_state_proof,
             resident_tables: request.resident_tables,
+            resident_cursor: request.resident_cursor,
             authorization,
             cached_artifact_hints: request.cached_artifact_hints,
             accepted_encodings: request.accepted_encodings,

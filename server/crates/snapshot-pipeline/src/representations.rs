@@ -3,7 +3,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
     },
     thread::JoinHandle,
@@ -15,7 +15,10 @@ use artifact_contract::{
     PackedParameters, RepresentationEncoding, ZstdParameters, DIRECT_COLUMNAR_CHUNK_BYTES,
     PACKED_BODY_VERSION,
 };
-use brotli::enc::{BrotliEncoderParams, StandardAlloc};
+use brotli::enc::{
+    encode::{BrotliEncoderDestroyInstance, BrotliEncoderOperation, BrotliEncoderStateStruct},
+    BrotliEncoderParams, StandardAlloc,
+};
 use direct_columnar::pack::{pack_unless, unpack, PackError, UnpackError};
 use sha2::{Digest, Sha256};
 use snapshot_builder::ArtifactTee;
@@ -49,37 +52,63 @@ const ZSTD_HASH_LOG: u32 = 21;
 /// several times the memory.
 pub const REENCODED_ZSTD_LEVEL: i32 = 19;
 
+/// The level of a zstd object that background stages replace once it is
+/// published: on a 29.5 MB tenant artifact level 12 spent five times its CPU
+/// to write 5% fewer bytes, while the tenant's first page waits.
+pub const REPLACED_ZSTD_LEVEL: i32 = 6;
+
 /// The level a zstd representation records and the worker threads that write
-/// it. Every other parameter is the same for both.
+/// it. Every other parameter is the same for each.
 #[derive(Debug, Clone, Copy)]
 struct ZstdEncoding {
     level: i32,
     workers: u32,
 }
 
-const PUBLISHED_ZSTD: ZstdEncoding = ZstdEncoding {
-    level: ZSTD_LEVEL,
-    workers: ZSTD_WORKERS,
-};
-
 const REENCODED_ZSTD: ZstdEncoding = ZstdEncoding {
     level: REENCODED_ZSTD_LEVEL,
     workers: 0,
 };
 
-/// What a lowered thread publishes at: the same level, on the thread alone.
-/// libzstd starts its own workers, which macOS runs at normal priority
-/// whatever the class of the thread that starts them.
-const BACKGROUND_ZSTD: ZstdEncoding = ZstdEncoding {
-    level: ZSTD_LEVEL,
-    workers: 0,
-};
+/// How a build that runs beside other builds writes its zstd object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedBuildZstd {
+    /// The decoded size from which background stages replace the object,
+    /// which is then written at [`REPLACED_ZSTD_LEVEL`].
+    pub replaced_from_bytes: u64,
+    /// This build's compression threads.
+    pub workers: u32,
+}
 
-fn published_zstd() -> ZstdEncoding {
-    if background_thread::current_thread_is_lowered() {
-        BACKGROUND_ZSTD
-    } else {
-        PUBLISHED_ZSTD
+impl SharedBuildZstd {
+    /// Up to `builds` at once split [`ZSTD_WORKERS`] between them, so that
+    /// compression holds as many threads at the cap as one build does and
+    /// leaves the rest of the machine to live delivery.
+    pub fn split_among(builds: usize, replaced_from_bytes: u64) -> Self {
+        let builds = u32::try_from(builds).unwrap_or(u32::MAX).max(1);
+        Self {
+            replaced_from_bytes,
+            workers: (ZSTD_WORKERS / builds).max(1),
+        }
+    }
+}
+
+/// A lowered thread encodes on the thread alone: libzstd starts its own
+/// workers, which macOS runs at normal priority whatever the class of the
+/// thread that starts them.
+fn published_zstd(shared: Option<SharedBuildZstd>, decoded_bytes: u64) -> ZstdEncoding {
+    let replaced = shared.is_some_and(|shared| decoded_bytes >= shared.replaced_from_bytes);
+    ZstdEncoding {
+        level: if replaced {
+            REPLACED_ZSTD_LEVEL
+        } else {
+            ZSTD_LEVEL
+        },
+        workers: if background_thread::current_thread_is_lowered() {
+            0
+        } else {
+            shared.map_or(ZSTD_WORKERS, |shared| shared.workers)
+        },
     }
 }
 
@@ -172,7 +201,7 @@ impl PreparedRepresentations {
             decoded_sha256,
             max_encoded_bytes,
             chunk_bytes,
-            published_zstd(),
+            published_zstd(None, decoded_bytes),
             cancellation,
         )?;
 
@@ -257,12 +286,35 @@ pub fn encode_brotli_large_window_controlled(
 pub struct PackedArtifact {
     body: NamedTempFile,
     body_bytes: u64,
+    /// Where the body's sections end, as [`direct_columnar::pack::Packed`]
+    /// gives them.
+    part_ends: Vec<u64>,
 }
 
 impl PackedArtifact {
     pub fn body_bytes(&self) -> u64 {
         self.body_bytes
     }
+}
+
+/// A packed body's encode ends a brotli metablock at the end of a section of
+/// the body once at least this many bytes have been encoded since the last
+/// such end. Across a fleet of tenant artifacts it wrote 0.2% fewer bytes than
+/// the encoder's own metablocks alone, in the same CPU.
+const PACKED_FLUSH_BYTES: u64 = 64 * 1024;
+
+/// The body offsets to flush at, ascending and inside the body: each section
+/// end at least `gap` bytes past the last flush.
+fn flush_offsets(part_ends: &[u64], body_bytes: u64, gap: u64) -> Vec<u64> {
+    let mut flushed = 0;
+    let mut offsets = Vec::new();
+    for &end in part_ends {
+        if end < body_bytes && end > flushed && end - flushed >= gap {
+            offsets.push(end);
+            flushed = end;
+        }
+    }
+    offsets
 }
 
 /// Packs the decoded artifact at `decoded_path` on the calling thread and
@@ -325,12 +377,14 @@ fn pack_artifact(
     Ok(Some(PackedArtifact {
         body,
         body_bytes: packed.body.len() as u64,
+        part_ends: packed.part_ends.iter().map(|&end| end as u64).collect(),
     }))
 }
 
 /// Encodes `packed` as one brotli stream with the large-window extension, at
-/// [`BROTLI_QUALITY`] and the smallest window that covers the body, on the
-/// calling thread, into a file beside the body. Its verifier decodes the
+/// [`BROTLI_QUALITY`] and the smallest window that covers the body, flushed
+/// at a section's end once 64 KiB have been encoded since the last flush, on
+/// the calling thread, into a file beside the body. Its verifier decodes the
 /// stream again, restores the artifact from the body it decoded, and checks
 /// that artifact's length, SHA-256 and every chunk against `decoded_bytes` and
 /// `decoded_sha256`. Returns the representation and the digest of each chunk
@@ -338,6 +392,26 @@ fn pack_artifact(
 /// stops there and fails.
 pub fn encode_packed_brotli_large_window_controlled(
     packed: &PackedArtifact,
+    decoded_bytes: u64,
+    decoded_sha256: &str,
+    max_encoded_bytes: u64,
+    cancellation: &CancellationToken,
+) -> Result<(PreparedRepresentation, Vec<String>), RepresentationError> {
+    encode_packed_brotli(
+        packed,
+        PACKED_FLUSH_BYTES,
+        decoded_bytes,
+        decoded_sha256,
+        max_encoded_bytes,
+        cancellation,
+    )
+}
+
+/// [`encode_packed_brotli_large_window_controlled`], flushed at a section's
+/// end once `flush_gap` bytes have been encoded since the last flush.
+fn encode_packed_brotli(
+    packed: &PackedArtifact,
+    flush_gap: u64,
     decoded_bytes: u64,
     decoded_sha256: &str,
     max_encoded_bytes: u64,
@@ -352,6 +426,7 @@ pub fn encode_packed_brotli_large_window_controlled(
             decoded_bytes: body_bytes,
         },
     )?;
+    let flush_at = flush_offsets(&packed.part_ends, body_bytes, flush_gap);
     let verified = encode_verified(
         body_path,
         max_encoded_bytes,
@@ -364,6 +439,7 @@ pub fn encode_packed_brotli_large_window_controlled(
                 output,
                 BROTLI_QUALITY,
                 window_bits,
+                &flush_at,
                 cancellation,
             )
         },
@@ -403,11 +479,15 @@ pub fn encode_packed_brotli_large_window_controlled(
 /// beside the write. Its verifier starts when the artifact's length is known
 /// and decodes the representation back as it is written;
 /// [`ZstdWhileWriting::finish`] holds what it decoded to the written
-/// artifact's digest.
+/// artifact's digest. [`ZstdWhileWriting::progress`] counts the bytes the
+/// encoder took and the verifier read, so a caller can tell a slow
+/// finalization from a stalled one.
 pub(crate) struct ZstdWhileWriting {
     directory: PathBuf,
     max_encoded_bytes: u64,
+    shared: Option<SharedBuildZstd>,
     cancellation: CancellationToken,
+    progress: Arc<AtomicU64>,
     encode: Option<ZstdEncode>,
     refused: Option<RepresentationError>,
 }
@@ -423,19 +503,28 @@ struct ZstdEncode {
 }
 
 impl ZstdWhileWriting {
-    /// An encode into a file in `directory`, which is the artifact's.
+    /// An encode into a file in `directory`, which is the artifact's, as
+    /// `shared` says when other builds run beside it.
     pub(crate) fn new(
         directory: &Path,
         max_encoded_bytes: u64,
+        shared: Option<SharedBuildZstd>,
         cancellation: &CancellationToken,
     ) -> Self {
         Self {
             directory: directory.to_path_buf(),
             max_encoded_bytes,
+            shared,
             cancellation: cancellation.clone(),
+            progress: Arc::new(AtomicU64::new(0)),
             encode: None,
             refused: None,
         }
+    }
+
+    /// Bytes the encoder has taken plus bytes the verifier has read, so far.
+    pub(crate) fn progress(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.progress)
     }
 
     fn start(&self, decoded_bytes: u64) -> Result<ZstdEncode, RepresentationError> {
@@ -457,11 +546,15 @@ impl ZstdWhileWriting {
         );
         let (chunks, queue) = mpsc::sync_channel(VERIFIER_QUEUE_CHUNKS);
         let cancellation = self.cancellation.clone();
+        let progress = Arc::clone(&self.progress);
         let verifier = background_thread::spawn(
             std::thread::Builder::new().name("calque-zstd-verify".to_owned()),
             move || {
                 decode_zstd_stream(
-                    QueueReader::new(queue),
+                    CountingReader {
+                        inner: QueueReader::new(queue),
+                        progress,
+                    },
                     decoded_bytes,
                     chunk_bytes,
                     &cancellation,
@@ -474,7 +567,7 @@ impl ZstdWhileWriting {
             chunks,
             verifier_stopped: Arc::clone(&verifier_stopped),
         };
-        let encoding = published_zstd();
+        let encoding = published_zstd(self.shared, decoded_bytes);
         Ok(ZstdEncode {
             started,
             encoding,
@@ -592,10 +685,12 @@ impl ArtifactTee for ZstdWhileWriting {
 
 impl Write for ZstdWhileWriting {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        match &mut self.encode {
-            Some(encode) => encode.encoder.write(bytes),
-            None => Err(io::Error::other("the zstd encode has not begun")),
-        }
+        let written = match &mut self.encode {
+            Some(encode) => encode.encoder.write(bytes)?,
+            None => return Err(io::Error::other("the zstd encode has not begun")),
+        };
+        self.progress.fetch_add(written as u64, Ordering::Relaxed);
+        Ok(written)
     }
 
     // Never flushed (`ArtifactTee`): a flush would end the frame's block.
@@ -791,6 +886,7 @@ fn prepare_brotli(
                 output,
                 quality,
                 window_bits,
+                &[],
                 cancellation,
             )
         },
@@ -903,14 +999,17 @@ fn finish_zstd(encoder: ZstdEncoder) -> Result<u64, RepresentationError> {
 }
 
 /// Writes `decoded_path` as one large-window brotli stream to `output` and
-/// returns the encoded length. `output`, and with it the verifier's queue, is
-/// closed by the time this returns, whether or not it succeeded.
+/// returns the encoded length. The stream ends a metablock at each of
+/// `flush_at`, ascending offsets into the input, and wherever the encoder
+/// ends one itself. `output`, and with it the verifier's queue, is closed by
+/// the time this returns, whether or not it succeeded.
 fn encode_brotli(
     decoded_path: &Path,
     decoded_bytes: u64,
     mut output: TeeWriter<BoundedWriter<File>>,
     quality: u8,
     window_bits: u8,
+    flush_at: &[u64],
     cancellation: &CancellationToken,
 ) -> Result<u64, RepresentationError> {
     let params = BrotliEncoderParams {
@@ -923,16 +1022,40 @@ fn encode_brotli(
     };
     let mut input =
         CancellableReader::new(File::open(decoded_path)?, cancellation.clone()).take(decoded_bytes);
+    let mut encoder = BrotliEncoderStateStruct::new(StandardAlloc::default());
+    encoder.params = params;
     let mut input_buffer = vec![0_u8; IO_BUFFER_BYTES];
     let mut output_buffer = vec![0_u8; IO_BUFFER_BYTES];
-    brotli::BrotliCompressCustomAlloc(
-        &mut input,
-        &mut output,
-        &mut input_buffer,
-        &mut output_buffer,
-        &params,
-        StandardAlloc::default(),
-    )?;
+    let mut flushes = flush_at.iter().copied().peekable();
+    let mut read = 0_u64;
+    loop {
+        let flush = flushes.peek().copied();
+        let wanted = flush.map_or(IO_BUFFER_BYTES, |at| {
+            usize::try_from(at.saturating_sub(read))
+                .map_or(IO_BUFFER_BYTES, |left| left.min(IO_BUFFER_BYTES))
+        });
+        let size = input.read(&mut input_buffer[..wanted])?;
+        read += size as u64;
+        let operation = if size == 0 {
+            BrotliEncoderOperation::BROTLI_OPERATION_FINISH
+        } else if flush == Some(read) {
+            flushes.next();
+            BrotliEncoderOperation::BROTLI_OPERATION_FLUSH
+        } else {
+            BrotliEncoderOperation::BROTLI_OPERATION_PROCESS
+        };
+        compress_brotli(
+            &mut encoder,
+            operation,
+            &input_buffer[..size],
+            &mut output_buffer,
+            &mut output,
+        )?;
+        if size == 0 {
+            break;
+        }
+    }
+    BrotliEncoderDestroyInstance(&mut encoder);
     let mut trailing = [0_u8; 1];
     if input.limit() != 0 || input.into_inner().read(&mut trailing)? != 0 {
         return Err(RepresentationError::DecodedFileChanged {
@@ -947,6 +1070,50 @@ fn encode_brotli(
     let (output, encoded_bytes) = output.finish()?;
     output.sync_all()?;
     Ok(encoded_bytes)
+}
+
+/// Hands `input` to `encoder` under `operation` and writes what it emits to
+/// `output`, until the input is taken and, for a flush or the finish, every
+/// byte it owes is out.
+fn compress_brotli(
+    encoder: &mut BrotliEncoderStateStruct<StandardAlloc>,
+    operation: BrotliEncoderOperation,
+    input: &[u8],
+    output_buffer: &mut [u8],
+    output: &mut impl Write,
+) -> Result<(), RepresentationError> {
+    let mut available_in = input.len();
+    let mut input_offset = 0;
+    let mut total_out = None;
+    loop {
+        let mut available_out = output_buffer.len();
+        let mut output_offset = 0;
+        let accepted = encoder.compress_stream(
+            operation,
+            &mut available_in,
+            input,
+            &mut input_offset,
+            &mut available_out,
+            output_buffer,
+            &mut output_offset,
+            &mut total_out,
+            &mut |_: &mut _, _: &mut _, _: _, _: &mut _| (),
+        );
+        output.write_all(&output_buffer[..output_offset])?;
+        if !accepted {
+            return Err(io::Error::other("the brotli encoder refused its input").into());
+        }
+        let done = match operation {
+            BrotliEncoderOperation::BROTLI_OPERATION_FINISH => encoder.is_finished(),
+            BrotliEncoderOperation::BROTLI_OPERATION_FLUSH => {
+                available_in == 0 && !encoder.has_more_output()
+            }
+            _ => available_in == 0,
+        };
+        if done {
+            return Ok(());
+        }
+    }
 }
 
 fn prepared_compressed(
@@ -1483,6 +1650,20 @@ impl Read for QueueReader {
     }
 }
 
+/// Adds what its reader reads to `progress`.
+struct CountingReader<R> {
+    inner: R,
+    progress: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(bytes)?;
+        self.progress.fetch_add(read as u64, Ordering::Relaxed);
+        Ok(read)
+    }
+}
+
 struct CancellableReader<R> {
     inner: R,
     cancellation: CancellationToken,
@@ -1996,7 +2177,17 @@ mod tests {
         maximum: u64,
         cancellation: &CancellationToken,
     ) -> ZstdWhileWriting {
-        let mut zstd = ZstdWhileWriting::new(directory, maximum, cancellation);
+        write_replaced_beside(directory, bytes, maximum, None, cancellation)
+    }
+
+    fn write_replaced_beside(
+        directory: &Path,
+        bytes: &[u8],
+        maximum: u64,
+        shared: Option<SharedBuildZstd>,
+        cancellation: &CancellationToken,
+    ) -> ZstdWhileWriting {
+        let mut zstd = ZstdWhileWriting::new(directory, maximum, shared, cancellation);
         zstd.begin(bytes.len() as u64).unwrap();
         // Uneven writes, as the artifact's buffered writer may issue them.
         let mut rest = bytes;
@@ -2018,10 +2209,16 @@ mod tests {
         let maximum = bytes.len() as u64 + 1024 * 1024;
         let from_file =
             PreparedRepresentations::prepare(&path, bytes.len() as u64, &digest, maximum).unwrap();
-        let beside = write_beside(directory.path(), &bytes, maximum, &CancellationToken::new())
-            .finish(&path, bytes.len() as u64, &digest)
-            .unwrap();
+        let zstd = write_beside(directory.path(), &bytes, maximum, &CancellationToken::new());
+        let progress = zstd.progress();
+        let beside = zstd.finish(&path, bytes.len() as u64, &digest).unwrap();
 
+        // What the encoder took and what the verifier read.
+        let encoded = beside.entries().next().unwrap().manifest().encoded_bytes;
+        assert_eq!(
+            progress.load(Ordering::Relaxed),
+            bytes.len() as u64 + encoded
+        );
         assert_eq!(beside.decoded_chunks(), from_file.decoded_chunks());
         for (beside, from_file) in beside.entries().zip(from_file.entries()) {
             assert_eq!(beside.manifest(), from_file.manifest());
@@ -2031,6 +2228,40 @@ mod tests {
             );
         }
         assert_eq!(beside.entries().count(), 2);
+    }
+
+    #[test]
+    fn only_a_zstd_object_that_will_be_replaced_is_written_at_the_cheaper_level() {
+        let (directory, path, bytes, digest) = fixture_of(1024 * 1024 + 123);
+        let length = bytes.len() as u64;
+        let maximum = length + 1024 * 1024;
+        let level_beside = |replaced_from_bytes: Option<u64>| {
+            let zstd = write_replaced_beside(
+                directory.path(),
+                &bytes,
+                maximum,
+                replaced_from_bytes.map(|bytes| SharedBuildZstd::split_among(4, bytes)),
+                &CancellationToken::new(),
+            );
+            let prepared = zstd.finish(&path, length, &digest).unwrap();
+            let zstd = prepared.entries().next().unwrap().manifest().zstd.clone();
+            zstd.unwrap().level
+        };
+        assert_eq!(level_beside(None), ZSTD_LEVEL);
+        assert_eq!(level_beside(Some(length + 1)), ZSTD_LEVEL);
+        assert_eq!(level_beside(Some(length)), REPLACED_ZSTD_LEVEL);
+    }
+
+    #[test]
+    fn builds_at_the_cap_split_the_compression_threads() {
+        let workers = |builds| SharedBuildZstd::split_among(builds, 0).workers;
+        assert_eq!(workers(1), ZSTD_WORKERS);
+        assert_eq!(workers(4), ZSTD_WORKERS / 4);
+        assert_eq!(workers(64), 1);
+        assert_eq!(workers(0), ZSTD_WORKERS);
+        let shared = SharedBuildZstd::split_among(4, 0);
+        assert_eq!(published_zstd(Some(shared), 1).workers, shared.workers);
+        assert_eq!(published_zstd(None, 1).workers, ZSTD_WORKERS);
     }
 
     #[test]
@@ -2065,7 +2296,7 @@ mod tests {
         let maximum = bytes.len() as u64 - 1;
         let cancellation = CancellationToken::new();
 
-        let mut zstd = ZstdWhileWriting::new(directory.path(), maximum, &cancellation);
+        let mut zstd = ZstdWhileWriting::new(directory.path(), maximum, None, &cancellation);
         assert!(zstd.begin(bytes.len() as u64).is_err());
         assert!(zstd.write_all(&bytes).is_err());
         assert!(matches!(
@@ -2073,7 +2304,7 @@ mod tests {
             Some(RepresentationError::EncodedLimitTooSmall { .. })
         ));
 
-        let mut zstd = ZstdWhileWriting::new(directory.path(), maximum, &cancellation);
+        let mut zstd = ZstdWhileWriting::new(directory.path(), maximum, None, &cancellation);
         assert!(zstd.begin(bytes.len() as u64).is_err());
         assert!(matches!(
             zstd.finish(&path, bytes.len() as u64, &digest),
@@ -2087,7 +2318,7 @@ mod tests {
         let maximum = bytes.len() as u64 + 1024 * 1024;
         let cancellation = CancellationToken::new();
         cancellation.cancel();
-        let mut zstd = ZstdWhileWriting::new(directory.path(), maximum, &cancellation);
+        let mut zstd = ZstdWhileWriting::new(directory.path(), maximum, None, &cancellation);
         assert!(zstd.begin(bytes.len() as u64).is_err());
         assert!(matches!(
             zstd.abandon(),
@@ -2119,13 +2350,16 @@ mod tests {
         ZstdWhileWriting {
             directory: directory.to_path_buf(),
             max_encoded_bytes: u64::MAX,
+            shared: None,
             cancellation,
+            progress: Arc::default(),
             encode: Some(ZstdEncode {
                 started: Instant::now(),
-                encoding: PUBLISHED_ZSTD,
+                encoding: published_zstd(None, decoded_bytes),
                 decoded_bytes,
                 temporary,
-                encoder: zstd_encoder(output, PUBLISHED_ZSTD, decoded_bytes).unwrap(),
+                encoder: zstd_encoder(output, published_zstd(None, decoded_bytes), decoded_bytes)
+                    .unwrap(),
                 verifier: std::thread::spawn(move || Err(failure)),
                 verifier_stopped,
             }),
@@ -2414,6 +2648,30 @@ mod tests {
         encoded
     }
 
+    /// The stream the library's writer makes of `body` at the packed
+    /// object's quality, flushed at each of `offsets`.
+    fn flushed_brotli_of(body: &[u8], offsets: &[u64], window_bits: u8) -> Vec<u8> {
+        let params = BrotliEncoderParams {
+            quality: i32::from(BROTLI_QUALITY),
+            lgwin: i32::from(window_bits),
+            large_window: true,
+            size_hint: body.len(),
+            ..BrotliEncoderParams::default()
+        };
+        let mut encoded = Vec::new();
+        {
+            let mut writer = brotli::CompressorWriter::with_params(&mut encoded, 4096, &params);
+            let mut at = 0;
+            for &end in offsets {
+                writer.write_all(&body[at..end as usize]).unwrap();
+                writer.flush().unwrap();
+                at = end as usize;
+            }
+            writer.write_all(&body[at..]).unwrap();
+        }
+        encoded
+    }
+
     fn brotli_decoded(encoded: &[u8]) -> Vec<u8> {
         let mut decoded = Vec::new();
         brotli::Decompressor::new(encoded, IO_BUFFER_BYTES)
@@ -2624,8 +2882,9 @@ mod tests {
     }
 
     /// The object is the packer's body as one stream at the quality and the
-    /// window its manifest records, the window covering the body and not the
-    /// artifact, and the chunks returned are the restored artifact's.
+    /// window its manifest records, flushed at the sections 64 KiB apart, the
+    /// window covering the body and not the artifact, and the chunks returned
+    /// are the restored artifact's.
     #[test]
     fn the_packed_object_is_the_packer_s_body_as_one_stream_and_restores_the_artifact() {
         let (directory, path, artifact, digest, body) = packed_fixture("every-kind");
@@ -2675,7 +2934,8 @@ mod tests {
             manifest.representation_id,
             format!("sha256:{}", manifest.encoded_sha256)
         );
-        assert_eq!(encoded, brotli_of(&body, BROTLI_QUALITY, 17, true));
+        let offsets = flush_offsets(&packed.part_ends, packed.body_bytes, PACKED_FLUSH_BYTES);
+        assert_eq!(encoded, flushed_brotli_of(&body, &offsets, 17));
         assert_eq!(unpack(&brotli_decoded(&encoded), length).unwrap(), artifact);
         assert_eq!(
             chunks,
@@ -2684,6 +2944,52 @@ mod tests {
         drop(object);
         drop(packed);
         assert_eq!(files_in(&directory), ["artifact.calque"]);
+    }
+
+    /// A flush ends a metablock at each section the gap allows, as the brotli
+    /// library's own writer does when flushed there, and the object still
+    /// restores the artifact. A gap past the body leaves the library's one
+    /// stream.
+    #[test]
+    fn a_packed_encode_flushed_at_its_sections_restores_the_artifact() {
+        let (_directory, path, artifact, digest, body) = packed_fixture("every-kind");
+        let length = artifact.len() as u64;
+        let packed = pack_artifact_controlled(&path, length, &CancellationToken::new())
+            .unwrap()
+            .unwrap();
+        let encode = |gap| {
+            let (object, chunks) = encode_packed_brotli(
+                &packed,
+                gap,
+                length,
+                &digest,
+                length,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            (std::fs::read(object.path()).unwrap(), chunks)
+        };
+        let (unflushed, _) = encode(u64::MAX);
+        assert_eq!(unflushed, brotli_of(&body, BROTLI_QUALITY, 17, true));
+        let offsets = flush_offsets(&packed.part_ends, packed.body_bytes, 1);
+        assert!(offsets.len() > 2);
+        let (flushed, chunks) = encode(1);
+        assert_ne!(flushed, unflushed);
+        assert_eq!(flushed, flushed_brotli_of(&body, &offsets, 17));
+        assert_eq!(unpack(&brotli_decoded(&flushed), length).unwrap(), artifact);
+        assert_eq!(
+            chunks,
+            chunk_digests(&artifact, DIRECT_COLUMNAR_CHUNK_BYTES as usize)
+        );
+    }
+
+    #[test]
+    fn flushes_skip_sections_until_their_gap_and_never_name_the_body_s_ends() {
+        let ends = [10, 10, 30, 35, 100, 160];
+        assert_eq!(flush_offsets(&ends, 160, 1), [10, 30, 35, 100]);
+        assert_eq!(flush_offsets(&ends, 160, 25), [30, 100]);
+        assert!(flush_offsets(&ends, 160, u64::MAX).is_empty());
+        assert_eq!(flush_offsets(&[0, 5, 8], 8, 1), [5]);
     }
 
     /// An artifact of two tables, 100 owners and `items` rows that each name
@@ -3143,7 +3449,8 @@ mod tests {
         let packed = pack_artifact_controlled(&path, length, &CancellationToken::new())
             .unwrap()
             .unwrap();
-        let size = brotli_of(&body, BROTLI_QUALITY, 17, true).len() as u64;
+        let offsets = flush_offsets(&packed.part_ends, packed.body_bytes, PACKED_FLUSH_BYTES);
+        let size = flushed_brotli_of(&body, &offsets, 17).len() as u64;
         let encode = |limit: u64, cancellation: &CancellationToken| {
             encode_packed_brotli_large_window_controlled(
                 &packed,

@@ -109,7 +109,7 @@ interface ClientGeneratedRuntime {
 // The digest of the built `@calque/react` declaration graph. It covers the
 // declarations' doc comments as well as their shapes.
 const CURRENT_REACT_DECLARATION_GRAPH_SHA256 =
-  "fdd3f55bda3cdcf9db76069b1bff33fe139a0504c2da072290590f81bb693e7a";
+  "b7f7e0dec8134a194d06f64a3081266fdaae487ac08a3b70af8d013d1fb26cc5";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const clientRoot = join(root, "client/packages/client");
@@ -1412,7 +1412,7 @@ function assertMutationSubmissionErrorShape(
     parameters[3]?.name.getText(source) !== "options" ||
     !parameters[3]?.questionToken ||
     parameters[3]?.type?.getText(source).replace(/\s+/g, " ") !==
-      'ErrorOptions & { readonly recovery?: "none"; }'
+      'ErrorOptions & { readonly recovery?: "none"; readonly conflict?: MutationConflict; }'
   ) {
     throw new Error("MutationSubmissionError constructor surface drifted");
   }

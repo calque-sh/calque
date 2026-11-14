@@ -70,13 +70,15 @@ pub(crate) fn reconnect_or_forget(state_dir: &Path, database_url_env: &str, reru
     )
 }
 
-/// The remedy for the app-owned publication no longer having its enrolled
-/// definition, which the refusal it follows describes. Neither form of
-/// `calque destroy` gets past it: destroy will not drop a publication it
-/// cannot verify, and after `--local-state-only` the next enrollment takes
-/// the same publication name and meets it again.
-pub(crate) fn restore_publication(rerun: &str) -> String {
-    format!("Restore that definition, then rerun {rerun}.")
+/// The remedy for the app-owned publication having been altered, which the
+/// refusal it follows describes. pgoutput leaves out what an altered
+/// definition does not publish, from the alteration's commit on, so the
+/// working set is prepared anew even once the definition is back. `calque
+/// destroy` drops only a publication it can verify, so the definition is
+/// restored first; after `--local-state-only` the next enrollment would take
+/// the same publication name and meet it again.
+pub(crate) fn restore_publication(destroy: Destroy<'_>, rerun: &str) -> String {
+    format!("Restore the publication's definition if it was altered, then run {destroy} and rerun {rerun} to prepare the working set anew, since the one it holds may no longer match PostgreSQL.")
 }
 
 /// The remedy a runtime whose CDC loop stopped before readiness names. A
@@ -91,7 +93,7 @@ pub(crate) fn after_stopped_runtime(
 ) -> String {
     match remedy {
         CdcStopRemedy::DestroyState => destroy.then_rerun(rerun),
-        CdcStopRemedy::RestorePublication => restore_publication(rerun),
+        CdcStopRemedy::RestorePublication => restore_publication(destroy, rerun),
         CdcStopRemedy::Rerun => format!(
             "Rerun {rerun}; if it stops again, run {destroy} and then rerun {rerun} to rebuild from a complete snapshot."
         ),
@@ -171,7 +173,7 @@ mod tests {
         );
         assert_eq!(
             after_stopped_runtime(destroy(), "dev", CdcStopRemedy::RestorePublication),
-            "Restore that definition, then rerun dev."
+            "Restore the publication's definition if it was altered, then run calque destroy --state-dir .calque-dev --database-url-env CALQUE_DATABASE_URL --yes and rerun dev to prepare the working set anew, since the one it holds may no longer match PostgreSQL."
         );
         assert_eq!(
             after_stopped_runtime(destroy(), "dev", CdcStopRemedy::Rerun),

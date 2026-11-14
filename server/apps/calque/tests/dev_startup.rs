@@ -299,3 +299,51 @@ fn a_postgres_that_never_answers_is_refused_once_the_connect_timeout_runs_out() 
     );
     assert!(postgres_connections.load(Ordering::SeqCst) >= 1);
 }
+
+/// Dev always uses the filesystem store, so an S3 variable would be ignored
+/// without a word; dev says so and touches neither the state directory nor
+/// PostgreSQL.
+#[test]
+fn an_s3_setting_is_refused_because_dev_uses_the_filesystem_store() {
+    let (database_port, postgres_connections) = counting_listener();
+    let workspace = tempfile::tempdir().unwrap();
+    let state = workspace.path().join("state");
+
+    for (name, value) in [
+        ("CALQUE_OBJECT_STORE", "s3"),
+        ("CALQUE_S3_BUCKET", "artifacts"),
+    ] {
+        let output = dev(&state, "CALQUE_DEV_STARTUP_URL")
+            .env(
+                "CALQUE_DEV_STARTUP_URL",
+                format!("postgresql://127.0.0.1:{database_port}/app"),
+            )
+            .env_remove("CALQUE_OBJECT_STORE")
+            .env_remove("CALQUE_S3_BUCKET")
+            .env(name, value)
+            .output()
+            .unwrap();
+        assert_eq!(
+            refusal(&output),
+            [format!(
+                "calque: {name} is set, but calque dev always keeps artifacts in the filesystem store under its state directory and would ignore it. Unset it to run dev, or run calque serve to use S3"
+            )]
+        );
+    }
+    assert!(!state.exists());
+    assert_eq!(postgres_connections.load(Ordering::SeqCst), 0);
+
+    let output = dev(&state, "CALQUE_DEV_STARTUP_URL")
+        .env(
+            "CALQUE_DEV_STARTUP_URL",
+            format!("postgresql://127.0.0.1:{database_port}/app"),
+        )
+        .env("CALQUE_OBJECT_STORE", "filesystem")
+        .env_remove("CALQUE_S3_BUCKET")
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("filesystem store under its state"),
+        "CALQUE_OBJECT_STORE=filesystem names what dev uses and is accepted"
+    );
+}

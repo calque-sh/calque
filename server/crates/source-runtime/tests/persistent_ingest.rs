@@ -9,7 +9,9 @@ use std::{
 };
 
 use authz::{AuthorizationPolicy, PolicyDefinition, TablePermitDefinition};
-use canonical_log::LogError;
+use canonical_log::{
+    FencedWriterIdentity, LogError, PostgresDatastoreIdentity, PostgresFencedCanonicalLog,
+};
 use mutation_api::install_metadata;
 use pg_walstream::parse_lsn;
 use postgres::{Client, NoTls};
@@ -796,6 +798,71 @@ impl GroupFixture {
         .unwrap()
     }
 
+    /// Copies the slot at its current position under a new name.
+    fn copy_slot(&mut self) -> String {
+        let copy = format!("{}_saved", self.slot);
+        self.source
+            .query_one(
+                "SELECT pg_catalog.pg_copy_logical_replication_slot($1, $2)",
+                &[&self.slot, &copy],
+            )
+            .unwrap();
+        copy
+    }
+
+    /// Drops the slot and renames `copy` to it, by copying it once more.
+    fn replace_slot_with(&mut self, copy: &str) {
+        self.source
+            .query_one(
+                "SELECT pg_catalog.pg_drop_replication_slot($1)",
+                &[&self.slot],
+            )
+            .unwrap();
+        self.source
+            .query_one(
+                "SELECT pg_catalog.pg_copy_logical_replication_slot($1, $2)",
+                &[&copy, &self.slot],
+            )
+            .unwrap();
+        self.source
+            .query_one("SELECT pg_catalog.pg_drop_replication_slot($1)", &[&copy])
+            .unwrap();
+    }
+
+    /// The log as the active session's writer, under its fence token.
+    fn writer_log(&self) -> PostgresFencedCanonicalLog {
+        let mut control = Client::connect(&self.control_url, NoTls).unwrap();
+        let token: i64 = control
+            .query_one(
+                "SELECT fence_token FROM calque_control.canonical_log_writer_fence
+                  WHERE source_id = $1",
+                &[&self.source_id.as_str()],
+            )
+            .unwrap()
+            .get(0);
+        let datastore = PostgresDatastoreIdentity::inspect(&mut control).unwrap();
+        PostgresFencedCanonicalLog::connect(
+            &self.control_url,
+            FencedWriterIdentity::new(self.source_id.clone(), self.epoch.clone(), token, datastore)
+                .unwrap(),
+            state_dir(),
+        )
+        .unwrap()
+    }
+
+    fn compacted_through(&self) -> Option<u64> {
+        Client::connect(&self.control_url, NoTls)
+            .unwrap()
+            .query_one(
+                "SELECT retired_compacted_through_lsn::text
+                   FROM calque_control.canonical_log_retention WHERE source_id = $1",
+                &[&self.source_id.as_str()],
+            )
+            .unwrap()
+            .get::<_, Option<String>>(0)
+            .map(|lsn| parse_lsn(&lsn).unwrap())
+    }
+
     /// Rewrites record `sequence` in JSON, the form an earlier release
     /// stored every entry in, with a checksum that matches the new bytes.
     fn rewrite_as_an_earlier_release(&self, sequence: i64) {
@@ -964,6 +1031,66 @@ fn a_crash_between_a_group_commit_and_its_acknowledgement_replays_the_group_once
     );
     assert_eq!(fixture.canonical_state(), (xids, flushed_lsn));
     assert_eq!(session.slot().confirmed_flush_lsn, flushed_lsn);
+
+    fixture.remove(session);
+}
+
+/// PostgreSQL writes a logical slot to disk only when a checkpoint finds it
+/// dirty, and an acknowledgement that moves neither its restart LSN nor its
+/// catalog xmin leaves it clean. A crash can therefore take the slot back past
+/// transactions Calque logged, acknowledged and then forgot in a trim. The
+/// next session starts at the trim's watermark, so it neither stops on them
+/// nor logs them twice.
+///
+/// The test keeps a copy of the slot from before the acknowledgement and puts
+/// it back in place of the slot, which is the state such a crash leaves.
+#[test]
+#[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+fn a_slot_a_crash_took_back_behind_a_trim_resumes_at_the_trim_watermark() {
+    let _logical_stream = LogicalStreamLock::acquire(&database_url().unwrap());
+    let mut fixture = GroupFixture::start("crash_behind_trim");
+    let trimmed = fixture.commit_each(&[1, 2, 3]);
+    let saved_slot = fixture.copy_slot();
+    let mut session = fixture.establish();
+    let stats = ingest_until_decided(
+        &mut session,
+        &fixture.registry,
+        &fixture.policy,
+        &fixture.config(trimmed.len()),
+        None,
+    )
+    .unwrap();
+    assert_eq!(stats.committed_transactions, trimmed.len());
+    assert_eq!(
+        slot_confirmed_lsn(&mut fixture.source, &fixture.slot),
+        stats.flushed_lsn
+    );
+
+    fixture.writer_log().retain_from(4).unwrap();
+    assert_eq!(fixture.canonical_state(), (Vec::new(), stats.flushed_lsn));
+    assert_eq!(fixture.compacted_through(), Some(stats.flushed_lsn));
+    session.shutdown().unwrap();
+    fixture.replace_slot_with(&saved_slot);
+    assert_eq!(
+        slot_confirmed_lsn(&mut fixture.source, &fixture.slot),
+        fixture.initial_lsn
+    );
+
+    let after_crash = fixture.commit_each(&[4]);
+    let mut session = fixture.take_over();
+    let stats = ingest_until_decided(
+        &mut session,
+        &fixture.registry,
+        &fixture.policy,
+        &fixture.config(1),
+        None,
+    )
+    .expect("the session must resume after the transactions the trim forgot");
+    assert_eq!(fixture.canonical_state(), (after_crash, stats.flushed_lsn));
+    assert_eq!(
+        slot_confirmed_lsn(&mut fixture.source, &fixture.slot),
+        stats.flushed_lsn
+    );
 
     fixture.remove(session);
 }
@@ -1215,6 +1342,93 @@ fn a_session_refuses_a_log_an_earlier_release_wrote_and_names_the_state_dir() {
         refused.to_string(),
         "/srv/calque/state serves a canonical log an earlier release of calque wrote, and calque does not migrate it."
     );
+
+    fixture.remove(session);
+}
+
+/// `url` with its walsender's `wal_sender_timeout` set to 2 s, which makes the
+/// session's silence bound its 5 s floor.
+fn with_short_wal_sender_timeout(url: &str) -> String {
+    format!("{url}&options=-c%20wal_sender_timeout%3D2s")
+}
+
+/// Whether `bytes` hold a standby status update that asks the server to reply
+/// at once: CopyData of 34 bytes, `r`, three WAL positions, a clock and a flag
+/// of 1.
+fn holds_a_reply_request(bytes: &[u8]) -> bool {
+    bytes.windows(39).any(|message| {
+        message[0] == b'd'
+            && message[1..5] == 38_u32.to_be_bytes()
+            && message[5] == b'r'
+            && message[38] == 1
+    })
+}
+
+/// A walsender with a 2 s `wal_sender_timeout` sends a keepalive each second
+/// the stream is idle, so a cycle longer than the session's 5 s silence bound
+/// ends at its timeout with nothing committed and the stream still open.
+#[test]
+#[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+fn an_idle_stream_its_walsender_keeps_alive_outlasts_its_silence_bound() {
+    let _logical_stream = LogicalStreamLock::acquire(&database_url().unwrap());
+    let mut fixture = GroupFixture::start("kept_alive");
+    fixture.replication_url = with_short_wal_sender_timeout(&fixture.replication_url);
+    let mut session = fixture.establish_now();
+
+    let started = Instant::now();
+    let stats = session
+        .ingest_bounded(
+            &fixture.registry,
+            &fixture.policy,
+            PersistentIngestConfig::new(state_dir())
+                .with_bounds(1, Duration::from_secs(8))
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(8));
+    assert_eq!(stats.committed_transactions, 0);
+    assert!(session.socket_is_open());
+
+    fixture.remove(session);
+}
+
+/// A stream whose server stops sending, through a relay that still forwards
+/// what the session sends, gets a status update asking for a reply, then is
+/// given up once its 5 s silence bound has passed since the last message.
+#[test]
+#[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+fn a_stream_whose_server_stops_sending_asks_for_a_reply_then_is_given_up_at_its_bound() {
+    let _logical_stream = LogicalStreamLock::acquire(&database_url().unwrap());
+    let mut fixture = GroupFixture::start("silent_stream");
+    let relay = postgres_connect::relay::SilenceableRelay::start(&fixture.source_url);
+    fixture.replication_url = with_short_wal_sender_timeout(&replication_url(relay.url()));
+    let mut session = fixture.establish_now();
+
+    relay.silence_replies();
+    let silenced = Instant::now();
+    let silent = session
+        .ingest_bounded(
+            &fixture.registry,
+            &fixture.policy,
+            PersistentIngestConfig::new(state_dir())
+                .with_bounds(1, Duration::from_secs(30))
+                .unwrap(),
+        )
+        .unwrap_err();
+    let took = silenced.elapsed();
+    assert!(
+        matches!(silent, PersistentIngestError::ReplicationSilent(bound) if bound == Duration::from_secs(5)),
+        "{silent:?}"
+    );
+    // The bound runs from the last message, at most a keepalive interval
+    // before the relay stopped forwarding.
+    assert!(
+        took >= Duration::from_secs(3) && took < Duration::from_secs(8),
+        "{took:?}"
+    );
+    assert_eq!(silent.disposition(), PersistentIngestDisposition::Retry);
+    assert!(holds_a_reply_request(&relay.sent_unanswered()));
+    assert!(!session.socket_is_open());
 
     fixture.remove(session);
 }

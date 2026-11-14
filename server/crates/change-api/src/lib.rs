@@ -1773,6 +1773,7 @@ mod tests {
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                unlisted_columns: Vec::new(),
                 columns: vec![ColumnInspection {
                     attribute_number: 1,
                     name: "id".to_owned(),
@@ -1784,6 +1785,7 @@ mod tests {
                     primary_key_ordinal: Some(1),
                     generated: false,
                     nondeterministic_collation: false,
+                    carried_as: None,
                 }],
             },
         }
@@ -1900,6 +1902,7 @@ mod tests {
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                unlisted_columns: Vec::new(),
                 columns: vec![
                     ColumnInspection {
                         attribute_number: 1,
@@ -1912,6 +1915,7 @@ mod tests {
                         primary_key_ordinal: Some(1),
                         generated: false,
                         nondeterministic_collation: false,
+                        carried_as: None,
                     },
                     ColumnInspection {
                         attribute_number: 2,
@@ -1924,6 +1928,7 @@ mod tests {
                         primary_key_ordinal: None,
                         generated: false,
                         nondeterministic_collation: false,
+                        carried_as: None,
                     },
                     ColumnInspection {
                         attribute_number: 3,
@@ -1936,6 +1941,7 @@ mod tests {
                         primary_key_ordinal: None,
                         generated: false,
                         nondeterministic_collation: false,
+                        carried_as: None,
                     },
                 ],
             },
@@ -3065,6 +3071,7 @@ mod tests {
             primary_key_ordinal: Some(key),
             generated: false,
             nondeterministic_collation: false,
+            carried_as: None,
         };
         let registered = RegisteredTable {
             table_id: table("tasks"),
@@ -3082,6 +3089,7 @@ mod tests {
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                unlisted_columns: Vec::new(),
                 columns: vec![
                     inspection(1, "tenant_id", "uuid", 1),
                     inspection(2, "id", "int8", 2),

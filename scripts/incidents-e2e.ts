@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /// <reference lib="dom" />
 /**
- * `pnpm incidents:e2e`: the incident-operations page at 1M rows in headless
+ * `pnpm incidents:e2e`: the incident-operations page at 100k rows in headless
  * Chromium, checked against PostgreSQL.
  *
  * It runs `scripts/incidents.ts --no-open --fresh`, so calque prepares the
@@ -15,7 +15,7 @@
  * directional: the source is a container on the same host.
  *
  * Usage:
- *   CALQUE_INCIDENTS_POSTGRES_PORT=55481 pnpm incidents:e2e [-- --dataset content-v1]
+ *   CALQUE_INCIDENTS_POSTGRES_PORT=55481 pnpm incidents:e2e [-- [--dataset content-v1]]
  *
  * `--dataset` passes through to `pnpm incidents` (default v1).
  * `CALQUE_INCIDENTS_ROUNDS` sets the mutation round count (default 5),
@@ -239,20 +239,50 @@ function uuidLiteral(key: string): string {
   return `'${key}'::uuid`;
 }
 
-/** `[-- --dataset v1|content-v1]`: the dataset the run seeds and checks. */
+const E2E_USAGE = "usage: pnpm incidents:e2e [-- [--dataset v1|content-v1]]";
+
+/** `[-- [--dataset v1|content-v1]]`: the dataset the run seeds and checks. */
 export function parseIncidentsE2eArguments(arguments_: readonly string[]): {
   readonly dataset: IncidentsDataset;
 } {
   const rest = arguments_[0] === "--" ? arguments_.slice(1) : arguments_;
-  if (rest.length === 0) return { dataset: "v1" };
-  const value = rest[1];
-  if (
-    rest.length === 2 &&
-    rest[0] === "--dataset" &&
-    (value === "v1" || value === "content-v1")
-  )
-    return { dataset: value };
-  throw new Error("usage: pnpm incidents:e2e [-- --dataset v1|content-v1]");
+  let dataset: IncidentsDataset | undefined;
+  for (let index = 0; index < rest.length; index += 1) {
+    const argument = rest[index];
+    const value = rest[index + 1];
+    if (
+      argument === "--dataset" &&
+      dataset === undefined &&
+      (value === "v1" || value === "content-v1")
+    ) {
+      dataset = value;
+      index += 1;
+    } else throw new Error(E2E_USAGE);
+  }
+  return { dataset: dataset ?? "v1" };
+}
+
+/** The artifacts a page's bootstrap plan selected. */
+interface PlannedRepresentation {
+  readonly encoding: string;
+  readonly encodedBytes: number;
+  readonly decodedBytes: number;
+}
+
+function plannedRepresentations(plan: unknown): PlannedRepresentation[] {
+  const artifacts = (plan as { artifacts?: unknown } | null)?.artifacts;
+  if (!Array.isArray(artifacts)) return [];
+  return artifacts.map((artifact: unknown) => {
+    const { decodedBytes, selectedRepresentation } = (artifact ?? {}) as {
+      decodedBytes?: unknown;
+      selectedRepresentation?: { encoding?: unknown; encodedBytes?: unknown };
+    };
+    return {
+      encoding: String(selectedRepresentation?.encoding),
+      encodedBytes: Number(selectedRepresentation?.encodedBytes),
+      decodedBytes: Number(decodedBytes),
+    };
+  });
 }
 
 interface Launcher {
@@ -304,12 +334,18 @@ async function startIncidents(
       throw new Error("pnpm incidents did not stop on SIGINT");
     }
   };
-  // Seeding a million rows and preparing them fresh takes minutes.
+  // Seeding the cut and preparing it fresh takes minutes.
   const deadline = Date.now() + 30 * 60_000;
   while (Date.now() < deadline) {
     const url = announcedUrl(text);
     if (url && preparation)
-      return { url, preparation, seededSeconds, output: () => text, stop };
+      return {
+        url,
+        preparation,
+        seededSeconds,
+        output: () => text,
+        stop,
+      };
     const state = await Promise.race([
       exited.then(() => "exited"),
       delay(250).then(() => "waiting"),
@@ -446,13 +482,16 @@ function reportMutationSubmissions(): void {
   };
 }
 
-/** Opens the page and waits for every panel's first complete view. */
+/**
+ * Opens the page and waits for every panel's first complete view, and returns
+ * it with what each of its bootstrap plans selected.
+ */
 async function openPage(
   browser: Browser,
   url: string,
   label: string,
   failures: string[],
-): Promise<Page> {
+): Promise<{ page: Page; plans: PlannedRepresentation[][] }> {
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1000 },
   });
@@ -462,6 +501,20 @@ async function openPage(
   page.on("console", (message) => {
     if (message.type() === "error")
       failures.push(`${label} console: ${message.text()}`);
+  });
+  const plans: Promise<PlannedRepresentation[]>[] = [];
+  page.on("response", (response) => {
+    if (
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname.endsWith("/v1/bootstrap") &&
+      response.ok()
+    )
+      plans.push(
+        response.json().then(plannedRepresentations, (error: unknown) => {
+          failures.push(`${label}: unreadable plan: ${String(error)}`);
+          return [];
+        }),
+      );
   });
   await page.goto(url);
   await page.waitForFunction(
@@ -479,7 +532,7 @@ async function openPage(
     undefined,
     { timeout: PROBE_TIMEOUT_MS, polling: 50 },
   );
-  return page;
+  return { page, plans: await Promise.all(plans) };
 }
 
 type Grid = NonNullable<IncidentsView["grid"]>;
@@ -944,7 +997,12 @@ async function main(): Promise<void> {
     assert(originalStatus);
 
     browser = await launchDemoBrowser();
-    const pageA = await openPage(browser, url, "A", failures);
+    const { page: pageA, plans: plansA } = await openPage(
+      browser,
+      url,
+      "A",
+      failures,
+    );
     const coldA = (await view(pageA)).coldLoad;
     const artifactA = await pageA.evaluate(() =>
       performance
@@ -962,9 +1020,13 @@ async function main(): Promise<void> {
         })
         .filter((entry) => entry.decodedBytes > 1024 * 1024),
     );
-    const pageB = await openPage(browser, url, "B", failures);
+    const { page: pageB, plans: plansB } = await openPage(
+      browser,
+      url,
+      "B",
+      failures,
+    );
     const coldB = (await view(pageB)).coldLoad;
-
     // The grid: the whole collection, a filter, and a sort, against SQL.
     const eventTotal = count(oracle, "SELECT count(*) FROM incidents.events");
     const wholeGrid = await settledGrid(pageA, () => true);
@@ -1247,6 +1309,7 @@ async function main(): Promise<void> {
         seededSeconds: launcher.seededSeconds ?? null,
       },
       coldLoadMs: { A: coldA, B: coldB },
+      plans: { A: plansA, B: plansB },
       gridScrolls: scrolled,
       artifactsA: artifactA,
       writes: {

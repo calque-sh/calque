@@ -215,6 +215,7 @@ interface HeaderColumn {
 interface HeaderTable {
   readonly name: string;
   readonly rows: number;
+  readonly primaryKey: readonly string[];
   readonly columns: readonly HeaderColumn[];
 }
 
@@ -235,20 +236,33 @@ function readHeader(bytes: Uint8Array): {
   return { header, payloadStart: (12 + headerLength + 7) & ~7 };
 }
 
-/** Where the last of each table's parts ends, in the header's order. */
+/**
+ * Where the last of each table's parts ends, and where its columns up to the
+ * last key column end, in the header's order.
+ */
 function tableEnds(
   bytes: Uint8Array,
-): { readonly name: string; readonly end: number }[] {
+): { readonly name: string; readonly keys: number; readonly end: number }[] {
   const { header, payloadStart } = readHeader(bytes);
-  return header.tables.map(({ name, columns }) => ({
-    name,
-    end: Math.max(
+  const endOf = (columns: readonly HeaderColumn[]) =>
+    Math.max(
       payloadStart,
       ...columns.flatMap(({ parts }) =>
         parts.map((part) => payloadStart + part.offset + part.length),
       ),
-    ),
-  }));
+    );
+  return header.tables.map(({ name, columns, primaryKey }) => {
+    const lastKey = Math.max(
+      ...primaryKey.map((field) =>
+        columns.findIndex((column) => column.name === field),
+      ),
+    );
+    return {
+      name,
+      keys: endOf(columns.slice(0, lastKey + 1)),
+      end: endOf(columns),
+    };
+  });
 }
 
 /** Reads a dictionary column's raw codes and entries out of a payload. */
@@ -1451,7 +1465,7 @@ describe("browser direct-columnar artifact", () => {
     expect(everyValue(await reordered.open())).toEqual(everyValue(workspace));
   });
 
-  test("interprets each table while the rest downloads, once the chunks from the first one on cover it", async () => {
+  test("interprets each table while the rest downloads, once the chunks from the first one on cover it, and its key index once they cover its key columns", async () => {
     const encoded = fixture();
     const binding = chunked(encoded.bytes, 96);
     const chunks = hashedChunks(encoded.bytes, 96);
@@ -1459,6 +1473,10 @@ describe("browser direct-columnar artifact", () => {
     expect(
       ends.filter(({ end }) => end <= (chunks.length - 1) * 96).length,
     ).toBeGreaterThan(1);
+    // A table whose key columns are covered a chunk before its last column.
+    expect(
+      ends.some(({ keys, end }) => Math.ceil(keys / 96) < Math.ceil(end / 96)),
+    ).toBe(true);
     const whole = everyValue(
       await openDirectColumnarArtifact(ownedBuffer(encoded.bytes), binding),
     );
@@ -1488,6 +1506,14 @@ describe("browser direct-columnar artifact", () => {
             ends
               .filter(({ end }) => end <= verified)
               .map(({ name }) => `artifact:table:${name}`),
+          );
+          expect(
+            marked(mark).filter((name) => name.startsWith("artifact:index:")),
+            `after chunk ${String(chunk.index)}`,
+          ).toEqual(
+            ends
+              .filter(({ keys }) => keys <= verified)
+              .map(({ name }) => `artifact:index:${name}`),
           );
         }
         expect(everyValue(await receiver.open())).toEqual(whole);

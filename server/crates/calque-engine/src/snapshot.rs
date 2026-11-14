@@ -24,10 +24,10 @@ use snapshot_coordinator::{
 };
 use snapshot_pipeline::{
     BarrierWaitError, BarrierWaitRequest, CanonicalHeadSignal, PublicationAdmission,
-    SnapshotBuildConnections, SnapshotBuildJobConfig, SnapshotBuildJobError, SnapshotBuildJournal,
-    SnapshotBuildRecoveryOutcome, SnapshotBuildSafetyPolicy, SnapshotBuildStage,
-    SnapshotBuildSupervisor, SnapshotPublicationReport, SnapshotPublicationRequest,
-    SnapshotWatchdogConfig, SNAPSHOT_ARTIFACT_FILE_NAME,
+    SharedBuildZstd, SnapshotBuildConnections, SnapshotBuildJobConfig, SnapshotBuildJobError,
+    SnapshotBuildJournal, SnapshotBuildRecoveryOutcome, SnapshotBuildSafetyPolicy,
+    SnapshotBuildStage, SnapshotBuildSupervisor, SnapshotPublicationReport,
+    SnapshotPublicationRequest, SnapshotWatchdogConfig, SNAPSHOT_ARTIFACT_FILE_NAME,
 };
 use sync_types::ArtifactId;
 use thiserror::Error;
@@ -44,6 +44,14 @@ use crate::{
     LOCAL_ARTIFACT_GROWTH_RESERVE_BYTES, MAX_LOCAL_ARTIFACT_BYTES,
 };
 
+/// The longest a statement runs on a snapshot build's control, DDL-guard or
+/// pressure connection, lock waits included. A request on any of the four
+/// snapshot connections that hears nothing from the server for this plus
+/// `postgres_connect::REPLY_MARGIN` fails the connection: PostgreSQL ends a
+/// statement at its own timeout well inside the margin, and a COPY that keeps
+/// streaming restarts the wait with every message. The build's watchdog ends
+/// a build that makes no progress for 60 s whatever the connections do.
+const SNAPSHOT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCAL_BARRIER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 // `wait_for_persistent_barrier` requires the polling interval to cover the
 // provider's declared maximum synchronous read duration. The PostgreSQL
@@ -141,6 +149,7 @@ impl ArtifactBuilder {
                 random_owner_id()?,
                 None,
                 MAX_LOCAL_ARTIFACT_BYTES,
+                None,
             )?;
             let outcome = recovery
                 .recover_interrupted_local(Arc::clone(&self.barrier_provider), catalog, &self.store)
@@ -176,6 +185,7 @@ impl ArtifactBuilder {
             random_owner_id()?,
             None,
             MAX_LOCAL_ARTIFACT_BYTES,
+            None,
         )?;
         self.run_build(prepared, plan, supervisor, catalog, &self.cancellation)
             .await?;
@@ -193,7 +203,7 @@ impl ArtifactBuilder {
     ) -> Result<ValidatedArtifactManifest, LocalSnapshotError> {
         let metrics = &self.metrics;
         let workers = plan.tables().len().min(2);
-        let connections = snapshot_connections(&self.database_url, workers).await?;
+        let (connections, failures) = snapshot_connections(&self.database_url, workers).await?;
         let build_started = Instant::now();
         let report = supervisor
             .run_controlled(
@@ -216,12 +226,15 @@ impl ArtifactBuilder {
                 },
             )
             .await
-            .map_err(|error| {
+            .inspect_err(|_| {
                 if !cancellation.is_cancelled() {
                     metrics.record_error(OperationErrorClass::ArtifactBuild);
                 }
-                LocalSnapshotError::Build(error)
-            })?;
+            });
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => return Err(failures.explain(error).await),
+        };
         metrics.observe_artifact_build_seconds(build_started.elapsed().as_secs_f64());
         metrics.observe_artifact_publication_seconds(
             (report
@@ -265,6 +278,7 @@ impl ArtifactBuilder {
             random_owner_id()?,
             Some(admission),
             MAX_LOCAL_ARTIFACT_BYTES,
+            None,
         )?;
         let built = self
             .run_build(prepared, plan, supervisor, catalog, cancellation)
@@ -331,6 +345,7 @@ impl ArtifactBuilder {
                 random_owner_id()?,
                 None,
                 MAX_LOCAL_ARTIFACT_BYTES,
+                None,
             )?;
             match recovery
                 .recover_interrupted_local(Arc::clone(&self.barrier_provider), catalog, &self.store)
@@ -381,6 +396,7 @@ pub(crate) async fn build_scope_artifact(
     prepared: &PreparedLocalSource,
     nonce: &str,
     decoded_bound: u64,
+    shared_build_zstd: Option<SharedBuildZstd>,
     provider: Arc<Mutex<PostgresFencedCanonicalLog>>,
     signal: &CanonicalHeadSignal,
     catalog: &mut SqliteArtifactCatalog,
@@ -409,9 +425,10 @@ pub(crate) async fn build_scope_artifact(
         random_owner_id()?,
         None,
         decoded_bound,
+        shared_build_zstd,
     )?;
     let workers = plan.tables().len().min(2);
-    let connections = snapshot_connections(database_url, workers).await?;
+    let (connections, failures) = snapshot_connections(database_url, workers).await?;
     let report = supervisor
         .run_controlled(
             provider,
@@ -425,8 +442,11 @@ pub(crate) async fn build_scope_artifact(
             cancellation,
             on_stage,
         )
-        .await
-        .map_err(LocalSnapshotError::Build);
+        .await;
+    let report = match report {
+        Ok(report) => Ok(report),
+        Err(error) => Err(failures.explain(error).await),
+    };
     // A build that ended leaves nothing to recover. One whose cleanup did not
     // finish keeps its journal for the next start's recovery.
     let _ = SnapshotBuildJournal::remove_ended(journal_root, &build_id);
@@ -468,6 +488,7 @@ pub(crate) async fn recover_scope_builds(
             random_owner_id()?,
             None,
             MAX_LOCAL_ARTIFACT_BYTES,
+            None,
         )?;
         loop {
             let outcome = supervisor
@@ -647,6 +668,7 @@ fn snapshot_supervisor(
     owner_id: SnapshotBuildOwnerId,
     admission: Option<PublicationAdmission>,
     decoded_bound: u64,
+    shared_build_zstd: Option<SharedBuildZstd>,
 ) -> Result<SnapshotBuildSupervisor, LocalSnapshotError> {
     let authorization = plan.authorization_identity();
     let workers = plan.tables().len().min(2);
@@ -737,6 +759,7 @@ fn snapshot_supervisor(
             catalog_lease_renewal_interval: Duration::from_secs(5),
             publication_cleanup_timeout: Duration::from_secs(30),
             max_encoded_representation_bytes: MAX_LOCAL_ARTIFACT_BYTES,
+            shared_build_zstd,
             admission,
         },
     })
@@ -755,39 +778,145 @@ fn local_barrier_wait_request() -> BarrierWaitRequest {
 async fn snapshot_connections(
     database_url: &DatabaseUrl,
     workers: usize,
-) -> Result<SnapshotBuildConnections, LocalSnapshotError> {
-    let control = connect_owned(database_url, PostgresConnectionFamily::SnapshotControl).await?;
-    let ddl_guard = connect_owned(database_url, PostgresConnectionFamily::SnapshotDdlGuard).await?;
-    let pressure = connect_owned(database_url, PostgresConnectionFamily::SnapshotPressure).await?;
+) -> Result<(SnapshotBuildConnections, ConnectionFailures), LocalSnapshotError> {
+    let failures = ConnectionFailures::default();
+    let control = connect_owned(
+        database_url,
+        PostgresConnectionFamily::SnapshotControl,
+        &failures,
+    )
+    .await?;
+    let ddl_guard = connect_owned(
+        database_url,
+        PostgresConnectionFamily::SnapshotDdlGuard,
+        &failures,
+    )
+    .await?;
+    let pressure = connect_owned(
+        database_url,
+        PostgresConnectionFamily::SnapshotPressure,
+        &failures,
+    )
+    .await?;
     let mut copy_workers = Vec::with_capacity(workers);
     for _ in 0..workers {
-        copy_workers
-            .push(connect_owned(database_url, PostgresConnectionFamily::SnapshotCopy).await?);
+        copy_workers.push(
+            connect_owned(
+                database_url,
+                PostgresConnectionFamily::SnapshotCopy,
+                &failures,
+            )
+            .await?,
+        );
     }
-    Ok(SnapshotBuildConnections {
+    let connections = SnapshotBuildConnections {
         control,
         ddl_guard: Some(ddl_guard),
         copy_workers,
         pressure: Some(pressure),
-    })
+    };
+    Ok((connections, failures))
+}
+
+/// Why a snapshot connection ended, for the build error that only says the
+/// connection closed. The driver reports the cause, a reply bound that ran
+/// out among them, to the task that drives the connection, and the request
+/// that was waiting sees `closed`.
+#[derive(Clone)]
+struct ConnectionFailures(Arc<tokio::sync::watch::Sender<Option<String>>>);
+
+impl Default for ConnectionFailures {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::watch::channel(None).0))
+    }
+}
+
+impl ConnectionFailures {
+    fn record(&self, family: PostgresConnectionFamily, error: &tokio_postgres::Error) {
+        let mut text = format!("{family:?}: {error}");
+        let mut source = std::error::Error::source(error);
+        while let Some(cause) = source {
+            text.push_str(&format!(": {cause}"));
+            source = cause.source();
+        }
+        self.0.send_if_modified(|failure| {
+            let first = failure.is_none();
+            if first {
+                *failure = Some(text);
+            }
+            first
+        });
+    }
+
+    /// `error`, or the failure of the connection whose closing ended the build.
+    async fn explain(&self, error: SnapshotBuildJobError) -> LocalSnapshotError {
+        if !closed_connection(&error) {
+            return LocalSnapshotError::Build(error);
+        }
+        let mut failures = self.0.subscribe();
+        let failure =
+            tokio::time::timeout(Duration::from_secs(1), failures.wait_for(Option::is_some))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|failure| failure.clone());
+        match failure {
+            Some(failure) => LocalSnapshotError::ConnectionLost(failure),
+            None => LocalSnapshotError::Build(error),
+        }
+    }
+}
+
+fn closed_connection(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut link = Some(error);
+    while let Some(error) = link {
+        if error
+            .downcast_ref::<tokio_postgres::Error>()
+            .is_some_and(tokio_postgres::Error::is_closed)
+        {
+            return true;
+        }
+        link = error.source();
+    }
+    false
 }
 
 async fn connect_owned(
     database_url: &DatabaseUrl,
     family: PostgresConnectionFamily,
+    failures: &ConnectionFailures,
 ) -> Result<tokio_postgres::Client, LocalSnapshotError> {
+    let (client, connection) = snapshot_endpoint(database_url, family)?
+        .connect_async()
+        .await
+        .map_err(|_| LocalSnapshotError::Connection)?;
+    let failures = failures.clone();
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            failures.record(family, &error);
+        }
+    });
+    Ok(client)
+}
+
+fn snapshot_endpoint(
+    database_url: &DatabaseUrl,
+    family: PostgresConnectionFamily,
+) -> Result<postgres_connect::Endpoint, LocalSnapshotError> {
     let mut endpoint = database_url
         .endpoint(family)
         .map_err(|_| LocalSnapshotError::Connection)?;
     endpoint.config_mut().application_name("calque-snapshot");
-    let (client, connection) = endpoint
-        .connect_async()
-        .await
-        .map_err(|_| LocalSnapshotError::Connection)?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    Ok(client)
+    endpoint.bound_replies(SNAPSHOT_STATEMENT_TIMEOUT);
+    // A COPY runs as long as its table takes, so only the reply bound limits
+    // the copy connections.
+    if family != PostgresConnectionFamily::SnapshotCopy {
+        endpoint.append_options(&format!(
+            "-c statement_timeout={}",
+            SNAPSHOT_STATEMENT_TIMEOUT.as_millis()
+        ));
+    }
+    Ok(endpoint)
 }
 
 /// The build and artifact id one prepared scope owns.
@@ -829,6 +958,8 @@ pub enum LocalSnapshotError {
     },
     #[error("local snapshot PostgreSQL connection failed")]
     Connection,
+    #[error("a local snapshot PostgreSQL connection ended: {0}")]
+    ConnectionLost(String),
     #[error(transparent)]
     Guard(#[from] crate::GuardError),
     #[error("local snapshot recovery failed")]
@@ -1122,6 +1253,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn every_snapshot_connection_bounds_its_replies_and_only_copy_may_run_long() {
+        let database = DatabaseUrl::parse("postgresql:///calque?host=%2Ftmp").unwrap();
+        for (family, statement_timeout) in [
+            (PostgresConnectionFamily::SnapshotControl, true),
+            (PostgresConnectionFamily::SnapshotDdlGuard, true),
+            (PostgresConnectionFamily::SnapshotPressure, true),
+            (PostgresConnectionFamily::SnapshotCopy, false),
+        ] {
+            let endpoint = snapshot_endpoint(&database, family).unwrap();
+            assert_eq!(
+                endpoint.config().get_reply_timeout(),
+                Some(&(SNAPSHOT_STATEMENT_TIMEOUT + postgres_connect::REPLY_MARGIN)),
+                "{family:?}"
+            );
+            let options = endpoint.config().get_options().unwrap_or_default();
+            assert_eq!(
+                options.contains("statement_timeout=30000"),
+                statement_timeout,
+                "{family:?}: {options}"
+            );
+        }
+    }
+
+    #[test]
     fn local_snapshot_limits_are_bounded() {
         assert_eq!(MAX_LOCAL_ARTIFACT_BYTES, 1280 * 1024 * 1024);
         let barrier = local_barrier_wait_request();
@@ -1309,6 +1464,7 @@ pub(crate) mod tests {
             owner_id.clone(),
             None,
             MAX_LOCAL_ARTIFACT_BYTES,
+            None,
         )
         .unwrap();
 

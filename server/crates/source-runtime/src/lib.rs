@@ -30,6 +30,7 @@ pub use persistent_ingest::{
     PersistentIngestBoundary, PersistentIngestConfig, PersistentIngestDisposition,
     PersistentIngestError, PersistentIngestObserver, PersistentIngestStats,
 };
+pub(crate) use publication::PUBLICATION_CHECK_INTERVAL;
 pub use publication::{inspect_owned_publication, OwnedPublication};
 pub use slot_owner::{
     establish_persistent_source, establish_persistent_source_interruptible,
@@ -106,6 +107,10 @@ const MAX_OWNER_ID_BYTES: usize = 256;
 /// The control connection's `lock_timeout`: the longest one lease operation
 /// waits for another transaction to release the lease row.
 const CONTROL_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+/// The control connection's `statement_timeout`. A request that hears nothing
+/// from the server for this long plus `postgres_connect::REPLY_MARGIN` fails
+/// the connection, so a renewal whose socket stalls returns.
+const CONTROL_STATEMENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// The pause before the first retry of a renewal that met the lease row
 /// locked. Each later pause doubles, up to `RENEWAL_RETRY_MAX_PAUSE`.
 const RENEWAL_RETRY_FIRST_PAUSE: Duration = Duration::from_millis(50);
@@ -113,7 +118,8 @@ const RENEWAL_RETRY_MAX_PAUSE: Duration = Duration::from_millis(400);
 
 // Runs on every connect and reconnect, under a 1 s lock timeout. On existing
 // tables `CREATE ... IF NOT EXISTS` takes no table lock, whereas any `ALTER
-// TABLE` here would take ACCESS EXCLUSIVE and wait behind an autovacuum.
+// TABLE` here would take ACCESS EXCLUSIVE and wait behind an autovacuum, so
+// the one column added since runs `ALTER TABLE` only while it is missing.
 const INSTALL_SQL: &str = r#"
 CREATE SCHEMA IF NOT EXISTS calque_control;
 CREATE SEQUENCE IF NOT EXISTS calque_control.source_fence_token_seq
@@ -162,8 +168,20 @@ CREATE TABLE IF NOT EXISTS calque_control.source_slot_enrollment (
     previous_timeline_id bigint NOT NULL CHECK (previous_timeline_id >= 0),
     pgoutput_profile text NOT NULL,
     initial_lsn text NOT NULL,
-    durable_canonical_lsn text NOT NULL
+    durable_canonical_lsn text NOT NULL,
+    publication_fingerprint text
 );
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_attribute
+         WHERE attrelid = 'calque_control.source_slot_enrollment'::regclass
+           AND attname = 'publication_fingerprint' AND NOT attisdropped
+    ) THEN
+        ALTER TABLE calque_control.source_slot_enrollment
+            ADD COLUMN publication_fingerprint text;
+    END IF;
+END $$;
 "#;
 
 /// A non-secret process identity used for exact lease ownership checks.
@@ -404,6 +422,14 @@ pub trait FenceStore: Send + Sync {
         &self,
         lease: &LeaseIdentity,
         durable_lsn: u64,
+    ) -> Result<(), FenceError>;
+
+    /// Records the publication fingerprint of an enrollment made before
+    /// enrollments recorded one. A recorded fingerprint is never replaced.
+    fn adopt_publication_fingerprint(
+        &self,
+        lease: &LeaseIdentity,
+        fingerprint: &str,
     ) -> Result<(), FenceError>;
 
     fn transition_active(
@@ -676,6 +702,17 @@ where
         })
     }
 
+    fn adopt_publication_fingerprint(
+        &self,
+        lease: &ProvisionalLease,
+        fingerprint: &str,
+    ) -> Result<(), FenceError> {
+        self.operate(lease, |identity| {
+            self.store
+                .adopt_publication_fingerprint(identity, fingerprint)
+        })
+    }
+
     fn activate(
         &self,
         lease: ProvisionalLease,
@@ -889,10 +926,10 @@ pub struct PostgresFenceStore {
 
 impl PostgresFenceStore {
     pub fn connect(connection_string: &str) -> Result<Self, FenceError> {
-        let mut client = postgres_connect::Endpoint::parse(connection_string)
-            .map_err(|_| store_error_unavailable())?
-            .connect()
-            .map_err(store_error)?;
+        let mut endpoint = postgres_connect::Endpoint::parse(connection_string)
+            .map_err(|_| store_error_unavailable())?;
+        endpoint.bound_replies(CONTROL_STATEMENT_TIMEOUT);
+        let mut client = endpoint.connect().map_err(store_error)?;
         configure_control_connection(&mut client)?;
         install_schema(&mut client)?;
         let datastore = PostgresDatastoreIdentity::inspect(&mut client)
@@ -1118,19 +1155,41 @@ impl FenceStore for PostgresFenceStore {
         lease: &LeaseIdentity,
     ) -> Result<Option<SlotEnrollment>, FenceError> {
         self.with_owned_lease(lease, |transaction, _current| {
-            transaction
+            let Some(row) = transaction
                 .query_opt(
                     "SELECT source_id, source_epoch, slot_name, publication_name,
                             system_identifier, database_name, timeline_id,
                             previous_timeline_id, pgoutput_profile, initial_lsn,
-                            durable_canonical_lsn
+                            durable_canonical_lsn, publication_fingerprint
                        FROM calque_control.source_slot_enrollment
                       WHERE source_id = $1",
                     &[&lease.source_id.as_str()],
                 )
                 .map_err(store_error)?
-                .map(SlotEnrollment::from_control_row)
-                .transpose()
+            else {
+                return Ok(None);
+            };
+            let mut enrollment = SlotEnrollment::from_control_row(row)?;
+            // The canonical log creates its retention table on first connect.
+            let log_installed: bool = transaction
+                .query_one(
+                    "SELECT to_regclass('calque_control.canonical_log_retention') IS NOT NULL",
+                    &[],
+                )
+                .map_err(store_error)?
+                .get(0);
+            if log_installed {
+                enrollment.retired_compacted_through_lsn_text = transaction
+                    .query_opt(
+                        "SELECT retired_compacted_through_lsn::text
+                           FROM calque_control.canonical_log_retention
+                          WHERE source_id = $1 AND source_epoch = $2",
+                        &[&lease.source_id.as_str(), &lease.source_epoch.as_str()],
+                    )
+                    .map_err(store_error)?
+                    .and_then(|row| row.get(0));
+            }
+            Ok(Some(enrollment))
         })
     }
 
@@ -1158,8 +1217,8 @@ impl FenceStore for PostgresFenceStore {
                         source_id, source_epoch, slot_name, publication_name,
                         system_identifier, database_name, timeline_id,
                         previous_timeline_id, pgoutput_profile, initial_lsn,
-                        durable_canonical_lsn
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+                        durable_canonical_lsn, publication_fingerprint
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11)
                      ON CONFLICT (source_id) DO NOTHING",
                     &[
                         &enrollment.source_id.as_str(),
@@ -1172,6 +1231,7 @@ impl FenceStore for PostgresFenceStore {
                         &previous_timeline_id,
                         &enrollment.pgoutput_profile,
                         &enrollment.initial_lsn_text,
+                        &enrollment.publication_fingerprint,
                     ],
                 )
                 .map_err(store_error)?;
@@ -1212,6 +1272,35 @@ impl FenceStore for PostgresFenceStore {
             if affected != 1 {
                 return Err(FenceError::SlotEnrollmentMismatch);
             }
+            Ok(())
+        })
+    }
+
+    fn adopt_publication_fingerprint(
+        &self,
+        lease: &LeaseIdentity,
+        fingerprint: &str,
+    ) -> Result<(), FenceError> {
+        self.with_owned_lease(lease, |transaction, current| {
+            if current.phase != LeasePhase::Provisional {
+                return Err(FenceError::WrongLeasePhase {
+                    expected: LeasePhase::Provisional,
+                    actual: current.phase,
+                });
+            }
+            transaction
+                .execute(
+                    "UPDATE calque_control.source_slot_enrollment
+                        SET publication_fingerprint = $3
+                      WHERE source_id = $1 AND source_epoch = $2
+                        AND publication_fingerprint IS NULL",
+                    &[
+                        &lease.source_id.as_str(),
+                        &lease.source_epoch.as_str(),
+                        &fingerprint,
+                    ],
+                )
+                .map_err(store_error)?;
             Ok(())
         })
     }
@@ -1469,7 +1558,8 @@ fn install_schema(client: &mut Client) -> Result<(), FenceError> {
 fn configure_control_connection(client: &mut Client) -> Result<(), FenceError> {
     client
         .batch_execute(&format!(
-            "SET synchronous_commit = on; SET statement_timeout = '2s'; SET lock_timeout = {};",
+            "SET synchronous_commit = on; SET statement_timeout = {}; SET lock_timeout = {};",
+            CONTROL_STATEMENT_TIMEOUT.as_millis(),
             CONTROL_LOCK_TIMEOUT.as_millis()
         ))
         .map_err(store_error)
@@ -1510,8 +1600,9 @@ pub enum PostgresRefusal {
     /// SQLSTATE 3D000.
     #[error("database does not exist")]
     DatabaseMissing,
-    /// The role has neither the REPLICATION nor the SUPERUSER attribute, so
-    /// PostgreSQL refuses it a walsender.
+    /// The role has neither the REPLICATION nor the SUPERUSER attribute, nor
+    /// RDS's `rds_replication` membership, so PostgreSQL refuses it a
+    /// walsender.
     #[error("replication privilege missing")]
     ReplicationPrivilegeMissing,
 }
@@ -1534,7 +1625,8 @@ impl PostgresRefusal {
         }
     }
 
-    pub(crate) fn of(error: &postgres::Error) -> Option<Self> {
+    /// The refusal `error` carries, by its SQLSTATE.
+    pub fn of(error: &postgres::Error) -> Option<Self> {
         error.code().and_then(Self::from_sqlstate)
     }
 }
@@ -1585,7 +1677,7 @@ pub enum FenceError {
     SlotLifecycleAlreadyInitialized,
     #[error("fence token sequence is exhausted")]
     TokenExhausted,
-    #[error("control store is unavailable or returned an uncertain result")]
+    #[error("the control store connection to PostgreSQL failed or returned an uncertain result; if this persists, check that PostgreSQL is running and reachable at the address in the database URL")]
     ControlStoreUnavailable,
     #[error("control store refused the connection or a statement: {0}")]
     ControlStoreRefused(PostgresRefusal),
@@ -1809,6 +1901,14 @@ mod tests {
             &self,
             _: &LeaseIdentity,
             _: u64,
+        ) -> Result<(), FenceError> {
+            unreachable!("not scripted")
+        }
+
+        fn adopt_publication_fingerprint(
+            &self,
+            _: &LeaseIdentity,
+            _: &str,
         ) -> Result<(), FenceError> {
             unreachable!("not scripted")
         }

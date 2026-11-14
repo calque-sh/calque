@@ -58,3 +58,27 @@ fn a_file_that_is_not_an_inspection_is_refused_by_its_path() {
         "{stderr}"
     );
 }
+
+#[test]
+fn the_earlier_flag_name_is_refused_with_the_current_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_calque"))
+        .args([
+            "init",
+            "--from-inspection",
+            "-",
+            "--application-id",
+            "app",
+            "--connection-env",
+            "APP_DATABASE_URL",
+        ])
+        .current_dir(directory.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "calque: --connection-env is now --database-url-env\n"
+    );
+}

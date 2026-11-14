@@ -1,0 +1,15 @@
+// `noEmit: false` overrides the `noEmit: true` of the config this extends;
+// without it `pnpm build` writes nothing and still exits 0.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts", "src/test-vectors.ts"]
+}

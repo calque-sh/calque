@@ -6,7 +6,7 @@
 //! pinned by SHA-256, and the issuer's serialization of the same claims must
 //! reproduce them. Ed25519 is deterministic, so the test-only key signs each
 //! positive payload to one token: the Rust issuer must mint it and the verifier
-//! accept it, and `scripts/grant-issuer-example.test.ts` holds the Node issuer
+//! accept it, and `client/packages/grant` holds the Node issuer
 //! to the same files.
 
 use std::collections::BTreeMap;

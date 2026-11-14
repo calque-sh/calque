@@ -44,6 +44,11 @@ pub struct Packed {
     pub hoisted: Vec<HoistedPart>,
     /// One entry per column of every table, in header order.
     pub columns: Vec<ColumnChoice>,
+    /// The body offsets at which its sections end, ascending: the preamble
+    /// with the artifact's header and the hoisted parts, then each stored
+    /// part and each stream in body order. The last is the body's length.
+    /// Empty when `stored`.
+    pub part_ends: Vec<usize>,
 }
 
 /// A part the body carries ahead of the payload.
@@ -448,6 +453,7 @@ fn pack_with(artifact: &[u8], rule: Rule, cancel: &Cancel) -> Result<Packed, Pac
             stored: true,
             hoisted: Vec::new(),
             columns: choices,
+            part_ends: Vec::new(),
         });
     }
     let mut body = Vec::with_capacity(plan.body_bytes);
@@ -458,13 +464,15 @@ fn pack_with(artifact: &[u8], rule: Rule, cancel: &Cancel) -> Result<Packed, Pac
     for &part in &hoisted {
         body.extend_from_slice(bytes_of(part));
     }
+    let mut part_ends = vec![body.len()];
     for &index in &layout.order {
         match plan.slots[index] {
             Slot::Stored => body.extend_from_slice(bytes_of(index)),
             // Each stream is freed once the body holds it.
             Slot::Stream(entry) => body.extend_from_slice(&std::mem::take(&mut streams[entry])),
-            Slot::Hoisted | Slot::Dropped => {}
+            Slot::Hoisted | Slot::Dropped => continue,
         }
+        part_ends.push(body.len());
     }
     debug_assert_eq!(body.len(), plan.body_bytes);
 
@@ -492,6 +500,7 @@ fn pack_with(artifact: &[u8], rule: Rule, cancel: &Cancel) -> Result<Packed, Pac
             })
             .collect(),
         columns: choices,
+        part_ends,
     })
 }
 

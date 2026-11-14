@@ -815,10 +815,10 @@ fn a_plan_resolves_from_its_token_until_it_expires() {
     let resolved = fixture.resolve(&token, expires_at - 1).unwrap();
     assert!(resolved.revocation.is_none());
     assert_eq!(
-        resolved.plan.scope.scope_hash(),
+        resolved.opened.plan.scope.scope_hash(),
         fixture.prepared.scope.scope_hash()
     );
-    assert_eq!(resolved.claims.expires_at_unix_micros, expires_at);
+    assert_eq!(resolved.opened.claims.expires_at_unix_micros, expires_at);
     assert!(fixture.write(&token, "device-1", expires_at - 1).is_ok());
     for now in [expires_at, expires_at + 60_000_000] {
         assert!(matches!(
@@ -938,7 +938,7 @@ fn a_request_names_the_tables_its_plan_signed() {
     ));
     let resolved = fixture.resolve(&token, 1_000_000).unwrap();
     assert_eq!(
-        resolved.table_starts,
+        resolved.opened.table_starts,
         BTreeMap::from([(fixture.table(), Some(fixture.cursor(1)))])
     );
 }
@@ -1181,6 +1181,99 @@ fn a_restart_keeps_every_plan_and_every_fence_it_loads() {
         .resolve(&fixture.serving, &incoming, incoming.request(), 1_000_002)
         .unwrap();
     assert_eq!(resolved.revocation.unwrap().ceiling, 7);
+}
+
+/// A later build of a request reads what its token proved from the plan the
+/// first build opened, and is refused from the token's expiry on.
+#[test]
+fn a_held_plan_is_refused_from_its_expiry() {
+    let fixture = fixture();
+    let token = fixture.token("plan-1", 2_000_000);
+    let incoming = fixture.request("plan-1", &token, "device-1", Some(1));
+    let mut held = None;
+    let build = |held: &mut Option<OpenedPlan>, now| {
+        fixture
+            .plans
+            .for_build(held, &fixture.serving, &incoming, incoming.request(), now)
+            .map(|(_, revocation)| revocation.is_none())
+    };
+
+    assert!(matches!(build(&mut held, 1_000_000), Ok(true)));
+    assert!(held.is_some());
+    assert!(matches!(build(&mut held, 1_999_999), Ok(true)));
+    assert!(matches!(
+        build(&mut held, 2_000_000),
+        Err(ChangeBatchError::InvalidPlanBinding)
+    ));
+}
+
+/// A fence that lands after the plan was opened applies to its next build:
+/// the plan reads up to the fence's ceiling, or is refused when the fence
+/// drafted no barrier for its scope.
+#[test]
+fn a_held_plan_meets_a_fence_that_landed_after_it_was_opened() {
+    for (scopes, ceiling) in [(vec![fixture().scope_hash()], Some(7)), (Vec::new(), None)] {
+        let fixture = fixture();
+        let token = fixture.token("plan-1", 2_000_000);
+        let incoming = fixture.request("plan-1", &token, "device-1", Some(1));
+        let mut held = None;
+        let opened = fixture
+            .plans
+            .for_build(
+                &mut held,
+                &fixture.serving,
+                &incoming,
+                incoming.request(),
+                1_000_000,
+            )
+            .unwrap();
+        assert!(opened.1.is_none());
+
+        fixture.fence(&scopes, 7, 1_000_001);
+        let built = fixture.plans.for_build(
+            &mut held,
+            &fixture.serving,
+            &incoming,
+            incoming.request(),
+            1_000_002,
+        );
+        match ceiling {
+            Some(ceiling) => assert_eq!(built.unwrap().1.unwrap().ceiling, ceiling),
+            None => assert!(matches!(built, Err(ChangeBatchError::AuthorizationExpired))),
+        }
+    }
+}
+
+/// A plan opened under a generation that the serving authorization has moved
+/// past is refused, as a new request with its token would be.
+#[test]
+fn a_held_plan_is_refused_once_its_generation_stops_being_served() {
+    let fixture = fixture();
+    let token = fixture.token("plan-1", 2_000_000);
+    let incoming = fixture.request("plan-1", &token, "device-1", Some(1));
+    let mut held = None;
+    fixture
+        .plans
+        .for_build(
+            &mut held,
+            &fixture.serving,
+            &incoming,
+            incoming.request(),
+            1_000_000,
+        )
+        .unwrap();
+
+    let moved = plans_for(&fixture.prepared, 1, fixture.generation() + 1);
+    assert!(matches!(
+        moved.for_build(
+            &mut held,
+            &fixture.serving,
+            &incoming,
+            incoming.request(),
+            1_000_001,
+        ),
+        Err(ChangeBatchError::AuthorizationExpired)
+    ));
 }
 
 const BARRIER_AUDIENCE: &str = "calque-revocation-test";
@@ -1713,6 +1806,7 @@ fn memory_policy_charges_active_state_only_for_complete_residency() {
         required_tables: BTreeSet::from([table.clone()]),
         resident_state_proof: None,
         resident_tables: BTreeSet::new(),
+        resident_cursor: None,
         cached_artifact_hints: BTreeSet::new(),
         accepted_encodings: vec![RepresentationEncoding::Identity],
         memory_budget_bytes: 1_000,

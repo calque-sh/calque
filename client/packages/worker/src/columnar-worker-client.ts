@@ -94,6 +94,11 @@ export interface AppliedChangeBatch {
 export interface ApplyChangeOptions {
   /** The terms of the fenced catch-up request the batches answer. */
   readonly fence?: ColumnarChangeFence;
+  /**
+   * The plan the request named, once a renewal has replaced the one the
+   * mount opened under.
+   */
+  readonly planId?: string;
 }
 
 interface MaterializedRows {
@@ -280,6 +285,7 @@ export class EngineWorkerClient {
         type: "change",
         batches,
         ...(options.fence === undefined ? {} : { fence: options.fence }),
+        ...(options.planId === undefined ? {} : { planId: options.planId }),
       },
       [],
     );

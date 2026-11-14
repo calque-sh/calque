@@ -7,6 +7,11 @@
 //! The same connection string therefore means the same thing to libpq, which
 //! carries replication, and to the Rust driver, which carries everything else.
 //!
+//! Every connection opens with [`session_options`] in its startup `options`
+//! parameter, so a role or database default such as
+//! `ALTER ROLE ... SET DateStyle` never reaches a session Calque reads values
+//! from.
+//!
 //! [`DropOffRuntime`] holds a blocking connection that may be dropped on a
 //! thread driving a tokio runtime.
 
@@ -14,6 +19,7 @@ use std::{
     borrow::Cow,
     path::Path,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 
 use percent_encoding::percent_decode_str;
@@ -26,8 +32,43 @@ use tokio_postgres::{config::SslMode, tls::MakeTlsConnect, Socket};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 mod close;
+#[cfg(feature = "test-relay")]
+pub mod relay;
 
 pub use close::DropOffRuntime;
+
+/// How long past a session's `statement_timeout` a request waits for the
+/// server's next message before its connection fails. PostgreSQL's own
+/// cancellation arrives well inside it, so only a server or proxy that has
+/// stopped answering runs it out.
+pub const REPLY_MARGIN: Duration = Duration::from_secs(3);
+
+/// The settings every Calque session pins, as `name=value` pairs. Text values
+/// that reach the decoders depend on them: ISO dates and timestamps, UTC
+/// offsets, hex `bytea` and shortest round-trip floats.
+pub const SESSION_SETTINGS: [(&str, &str); 4] = [
+    ("TimeZone", "UTC"),
+    ("DateStyle", "ISO,MDY"),
+    ("bytea_output", "hex"),
+    ("extra_float_digits", "1"),
+];
+
+/// [`SESSION_SETTINGS`] as the startup `options` parameter reads them:
+/// `-c TimeZone=UTC -c DateStyle=ISO,MDY ...`.
+pub fn session_options() -> String {
+    SESSION_SETTINGS
+        .iter()
+        .map(|(name, value)| format!("-c {name}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The value of a libpq URL's `options` query parameter that pins
+/// [`SESSION_SETTINGS`], percent-encoded because libpq reads `+` literally.
+pub fn session_options_url_value() -> String {
+    percent_encoding::utf8_percent_encode(&session_options(), percent_encoding::NON_ALPHANUMERIC)
+        .to_string()
+}
 
 /// The connection a [`Endpoint::connect_async`] caller drives to completion.
 pub type Connection =
@@ -68,7 +109,20 @@ impl Endpoint {
                 plaintext().clone()
             }
         };
-        Ok(Self { config, tls })
+        let mut endpoint = Self { config, tls };
+        endpoint.append_options(&session_options());
+        Ok(endpoint)
+    }
+
+    /// Adds startup `options` after the ones already set, which include
+    /// [`session_options`]. PostgreSQL applies the last `-c` for a name.
+    pub fn append_options(&mut self, options: &str) -> &mut Self {
+        let combined = match self.config.get_options() {
+            Some(existing) => format!("{existing} {options}"),
+            None => options.to_owned(),
+        };
+        self.config.options(combined);
+        self
     }
 
     pub fn config(&self) -> &tokio_postgres::Config {
@@ -77,6 +131,16 @@ impl Endpoint {
 
     pub fn config_mut(&mut self) -> &mut tokio_postgres::Config {
         &mut self.config
+    }
+
+    /// Fails the connection with `io::ErrorKind::TimedOut` once a request has
+    /// waited `statement_timeout` plus [`REPLY_MARGIN`] for the server's next
+    /// message. `statement_timeout` is the longest the session lets a
+    /// statement run, lock waits included.
+    pub fn bound_replies(&mut self, statement_timeout: Duration) -> &mut Self {
+        self.config
+            .reply_timeout(statement_timeout.saturating_add(REPLY_MARGIN));
+        self
     }
 
     pub fn uses_tls(&self) -> bool {
@@ -244,6 +308,39 @@ fn plaintext() -> &'static MakeRustlsConnect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_endpoint_pins_the_session_settings_after_any_options_it_was_given() {
+        let expected =
+            "-c TimeZone=UTC -c DateStyle=ISO,MDY -c bytea_output=hex -c extra_float_digits=1";
+        assert_eq!(session_options(), expected);
+        let plain = Endpoint::parse("postgresql://user@127.0.0.1/app").unwrap();
+        assert_eq!(plain.config().get_options(), Some(expected));
+        let mut given = Endpoint::parse(
+            "postgresql://user@127.0.0.1/app?options=-c%20TimeZone%3DEurope%2FParis",
+        )
+        .unwrap();
+        assert_eq!(
+            given.config().get_options(),
+            Some(format!("-c TimeZone=Europe/Paris {expected}").as_str())
+        );
+        given.append_options("-c statement_timeout=5");
+        assert_eq!(
+            given.config().get_options(),
+            Some(format!("-c TimeZone=Europe/Paris {expected} -c statement_timeout=5").as_str())
+        );
+    }
+
+    #[test]
+    fn replies_are_bounded_a_margin_past_the_statement_timeout() {
+        let mut endpoint = Endpoint::parse("postgresql://user@127.0.0.1/app").unwrap();
+        assert_eq!(endpoint.config().get_reply_timeout(), None);
+        endpoint.bound_replies(Duration::from_secs(2));
+        assert_eq!(
+            endpoint.config().get_reply_timeout(),
+            Some(&Duration::from_secs(5))
+        );
+    }
 
     fn bundle() -> (tempfile::TempDir, String) {
         let directory = tempfile::tempdir().unwrap();

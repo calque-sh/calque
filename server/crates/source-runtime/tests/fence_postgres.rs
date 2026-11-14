@@ -6,6 +6,7 @@ use std::{
 };
 
 use postgres::{Client, NoTls, Transaction};
+use postgres_connect::relay::SilenceableRelay;
 use source_runtime::{
     AcquireRequest, FenceAuthority, FenceError, FenceStore, LeasePhase, OwnerId, PostgresFenceStore,
 };
@@ -340,6 +341,46 @@ fn uncertain_control_store_result_revokes_the_local_guard() {
         authority.renew(&lease, Duration::from_secs(1)),
         Err(FenceError::LeaseLost)
     ));
+}
+
+/// A renewal whose server stops answering mid-request fails once the control
+/// connection's reply timeout runs out, and revokes the lease, where it used
+/// to wait on the socket without end.
+#[test]
+#[ignore = "requires CALQUE_CONTROL_DATABASE_URL or TEST_DATABASE_URL"]
+fn a_renewal_whose_server_stops_answering_fails_once_the_reply_timeout_runs_out() {
+    let url = database_url().expect("live control-store database URL");
+    let relay = SilenceableRelay::start(&url);
+    let source_id = unique_source("fence-silent");
+    let epoch = SourceEpoch::new("epoch-1").unwrap();
+    let store = PostgresFenceStore::connect(relay.url()).unwrap();
+    store.enroll_source(&source_id, &epoch).unwrap();
+    let authority = FenceAuthority::new(store);
+    let ttl = Duration::from_secs(30);
+    let lease = authority
+        .acquire(request(&source_id, &epoch, "runtime-a", 30_000))
+        .unwrap();
+    authority.renew(&lease, ttl).unwrap();
+
+    relay.silence();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let started = Instant::now();
+        let result = authority.renew(&lease, ttl);
+        let _ = sender.send((result, started.elapsed(), lease.is_locally_valid()));
+    });
+    let (result, elapsed, locally_valid) = receiver
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the renewal on a silent socket had not returned after 15 s");
+    assert!(
+        matches!(result, Err(FenceError::ControlStoreUnavailable)),
+        "{result:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(8),
+        "the renewal returned after {elapsed:?}"
+    );
+    assert!(!locally_valid);
 }
 
 /// Locks the source's lease row from another connection, as a canonical

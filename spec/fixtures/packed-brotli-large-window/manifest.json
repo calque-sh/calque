@@ -4,8 +4,8 @@
   "bodyVersion": 1,
   "decodedBytes": 72714,
   "decodedSha256": "61cca5e2940d13d63c71c4cc29a25f83501e5f55549e5cdb69febb29683e594a",
-  "encodedBytes": 17764,
-  "encodedSha256": "0a23fd8ad47239a74838c18317f6922277c1bca543b7a7c3c6b8df8059d1f840",
+  "encodedBytes": 17741,
+  "encodedSha256": "998d40146422a62c9b062f42db2fc55294200961f2b72e8cee5c18b5c035b679",
   "encoder": "brotli crate 8.0.4",
   "quality": 11,
   "windowBits": 17

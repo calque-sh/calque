@@ -2051,6 +2051,7 @@ mod tests {
             is_partition: false,
             has_publication_row_filter: false,
             has_publication_column_list: false,
+            unlisted_columns: Vec::new(),
             columns: vec![ColumnInspection {
                 attribute_number: 1,
                 name: "id".to_owned(),
@@ -2062,6 +2063,7 @@ mod tests {
                 primary_key_ordinal: Some(1),
                 generated: false,
                 nondeterministic_collation: false,
+                carried_as: None,
             }],
         };
         let tables = vec![inspection("tasks", 16_384), inspection("users", 16_385)];

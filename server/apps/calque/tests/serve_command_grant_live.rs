@@ -69,6 +69,27 @@ fn database_url() -> String {
         .expect("TEST_DATABASE_URL is required; run through scripts/live-postgres-suite.sh")
 }
 
+/// `url` with `database` as its database and, when given, `credentials` as
+/// its role and password.
+fn url_for(url: &str, credentials: Option<(&str, &str)>, database: &str) -> String {
+    let (scheme, rest) = url.split_once("://").expect("a URL has a scheme");
+    let (userinfo, location) = rest.rsplit_once('@').expect("the suite's URL names a role");
+    let (host, path) = location
+        .split_once('/')
+        .expect("the suite's URL names a database");
+    let query = path.split_once('?').map_or("", |(_, query)| query);
+    let userinfo = credentials.map_or_else(
+        || userinfo.to_owned(),
+        |(role, password)| format!("{role}:{password}"),
+    );
+    let query = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{query}")
+    };
+    format!("{scheme}://{userinfo}@{host}/{database}{query}")
+}
+
 fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -93,6 +114,13 @@ struct Fixture {
     suffix: String,
     directory: tempfile::TempDir,
     issuer: GrantIssuer,
+    /// The connection that owns the tables and the publication.
+    owner_url: String,
+    /// The connection `calque serve` and `calque destroy` get.
+    serve_url: String,
+    /// The database and role [`Fixture::least_privilege`] made, which
+    /// [`Fixture::drop_source`] drops.
+    least_privilege: Option<String>,
 }
 
 impl Fixture {
@@ -103,7 +131,44 @@ impl Fixture {
             issuer: GrantIssuer::generate("live-command-grant-key", GRANT_AUDIENCE)
                 .unwrap()
                 .0,
+            owner_url: database_url(),
+            serve_url: database_url(),
+            least_privilege: None,
         }
+    }
+
+    /// A dataset in a database of its own, whose tables the suite's role
+    /// owns, served by a role that owns nothing there. That role may log in
+    /// and replicate, create Calque's schemas in the database, and select,
+    /// insert, update and delete the tables' rows; nothing more. The
+    /// publication is left to the test.
+    fn least_privilege(name: &str) -> Self {
+        let mut fixture = Self::new(name);
+        let name = format!("calque_lp_{}", fixture.suffix);
+        let password = uuid::Uuid::new_v4().simple().to_string();
+        let mut suite = Client::connect(&database_url(), NoTls).unwrap();
+        suite
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .unwrap();
+        suite
+            .batch_execute(&format!(
+                "CREATE ROLE {name} LOGIN REPLICATION PASSWORD '{password}'"
+            ))
+            .unwrap();
+        fixture.least_privilege = Some(name.clone());
+        fixture.owner_url = url_for(&database_url(), None, &name);
+        fixture.serve_url = url_for(&database_url(), Some((&name, &password)), &name);
+        fixture.seed_tables();
+        let mut owner = Client::connect(&fixture.owner_url, NoTls).unwrap();
+        owner
+            .batch_execute(&format!(
+                "GRANT CREATE ON DATABASE {name} TO {name};
+                 GRANT SELECT, INSERT, UPDATE, DELETE ON {tasks}, {notes} TO {name};",
+                tasks = fixture.tasks(),
+                notes = fixture.notes(),
+            ))
+            .unwrap();
+        fixture
     }
 
     fn tasks(&self) -> String {
@@ -151,7 +216,24 @@ impl Fixture {
     }
 
     fn seed(&self) {
-        let mut client = Client::connect(&database_url(), NoTls).unwrap();
+        self.seed_tables();
+        self.publish();
+    }
+
+    fn publish(&self) {
+        Client::connect(&self.owner_url, NoTls)
+            .unwrap()
+            .batch_execute(&format!(
+                "CREATE PUBLICATION {publication} FOR TABLE {tasks}, {notes}",
+                tasks = self.tasks(),
+                notes = self.notes(),
+                publication = self.publication(),
+            ))
+            .unwrap();
+    }
+
+    fn seed_tables(&self) {
+        let mut client = Client::connect(&self.owner_url, NoTls).unwrap();
         client
             .batch_execute(&format!(
                 "CREATE TABLE {tasks} (
@@ -164,11 +246,9 @@ impl Fixture {
                      body text NOT NULL
                  );
                  ALTER TABLE {tasks} REPLICA IDENTITY FULL;
-                 ALTER TABLE {notes} REPLICA IDENTITY FULL;
-                 CREATE PUBLICATION {publication} FOR TABLE {tasks}, {notes};",
+                 ALTER TABLE {notes} REPLICA IDENTITY FULL;",
                 tasks = self.tasks(),
                 notes = self.notes(),
-                publication = self.publication(),
             ))
             .unwrap();
         let mut transaction = client.transaction().unwrap();
@@ -196,6 +276,16 @@ impl Fixture {
         let Ok(mut client) = Client::connect(&database_url(), NoTls) else {
             return;
         };
+        if let Some(name) = &self.least_privilege {
+            let _ = client.batch_execute(&format!(
+                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
+                     WHERE slot_name = '{}'",
+                self.slot()
+            ));
+            let _ = client.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"));
+            let _ = client.batch_execute(&format!("DROP ROLE IF EXISTS {name}"));
+            return;
+        }
         let _ = client.batch_execute(&format!(
             "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
                  WHERE slot_name = '{slot}';
@@ -220,7 +310,7 @@ impl Fixture {
             "protocol": { "manifest": 1, "artifact": 1, "changeStream": 1, "mutation": 1 },
             "sources": [{
                 "id": self.source_id(),
-                "connectionEnv": DATABASE_ENV,
+                "databaseUrlEnv": DATABASE_ENV,
                 "publication": self.publication(),
                 "slot": self.slot(),
             }],
@@ -284,7 +374,7 @@ impl Fixture {
     }
 
     fn title_of(&self, row: u64) -> Option<String> {
-        let mut client = Client::connect(&database_url(), NoTls).unwrap();
+        let mut client = Client::connect(&self.owner_url, NoTls).unwrap();
         client
             .query_opt(
                 &format!("SELECT title FROM {} WHERE id = $1", self.tasks()),
@@ -295,7 +385,7 @@ impl Fixture {
     }
 
     fn body_of(&self, row: u64) -> Option<String> {
-        let mut client = Client::connect(&database_url(), NoTls).unwrap();
+        let mut client = Client::connect(&self.owner_url, NoTls).unwrap();
         client
             .query_opt(
                 &format!("SELECT body FROM {} WHERE id = $1", self.notes()),
@@ -306,7 +396,7 @@ impl Fixture {
     }
 
     fn task_count(&self) -> i64 {
-        let mut client = Client::connect(&database_url(), NoTls).unwrap();
+        let mut client = Client::connect(&self.owner_url, NoTls).unwrap();
         client
             .query_one(&format!("SELECT count(*) FROM {}", self.tasks()), &[])
             .unwrap()
@@ -314,7 +404,7 @@ impl Fixture {
     }
 
     fn receipt_count(&self, mutation_id: &str) -> i64 {
-        let mut client = Client::connect(&database_url(), NoTls).unwrap();
+        let mut client = Client::connect(&self.serve_url, NoTls).unwrap();
         client
             .query_one(
                 "SELECT count(*) FROM calque_internal.mutation_receipts WHERE mutation_id = $1",
@@ -415,7 +505,7 @@ fn serve_with_key(fixture: &Fixture, key_environment: &str) -> Serving {
             "--port",
             &port.to_string(),
         ])
-        .env(DATABASE_ENV, database_url())
+        .env(DATABASE_ENV, &fixture.serve_url)
         .env(GRANT_KEY_ENV, key_environment)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1293,4 +1383,161 @@ fn rewrite_payload(token: &str, from: &str, to: &str) -> String {
     let rewritten = decoded.replace(from, to);
     assert_ne!(rewritten, decoded, "the rewrite must change the payload");
     format!("{}.{signature}", URL_SAFE_NO_PAD.encode(rewritten))
+}
+
+/// Calque's role needs to own nothing. The tables and the publication belong
+/// to another role, as an operator's would, and serve's role has only LOGIN,
+/// REPLICATION, CREATE on the database for Calque's own schemas, and row
+/// privileges on the tables. Before the publication exists, serve refuses
+/// and prints the statement the tables' owner runs; once it does, serve
+/// writes a row, and `calque destroy` keeps the publication it did not make.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn a_role_that_owns_no_table_serves_writes_and_destroys_without_dropping_the_publication() {
+    let _exclusive = exclusive();
+    let fixture = Fixture::least_privilege("leastpriv");
+
+    let refused = serve_until_exit(&fixture);
+    let statement = format!(
+        "CREATE PUBLICATION \"{}\" FOR TABLE \"public\".\"{}\", \"public\".\"{}\";",
+        fixture.publication(),
+        fixture.notes(),
+        fixture.tasks(),
+    );
+    assert!(
+        refused.contains(&format!(
+            "the PostgreSQL publication {} does not exist, and Calque's role cannot create it \
+             because it does not own",
+            fixture.publication()
+        )) && refused.contains(&statement),
+        "{refused}"
+    );
+
+    fixture.publish();
+    let serving = serve(&fixture);
+    let grant = fixture.grant(
+        vec![capability(
+            &fixture.tasks(),
+            &[GrantCommandOperation::Update],
+        )],
+        1,
+        unix_seconds(),
+        600,
+    );
+    let plan = bootstrap(
+        serving.port,
+        &grant,
+        &[
+            format!("public.{}", fixture.tasks()),
+            format!("public.{}", fixture.notes()),
+        ],
+    );
+    let written = update(
+        &plan,
+        plan.table(&fixture.tasks()),
+        row_id(0),
+        "title",
+        "written by a role that owns nothing",
+    );
+    assert_eq!(
+        outcome_code(&post_mutation(serving.port, &grant, &plan, written)),
+        MutationOutcomeCode::AcceptedAwaitingCanonicalEcho as i32
+    );
+    assert_eq!(
+        fixture.title_of(0).as_deref(),
+        Some("written by a role that owns nothing")
+    );
+    assert!(serving.shutdown(), "serve must exit cleanly on SIGTERM");
+
+    let destroyed = Command::new(env!("CARGO_BIN_EXE_calque"))
+        .args([
+            "destroy",
+            "--state-dir",
+            fixture.directory.path().join("state").to_str().unwrap(),
+            "--database-url-env",
+            DATABASE_ENV,
+            "--yes",
+        ])
+        .env(DATABASE_ENV, &fixture.serve_url)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&destroyed.stdout);
+    assert!(
+        destroyed.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&destroyed.stderr)
+    );
+    assert!(
+        stdout.contains(&format!(
+            "Kept the publication {}, which another role owns.",
+            fixture.publication()
+        )),
+        "{stdout}"
+    );
+    let mut owner = Client::connect(&fixture.owner_url, NoTls).unwrap();
+    let mut count =
+        |sql: &str, name: String| -> i64 { owner.query_one(sql, &[&name]).unwrap().get(0) };
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM pg_catalog.pg_publication WHERE pubname = $1",
+            fixture.publication()
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+            fixture.slot()
+        ),
+        0
+    );
+    fixture.drop_source();
+}
+
+/// Runs `calque serve` for a start it must refuse, and returns its stderr.
+fn serve_until_exit(fixture: &Fixture) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_calque"))
+        .args([
+            "serve",
+            "--config",
+            fixture.config().to_str().unwrap(),
+            "--state-dir",
+            fixture.directory.path().join("state").to_str().unwrap(),
+            "--grant-audience",
+            GRANT_AUDIENCE,
+            "--grant-verification-key-env",
+            GRANT_KEY_ENV,
+            "--allow-origin",
+            "http://127.0.0.1:5173",
+            "--port",
+            &reserved_port().to_string(),
+        ])
+        .env(DATABASE_ENV, &fixture.serve_url)
+        .env(
+            GRANT_KEY_ENV,
+            fixture.issuer.verification_key_environment().unwrap(),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            assert!(!status.success(), "serve started: {stderr}");
+            return stderr;
+        }
+        if started.elapsed() > READY_TIMEOUT {
+            let _ = child.kill();
+            panic!("serve neither started nor refused within {READY_TIMEOUT:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

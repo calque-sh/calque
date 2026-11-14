@@ -81,9 +81,7 @@ describe.each(workers)(
       const original = Object.getOwnPropertyDescriptor(globalThis, "Worker");
       try {
         Reflect.deleteProperty(globalThis, "Worker");
-        expect(create).toThrow(
-          "this runtime has no Worker constructor; Calque runs only in Chromium-based browsers",
-        );
+        expect(create).toThrow("this runtime has no Worker constructor");
       } finally {
         if (original) Object.defineProperty(globalThis, "Worker", original);
       }

@@ -17,6 +17,10 @@ services:
       - "max_replication_slots=10"
       - "-c"
       - "max_wal_senders=10"
+      # A stopped Calque's slot gives up past this much held-back WAL instead
+      # of filling the disk (docs/postgresql.md, "Protecting the primary's disk").
+      - "-c"
+      - "max_slot_wal_keep_size=10GB"
       - "-c"
       - "timezone=UTC"
     healthcheck:

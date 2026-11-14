@@ -356,6 +356,8 @@ interface BatchOptions {
   readonly commitTimes?: readonly bigint[];
   /** Mutation ids the batch end acknowledges. */
   readonly acknowledgedMutationIds?: readonly string[];
+  /** The plan the batch answers; the session's own unless given. */
+  readonly planId?: string;
 }
 
 async function encodeBatch(
@@ -379,7 +381,7 @@ async function encodeBatch(
             : { requestedFence: cursor(options.requestedFence) }),
           tableIds: CONTRACT.tables.map((table) => table.tableId).sort(),
           serverTimeUnixMicros: 1n,
-          planId: PLAN_ID,
+          planId: options.planId ?? PLAN_ID,
           tableStarts: CONTRACT.tables
             .map((table) => ({
               tableId: table.tableId,
@@ -877,7 +879,9 @@ function liveMount(
     ) {
       const decoded = await decodeColumnarChangeBatches(
         batches,
-        binding,
+        options?.planId === undefined
+          ? binding
+          : { ...binding, planId: options.planId },
         current,
         options?.fence,
       );
@@ -2393,6 +2397,67 @@ describe("a mutation applies optimistically through the wire operation grammar",
     expect(() => decodeOptimisticMutation("m-1", [], binding)).toThrow(
       /at least one operation/u,
     );
+  });
+});
+
+describe("a renewed plan names every later request", () => {
+  test("the request in flight keeps its terms, and each batch answers its own request's plan", async () => {
+    const source = seedState();
+    const base = await encodeAt(source, "cursor-0");
+    const mount = liveMount(overlayOver(base.workspace), "cursor-0");
+    const first = await encodeBatch("cursor-0", "cursor-1", [
+      { cursor: "cursor-1", operations: TAIL[0]?.operations ?? [] },
+    ]);
+    const second = await encodeBatch(
+      "cursor-1",
+      "cursor-2",
+      [{ cursor: "cursor-2", operations: TAIL[1]?.operations ?? [] }],
+      { planId: "plan-renewed" },
+    );
+    const requests: {
+      readonly planId: string;
+      readonly token: string;
+      readonly from: string;
+    }[] = [];
+    const answers: ((response: Response) => void)[] = [];
+    const failures: unknown[] = [];
+    const session = liveSession(
+      mount,
+      (_input, init) => {
+        const request = fromBinary(
+          change.ChangeRequestSchema,
+          init?.body as Uint8Array,
+        );
+        requests.push({
+          planId: request.planId,
+          token: utf8.decode(request.authorizationScopeToken),
+          from: utf8.decode(
+            request.fromCursorExclusive?.token ?? new Uint8Array(),
+          ),
+        });
+        if (requests.length > 2) return heldOpen(init);
+        return new Promise((resolve) => answers.push(resolve));
+      },
+      { onFailed: (error) => failures.push(error) },
+    );
+    session.start();
+    await vi.waitFor(() => expect(requests).toHaveLength(1));
+    session.renew({
+      planId: "plan-renewed",
+      authorizationScopeToken: "scope-renewed",
+    });
+    answers[0]?.(new Response(first.slice() as unknown as BodyInit));
+    await vi.waitFor(() => expect(requests).toHaveLength(2));
+    answers[1]?.(new Response(second.slice() as unknown as BodyInit));
+    await vi.waitFor(() => expect(requests).toHaveLength(3));
+    await session.stopped();
+    expect(failures).toEqual([]);
+    expect(mount.applied).toEqual(["cursor-1", "cursor-2"]);
+    expect(requests).toEqual([
+      { planId: PLAN_ID, token: "scope-token", from: "cursor-0" },
+      { planId: "plan-renewed", token: "scope-renewed", from: "cursor-1" },
+      { planId: "plan-renewed", token: "scope-renewed", from: "cursor-2" },
+    ]);
   });
 });
 

@@ -298,6 +298,19 @@ impl Dev {
     fn stderr(&self) -> Vec<String> {
         self.stderr_tail.lock().unwrap().iter().cloned().collect()
     }
+
+    /// Waits for a stderr line containing `text`, which the reader thread
+    /// may still be taking in after `dev` has exited.
+    fn says(&self, text: &str) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            if self.stderr().iter().any(|line| line.contains(text)) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
 }
 
 /// `calque dev` on the fixture's table and state directory.
@@ -592,6 +605,12 @@ fn dev_stops_and_releases_its_lease_on_sighup() {
     let (status, took) = dev.exit_within(STOP_TIMEOUT);
     assert!(status.success(), "{status} after {took:?}");
     assert_eq!(fixture.lease(), ("unowned".to_owned(), None, None));
+    assert!(
+        dev.says("stopping: received SIGHUP, so the terminal that started calque dev closed"),
+        "{:#?}",
+        dev.stderr()
+    );
+    assert!(dev.says("stopped"), "{:#?}", dev.stderr());
 }
 
 /// A PostgreSQL that closes every connection and then accepts new ones
@@ -625,14 +644,21 @@ fn dev_stops_on_sigterm_while_its_postgres_accepts_connections_and_never_answers
         "{status} after {took:?}: {:#?}",
         dev.stderr()
     );
+    assert!(
+        dev.says("stopping: received SIGTERM"),
+        "{:#?}",
+        dev.stderr()
+    );
+    assert!(dev.says("stopped"), "{:#?}", dev.stderr());
 }
 
-/// A PostgreSQL that freezes with every connection open holds change capture
-/// in a query that never returns. `dev` exits `STOP_BOUND` after SIGTERM
-/// anyway, and says it did not finish stopping.
+/// A PostgreSQL that freezes with every connection open leaves the source's
+/// requests unanswered. Each fails once its reply bound runs out, so `dev`
+/// finishes its stop before `STOP_BOUND`, exits 1 and says the cleanup
+/// failed; the watchdog behind `STOP_BOUND` never fires.
 #[test]
 #[ignore = "requires TEST_DATABASE_URL"]
-fn dev_exits_within_its_stop_bound_when_its_postgres_freezes() {
+fn dev_stops_before_its_stop_bound_when_its_postgres_freezes() {
     let _one = exclusive();
     let fixture = Fixture::create();
     let proxy = Proxy::start();
@@ -645,12 +671,18 @@ fn dev_exits_within_its_stop_bound_when_its_postgres_freezes() {
     dev.signal("-TERM");
     let (status, took) = dev.exit_within(STOP_BOUND + Duration::from_secs(10));
     assert_eq!(status.code(), Some(1), "{status} after {took:?}");
-    assert!(
-        dev.stderr().iter().any(|line| line
-            == "calque: the stop did not finish within 10 s, so calque exited without finishing it; its source lease expires on its own"),
-        "{:#?}",
-        dev.stderr()
-    );
+    assert!(took < STOP_BOUND, "{took:?}: {:#?}", dev.stderr());
+    let exited = Instant::now();
+    while dev.stderr().last().map(String::as_str)
+        != Some("calque: persistent CDC session cleanup failed")
+    {
+        assert!(
+            exited.elapsed() < Duration::from_secs(2),
+            "{:#?}",
+            dev.stderr()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Without `--metrics-port` nothing serves the scrape, and `dev` says so;

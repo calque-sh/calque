@@ -568,25 +568,18 @@ fn table_codec_from_registry(
                     registered.table_id, column.name
                 )));
             }
-            if column.type_schema != "pg_catalog" {
-                return Err(fail(format!(
-                    "registered column {}.{} is not a pg_catalog built-in",
-                    registered.table_id, column.name
-                )));
-            }
             Ok(ColumnCodec {
                 column_id: *column_id,
                 name: column.name.clone(),
                 type_oid: column.type_oid,
                 type_modifier: column.type_modifier,
                 is_replica_identity: observed.is_key,
-                codec: PostgresTypeCodec::from_catalog(&column.type_schema, &column.type_name)
-                    .ok_or_else(|| {
-                        fail(format!(
-                            "{}.{} has no version-1 text codec",
-                            column.type_schema, column.type_name
-                        ))
-                    })?,
+                codec: column.codec().ok_or_else(|| {
+                    fail(format!(
+                        "{}.{} has no version-1 text codec",
+                        column.type_schema, column.type_name
+                    ))
+                })?,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1124,6 +1117,7 @@ mod tests {
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                unlisted_columns: Vec::new(),
                 columns: vec![
                     ColumnInspection {
                         attribute_number: 1,
@@ -1136,6 +1130,7 @@ mod tests {
                         primary_key_ordinal: Some(2),
                         generated: false,
                         nondeterministic_collation: false,
+                        carried_as: None,
                     },
                     ColumnInspection {
                         attribute_number: 2,
@@ -1148,6 +1143,7 @@ mod tests {
                         primary_key_ordinal: None,
                         generated: false,
                         nondeterministic_collation: false,
+                        carried_as: None,
                     },
                     ColumnInspection {
                         attribute_number: 3,
@@ -1160,6 +1156,7 @@ mod tests {
                         primary_key_ordinal: Some(1),
                         generated: false,
                         nondeterministic_collation: false,
+                        carried_as: None,
                     },
                 ],
             }],

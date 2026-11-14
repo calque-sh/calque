@@ -3,7 +3,7 @@ import { schema } from "./calque.generated.js";
 
 const client = createSyncClient({
   endpoint: "https://localhost:8443/",
-  // The dev server serves the grant `calque-dev-grant` wrote. In production,
+  // The dev server serves the grant `calque-grant mint` wrote. In production,
   // your backend issues it.
   auth: async () => {
     const response = await fetch("/grant.json", { cache: "no-store" });
