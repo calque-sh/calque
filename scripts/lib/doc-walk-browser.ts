@@ -48,7 +48,10 @@ export async function expectTasks(
 // although the page received every byte, so a request answered 200 can end
 // this way on a load that worked. The steps say the artifact arrived, and the
 // one bootstrap request the run allows says the plan did: the client asks
-// again for a plan whose body the network cut.
+// again for a plan whose body the network cut. Each long poll on
+// `/v1/changes` is read the same way, and the worker aborts it once it has
+// read its batches, which a loaded host reports the same way; the steps say
+// every change arrived.
 const STREAMED_BODY_END = "net::ERR_ABORTED";
 
 // A path may sit under a proxy's prefix, such as `/_calque/`.
@@ -57,10 +60,11 @@ function isBootstrapRequest(method: string, url: string): boolean {
 }
 
 function isStreamedRequest(method: string, url: string): boolean {
+  const pathname = new URL(url).pathname;
   return (
     isBootstrapRequest(method, url) ||
-    (method === "GET" &&
-      new URL(url).pathname.includes("/v1/artifact-objects/"))
+    (method === "POST" && pathname.endsWith("/v1/changes")) ||
+    (method === "GET" && pathname.includes("/v1/artifact-objects/"))
   );
 }
 

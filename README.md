@@ -103,6 +103,10 @@ npm install @calque/client
 npm install -D @calque/config
 ```
 
+This repository's `main` branch holds the latest release, the one npm and
+ghcr.io publish, and its documentation describes those packages. The `dev`
+branch carries the work merged since, ahead of the next release.
+
 `@calque/client` is the browser client. `@calque/config` renders the typed
 schema the client is created with, for the client's Vite plugin and as the
 `calque-bindings` command. React applications add `@calque/react`. The Vite

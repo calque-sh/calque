@@ -1216,10 +1216,8 @@ fn start_session_watchdog(
         .name(format!("calque-source-watchdog-{backend_pid}"))
         .spawn(move || {
             let mut clock = WatchdogClock { stop: &receiver };
-            if authority
-                .keep_active_renewed(&renewal_kill.lease, &mut clock)
-                .is_err()
-            {
+            if let Err(error) = authority.keep_active_renewed(&renewal_kill.lease, &mut clock) {
+                tracing::warn!(%error, "the source lease could not be renewed; stopping the session");
                 renewal_kill.kill();
             }
         })

@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # main holds the latest release and dev the work merged since; a release
+  # fast-forwards main to a dev commit this workflow passed.
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
     branches: [main]
   # By hand, for running the live suites against a branch: every job runs on

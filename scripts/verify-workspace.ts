@@ -171,7 +171,7 @@ function workspaceInventory(): WorkspacePackage[] {
         .join(", ")}`,
       `  Hosted CI: ${
         existsSync(join(repositoryRoot, ".github/workflows/ci.yml"))
-          ? ".github/workflows/ci.yml; on every push to main and pull request it runs this gate, the browser end-to-end scripts, the self-hosted composition behind Caddy and blob-store's MinIO conformance, and on pushes to main and by dispatch the ignored live-PostgreSQL suite."
+          ? ".github/workflows/ci.yml; on every push to main or dev and every pull request it runs this gate, the browser end-to-end scripts, the self-hosted composition behind Caddy and blob-store's MinIO conformance, and on pushes to main or dev and by dispatch the ignored live-PostgreSQL suite."
           : "NOT CONFIGURED; this local gate is authoritative until repository hosting is available."
       }`,
       "",

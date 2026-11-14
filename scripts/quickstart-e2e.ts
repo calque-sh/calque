@@ -171,6 +171,31 @@ function volumes(): Set<string> {
   );
 }
 
+// Other work on the host creates and drops volumes while the walk runs, so
+// the run judges only the ones its project labels or its containers mount.
+function projectVolumes(project: string): Set<string> {
+  const label = `label=com.docker.compose.project=${project}`;
+  const lines = (output: string) => output.split("\n").filter(Boolean);
+  const labelled = lines(
+    succeed("docker", ["volume", "ls", "--quiet", "--filter", label]),
+  );
+  const containers = lines(
+    succeed("docker", ["ps", "--all", "--quiet", "--filter", label]),
+  );
+  const mounted =
+    containers.length === 0
+      ? []
+      : lines(
+          succeed("docker", [
+            "inspect",
+            "--format",
+            '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}',
+            ...containers,
+          ]),
+        );
+  return new Set([...labelled, ...mounted]);
+}
+
 function imageExists(image: string): boolean {
   return run("docker", ["image", "inspect", image]).status === 0;
 }
@@ -581,6 +606,7 @@ async function teardown(): Promise<string[]> {
   if (baseline === undefined) return [];
   const { composition: resolved } = baseline;
   const environment = composeEnvironment();
+  const owned = projectVolumes(resolved.project);
   run(
     "docker",
     ["compose", "-f", COMPOSE_FILE, "down", "--volumes", "--remove-orphans"],
@@ -605,7 +631,10 @@ async function teardown(): Promise<string[]> {
   if (containers !== "")
     left.push(`containers ${containers.split("\n").join(", ")}`);
   const before = baseline.volumes;
-  const newVolumes = [...volumes()].filter((volume) => !before.has(volume));
+  const remaining = volumes();
+  const newVolumes = [
+    ...new Set([...owned, ...projectVolumes(resolved.project)]),
+  ].filter((volume) => remaining.has(volume) && !before.has(volume));
   if (newVolumes.length > 0) left.push(`volumes ${newVolumes.join(", ")}`);
   for (const image of resolved.builtImages)
     if (!baseline.existingImages.has(image) && imageExists(image))
