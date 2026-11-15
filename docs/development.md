@@ -49,7 +49,12 @@ pnpm exec playwright install chromium firefox
 
 # Complete local workspace gate. It inventories every Cargo and pnpm package,
 # rejects missing package scripts, and reports ignored/skipped tests separately.
+# The text checks run on every change; then a Rust lane and a TypeScript lane
+# run side by side, each skipped when its inputs match its last passing run
+# on this checkout (Markdown under docs/ and at the root feeds neither).
+# `--all` runs both regardless, and CI always does.
 pnpm verify
+pnpm verify --all
 
 # Self-test the gate with six reversible failure injections.
 pnpm verify:probes
@@ -358,7 +363,7 @@ running container:
 ```sh
 docker run --name calque-pg-live --rm -d \
   -e POSTGRES_PASSWORD=postgres -p 127.0.0.1:55433:5432 postgres:18 \
-  -c wal_level=logical -c max_replication_slots=20 -c max_wal_senders=20 \
+  -c wal_level=logical -c max_replication_slots=64 -c max_wal_senders=64 \
   -c max_connections=400
 
 # Waits for the server, checks wal_level, slots, senders, connections and the

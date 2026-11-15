@@ -42,7 +42,10 @@
 # would hide an uncovered provider behind a green run.
 #
 # Tunables (all optional): CALQUE_LIVEPG_ROLE, CALQUE_LIVEPG_PASSWORD,
-# CALQUE_LIVEPG_DATABASE, CALQUE_LIVEPG_HOST, CALQUE_LIVEPG_SUPERUSER.
+# CALQUE_LIVEPG_DATABASE, CALQUE_LIVEPG_HOST, CALQUE_LIVEPG_SUPERUSER, and
+# CALQUE_LIVEPG_PACKAGES, the cargo package selection `run` tests (default
+# `--workspace --exclude blob-store`; CI splits the suite into shards with it,
+# and the completeness check below counts the same selection).
 set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -52,6 +55,7 @@ password=${CALQUE_LIVEPG_PASSWORD:-calque_test}
 database=${CALQUE_LIVEPG_DATABASE:-calque_verify}
 host=${CALQUE_LIVEPG_HOST:-127.0.0.1}
 superuser=${CALQUE_LIVEPG_SUPERUSER:-postgres}
+packages=${CALQUE_LIVEPG_PACKAGES:---workspace --exclude blob-store}
 
 # All of these want the same connection string, and no single one covers the
 # suite. Five are each required by some ignored test, which fails rather than
@@ -148,8 +152,11 @@ bootstrap() {
     printf 'wal_level must be logical, found %s\n' "$wal_level" >&2
     exit 1
   fi
-  if [ "$slots" -lt 20 ] || [ "$senders" -lt 20 ]; then
-    printf 'max_replication_slots and max_wal_senders must both be at least 20, found %s and %s\n' "$slots" "$senders" >&2
+  # cargo runs one test per core, and a calque-engine live test can hold
+  # several slots at once: on an 18-core host, 20 ran out mid-suite
+  # (SQLSTATE 53400, "all replication slots are in use").
+  if [ "$slots" -lt 64 ] || [ "$senders" -lt 64 ]; then
+    printf 'max_replication_slots and max_wal_senders must both be at least 64, found %s and %s\n' "$slots" "$senders" >&2
     exit 1
   fi
   # Every test's runtime holds several connections, and cargo runs one test
@@ -234,7 +241,9 @@ run() {
   # matches nothing lists nothing and is refused here; a binary that fails to
   # link, or a listed test that never reports, shows up below as fewer passes
   # than listed rather than as a smaller green run.
-  expected=$(cargo test --workspace --exclude blob-store -q -- --ignored --list "$@" 2>/dev/null \
+  # $packages is split into words on purpose.
+  # shellcheck disable=SC2086
+  expected=$(cargo test $packages -q -- --ignored --list "$@" 2>/dev/null \
     | grep -c ': test$' || true)
   if [ "$expected" -eq 0 ]; then
     printf '%s\n' 'no ignored tests were listed (does the filter match anything?); refusing to report an empty run as a pass' >&2
@@ -247,7 +256,8 @@ run() {
   # tee keeps the output visible in CI while the log feeds the tally below.
   # The status is captured inside the group because a plain pipeline in sh
   # would report tee's exit code, not cargo's.
-  { cargo test --workspace --exclude blob-store --no-fail-fast -- --ignored "$@" 2>&1 \
+  # shellcheck disable=SC2086
+  { cargo test $packages --no-fail-fast -- --ignored "$@" 2>&1 \
       || printf '%s' "$?" >"$log.status"; } | tee "$log"
   if [ -f "$log.status" ]; then
     status=$(cat "$log.status")

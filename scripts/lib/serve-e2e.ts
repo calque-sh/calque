@@ -128,9 +128,9 @@ export function ensurePostgresContainer(
       "-c",
       "wal_level=logical",
       "-c",
-      "max_replication_slots=20",
+      "max_replication_slots=64",
       "-c",
-      "max_wal_senders=20",
+      "max_wal_senders=64",
       "-c",
       "max_connections=400",
     ]);
