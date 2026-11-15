@@ -634,6 +634,7 @@ async fn serve_configured(
         mount.commands.contract_value()
     ));
     print_line(format_args!("artifact={artifact}"));
+    let stop = shutdown_signal();
     print_line("ready=true");
     print_line(format_args!("startup_millis={}", elapsed_millis(started)));
     print_line(format_args!("Calque serve is ready at {base_url}"));
@@ -649,7 +650,7 @@ async fn serve_configured(
             )
         });
     let serve_result = axum::serve(listener, router)
-        .with_graceful_shutdown(bounded_stop(shutdown_signal()))
+        .with_graceful_shutdown(bounded_stop(stop))
         .await;
     let metrics_result = stop_metrics_server(metrics_server, &metrics_stop).await;
     // A fenced generation's artifact still being cut stops here; the next

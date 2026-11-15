@@ -151,33 +151,53 @@ pub(crate) fn with_state_remedy<E: CommandError>(
     }
 }
 
-/// Waits for whichever OS shutdown signal arrives first. `docker stop` and
-/// most orchestrators send SIGTERM rather than the SIGINT `ctrl_c()` observes;
-/// without SIGTERM the process is killed after the grace period and leaves its
-/// source lease held until it expires, which the next start waits out.
+/// Resolves on whichever OS shutdown signal arrives first. `docker stop` and
+/// most orchestrators send SIGTERM rather than SIGINT; without SIGTERM the
+/// process is killed after the grace period and leaves its source lease held
+/// until it expires, which the next start waits out.
+///
+/// The handlers are installed by this call, not when the future is first
+/// polled: a caller that sends SIGTERM as soon as it reads `ready=true` would
+/// otherwise meet the default action, which ends the process at once.
 #[cfg(unix)]
-pub(crate) async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
+pub(crate) fn shutdown_signal() -> impl Future<Output = ()> {
+    use tokio::signal::unix::SignalKind;
 
-    let ctrl_c = tokio::signal::ctrl_c();
-    let mut terminate = match signal(SignalKind::terminate()) {
-        Ok(terminate) => terminate,
-        Err(error) => {
-            tracing::warn!(%error, "SIGTERM cannot be observed; only ctrl-c stops calque cleanly");
-            let _ = ctrl_c.await;
-            return;
+    let interrupt = received(SignalKind::interrupt(), "SIGINT");
+    let terminate = received(SignalKind::terminate(), "SIGTERM");
+    async move {
+        tokio::select! {
+            () = interrupt => {},
+            () = terminate => {},
         }
-    };
-    tokio::select! {
-        _ = ctrl_c => tracing::info!("stopping: received SIGINT"),
-        _ = terminate.recv() => tracing::info!("stopping: received SIGTERM"),
+    }
+}
+
+/// Installs the handler for `kind` now and resolves once the signal arrives.
+/// One that cannot be installed never resolves.
+#[cfg(unix)]
+fn received(kind: tokio::signal::unix::SignalKind, name: &'static str) -> impl Future<Output = ()> {
+    let installed = tokio::signal::unix::signal(kind);
+    if let Err(error) = &installed {
+        tracing::warn!(%error, "{name} cannot be observed, so it does not stop calque cleanly");
+    }
+    async move {
+        match installed {
+            Ok(mut signal) => {
+                signal.recv().await;
+                tracing::info!("stopping: received {name}");
+            }
+            Err(_) => std::future::pending().await,
+        }
     }
 }
 
 #[cfg(not(unix))]
-pub(crate) async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("stopping: received ctrl-c");
+pub(crate) fn shutdown_signal() -> impl Future<Output = ()> {
+    async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("stopping: received ctrl-c");
+    }
 }
 
 /// How long a stop may take once it is requested. One that took longer than a

@@ -233,7 +233,22 @@ impl Serving {
             .status();
         let status = self.child.wait().unwrap();
         self.stopped = true;
+        if !status.success() {
+            self.print_stderr_tail(&format!("serve exited with {status} on SIGTERM"));
+        }
         status.success()
+    }
+
+    fn print_stderr_tail(&self, why: &str) {
+        let tail = self
+            .stderr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let last = tail.iter().skip(tail.len().saturating_sub(40));
+        eprintln!(
+            "{why}; serve's last stderr lines:\n{}",
+            last.cloned().collect::<Vec<_>>().join("\n")
+        );
     }
 
     /// Ends the process the way a crash does: SIGKILL, with no chance to
@@ -262,15 +277,7 @@ impl Serving {
 impl Drop for Serving {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            let tail = self
-                .stderr
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let last = tail.iter().skip(tail.len().saturating_sub(40));
-            eprintln!(
-                "serve's last stderr lines:\n{}",
-                last.cloned().collect::<Vec<_>>().join("\n")
-            );
+            self.print_stderr_tail("the test panicked");
         }
         if !self.stopped {
             let _ = self.child.kill();

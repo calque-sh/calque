@@ -649,6 +649,7 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
         }
         None => print_line("Columns: every column of each --table"),
     }
+    let stop = dev_stop_signal();
     print_line(format_args!("Calque dev is ready at {base_url}"));
     print_line(format_args!(
         "State directory: {}",
@@ -676,7 +677,7 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
             )
         });
     let serve_result = axum::serve(listener, router)
-        .with_graceful_shutdown(bounded_stop(dev_stop_signal()))
+        .with_graceful_shutdown(bounded_stop(stop))
         .await;
     let metrics_result = stop_metrics_server(metrics_server, &metrics_stop).await;
     cancellation.cancel();
@@ -692,29 +693,37 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
 /// is gone: SIGHUP from a closed terminal, and an output line that met a broken
 /// pipe (`log_sink`). Either way `dev` stops as on SIGTERM and releases its
 /// source lease; SIGHUP's default action would end it before that release.
-async fn dev_stop_signal() {
-    tokio::select! {
-        () = shutdown_signal() => {},
-        () = hangup() => tracing::info!("stopping: received SIGHUP, so the terminal that started calque dev closed"),
-        () = crate::log_sink::closed() => tracing::info!("stopping: calque's stdout or stderr is a closed pipe, so whoever started calque dev is gone"),
+/// Like [`shutdown_signal`], the handlers are installed by this call.
+fn dev_stop_signal() -> impl std::future::Future<Output = ()> {
+    let shutdown = shutdown_signal();
+    let hangup = hangup();
+    async move {
+        tokio::select! {
+            () = shutdown => {},
+            () = hangup => tracing::info!("stopping: received SIGHUP, so the terminal that started calque dev closed"),
+            () = crate::log_sink::closed() => tracing::info!("stopping: calque's stdout or stderr is a closed pipe, so whoever started calque dev is gone"),
+        }
     }
 }
 
 #[cfg(unix)]
-async fn hangup() {
+fn hangup() -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{signal, SignalKind};
 
-    match signal(SignalKind::hangup()) {
-        Ok(mut hangup) => {
-            hangup.recv().await;
+    let hangup = signal(SignalKind::hangup());
+    async move {
+        match hangup {
+            Ok(mut hangup) => {
+                hangup.recv().await;
+            }
+            Err(_) => std::future::pending().await,
         }
-        Err(_) => std::future::pending().await,
     }
 }
 
 #[cfg(not(unix))]
-async fn hangup() {
-    std::future::pending().await
+fn hangup() -> impl std::future::Future<Output = ()> {
+    std::future::pending()
 }
 
 fn dev_memory_policy() -> LocalMemoryPolicy {
@@ -2250,6 +2259,29 @@ mod tests {
             .expect("shutdown_signal task panicked");
 
         let _ = tokio::time::timeout(Duration::from_secs(1), safety_net.recv()).await;
+    }
+
+    /// `shutdown_signal` installs its handlers when called, so a SIGTERM sent
+    /// before its future is first polled, as one sent the moment `serve`
+    /// prints `ready=true` is, still stops it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_signal_observes_a_sigterm_sent_before_its_first_poll() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let _safety_net =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM safety net");
+        let stop = shutdown_signal();
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("failed to invoke `kill`");
+        assert!(status.success(), "kill -TERM did not run successfully");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        tokio::time::timeout(Duration::from_secs(5), stop)
+            .await
+            .expect("a SIGTERM sent before the first poll was lost");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
