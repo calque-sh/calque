@@ -597,23 +597,26 @@ fn a_lease_that_expires_while_its_renewal_waits_on_the_lease_row_is_not_renewed(
             );
             thread::sleep(Duration::from_millis(5));
         };
-        thread::sleep(Duration::from_millis(900).saturating_sub(held_at.elapsed()));
-        let expired_at_release: bool = observer
+        // The row is released as soon as the lease has expired, so the
+        // renewal's wait stays far under `lock_timeout` on a slow host.
+        while !observer
             .query_one(
                 "SELECT expires_at <= clock_timestamp()
                    FROM calque_control.source_fence_lease WHERE source_id = $1",
                 &[&holder_source.as_str()],
             )
             .unwrap()
-            .get(0);
+            .get::<_, bool>(0)
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
         hold.commit().unwrap();
-        (expires_at, unexpired_while_waiting, expired_at_release)
+        (expires_at, unexpired_while_waiting)
     });
     locked_rx.recv().unwrap();
     let renewal = store.renew(&identity, Duration::from_secs(30));
-    let (expires_at, unexpired_while_waiting, expired_at_release) = holder.join().unwrap();
+    let (expires_at, unexpired_while_waiting) = holder.join().unwrap();
     assert!(unexpired_while_waiting);
-    assert!(expired_at_release);
     assert!(matches!(renewal, Err(FenceError::LeaseLost)), "{renewal:?}");
 
     let mut observer = Client::connect(&url, NoTls).unwrap();
