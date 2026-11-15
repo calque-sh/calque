@@ -49,6 +49,7 @@ pub(crate) fn inspection(
         is_partition: false,
         has_publication_row_filter: false,
         has_publication_column_list: false,
+        row_security_active: false,
         unlisted_columns: Vec::new(),
         columns,
     }

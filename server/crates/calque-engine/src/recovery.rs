@@ -33,7 +33,7 @@ use crate::{guard::PostgresConnectionFamily, DatabaseUrl, StateStore};
 /// than as an `OracleMismatch` that reads like a corrupt backup.
 /// Version 4 carries the enum labels the source serves. An earlier
 /// unit's enrollment records none, and this release cannot resume it.
-const RECOVERY_FORMAT_VERSION: u32 = 4;
+const RECOVERY_FORMAT_VERSION: u32 = 5;
 const COMPLETE_FILE: &str = "recovery.json";
 const CONTROL_DIRECTORY: &str = "control";
 const STATE_DIRECTORY: &str = "state";
@@ -82,6 +82,11 @@ const CONTROL_TABLES: &[ControlTable] = &[
         name: "source_enum_version",
         columns: "source_id, source_epoch, value_oid, value_xmin, seen_from_lsn",
         order_by: "value_oid, value_xmin",
+    },
+    ControlTable {
+        name: "source_column_version",
+        columns: "source_id, source_epoch, relation_oid, attribute_number, attribute_xmin, relation_filenode",
+        order_by: "relation_oid, attribute_number",
     },
     ControlTable {
         name: "canonical_log_head",
@@ -2214,7 +2219,7 @@ mod tests {
         // corrupt backup.
         assert_eq!(
             RecoveryError::UnsupportedFormat(1).to_string(),
-            "recovery unit is format version 1, and this build reads version 4; restore it with the calque release that took it, or take a fresh unit with calque backup from a deployment running this build"
+            "recovery unit is format version 1, and this build reads version 5; restore it with the calque release that took it, or take a fresh unit with calque backup from a deployment running this build"
         );
         assert_eq!(
             RecoveryError::ActiveSourceLease.to_string(),
@@ -2798,10 +2803,11 @@ mod tests {
             .any(|(_, count)| *count > 0));
     }
 
-    /// A unit carries the enum labels its source serves and the enrollment
-    /// fields that bound them, so the restored source resumes where the unit
-    /// left it. A unit of an earlier format has neither and is refused by
-    /// version before a restore writes anything.
+    /// A unit carries the enum labels its source serves, the enrollment
+    /// fields that bound them and its served columns' versions, so the
+    /// restored source resumes where the unit left it. A unit of an earlier
+    /// format lacks some of them and is refused by version before a restore
+    /// writes anything.
     #[test]
     #[ignore = "requires CALQUE_CONTROL_DATABASE_URL or CALQUE_DATABASE_URL"]
     fn a_unit_carries_the_served_enum_labels_and_an_earlier_format_is_refused() {
@@ -2843,6 +2849,22 @@ mod tests {
         let before = carried(&mut control);
         assert_eq!(before.len(), 1);
         assert!(before[0].iter().all(Option::is_some), "{before:?}");
+        let column_versions = |control: &mut Client| -> Vec<String> {
+            control
+                .query(
+                    "SELECT concat_ws(':', relation_oid, attribute_number, attribute_xmin,
+                                      relation_filenode)
+                       FROM calque_control.source_column_version
+                      WHERE source_id = $1 ORDER BY relation_oid, attribute_number",
+                    &[&source_id.as_str()],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect()
+        };
+        let columns_before = column_versions(&mut control);
+        assert!(!columns_before.is_empty());
 
         create_recovery_backup(
             &database,
@@ -2861,11 +2883,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(carried(&mut control), before);
+        assert_eq!(column_versions(&mut control), columns_before);
 
         let earlier = temporary.path().join("earlier");
         copy_tree(&backup_root, &earlier).unwrap();
         let mut manifest = read_manifest(&earlier).unwrap();
-        manifest.format_version = 3;
+        manifest.format_version = 4;
         fs::write(
             earlier.join(COMPLETE_FILE),
             serde_json::to_vec_pretty(&manifest).unwrap(),
@@ -2882,7 +2905,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(error, RecoveryError::UnsupportedFormat(3)),
+            matches!(error, RecoveryError::UnsupportedFormat(4)),
             "{error}"
         );
         assert!(!refused.exists());
@@ -3084,6 +3107,55 @@ mod tests {
                 if cause.contains("the server sent nothing while a reply was awaited")),
             "{error:?}"
         );
+        drop(live);
+    }
+
+    /// A row-level security policy that comes to apply to Calque's role after
+    /// the start's inspection fails the build, where PostgreSQL would
+    /// otherwise hand the snapshot only the rows the policy allows while
+    /// change capture goes on sending every row.
+    #[test]
+    #[ignore = "requires CALQUE_CONTROL_DATABASE_URL or CALQUE_DATABASE_URL"]
+    fn a_snapshot_under_row_level_security_fails_instead_of_losing_rows() {
+        let temporary = tempfile::tempdir().unwrap();
+        let live = LiveSource::enrol_without_snapshot(temporary.path().join("source"));
+        let mut owner = Client::connect(&live.raw_database, postgres::NoTls).unwrap();
+        let table = format!("public.\"{}\"", live.table_name);
+        owner
+            .batch_execute(&format!(
+                "ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {table} FORCE ROW LEVEL SECURITY;
+                 CREATE POLICY hide_every_row ON {table} USING (false);"
+            ))
+            .unwrap();
+
+        let error = live
+            .snapshot()
+            .expect_err("a policy that hides rows cannot publish");
+        let mut chain = error.to_string();
+        let mut cause = std::error::Error::source(&error);
+        while let Some(next) = cause {
+            chain.push_str(&format!(": {next}"));
+            cause = next.source();
+        }
+        assert!(
+            matches!(&error, crate::LocalSnapshotError::Build(_))
+                && chain.contains("row-level security"),
+            "{chain}"
+        );
+        assert!(live
+            .catalog()
+            .artifacts_in_state(artifact_catalog::ArtifactState::Published)
+            .unwrap()
+            .is_empty());
+
+        owner
+            .batch_execute(&format!("ALTER TABLE {table} NO FORCE ROW LEVEL SECURITY"))
+            .unwrap();
+        assert!(matches!(
+            live.snapshot(),
+            Ok(crate::LocalSnapshotOutcome::Published)
+        ));
         drop(live);
     }
 

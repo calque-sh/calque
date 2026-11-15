@@ -37,6 +37,13 @@ export const LOADING: LiveQuerySnapshot<never> = Object.freeze({
  */
 export const UNLISTENED_GRACE_MS = 5_000;
 
+/**
+ * How many released resources the session keeps to serve a retry that comes
+ * later, for example when a sibling in the same Suspense boundary waits on a
+ * slow fetch. Each holds its rows, so the count stays small.
+ */
+export const RELEASED_SUBSCRIPTIONS = 16;
+
 export type SubscriptionResult = readonly QueryRow[] | QueryWindowRows;
 
 export class QuerySubscription<

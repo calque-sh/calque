@@ -75,7 +75,7 @@ pub use source::{
 };
 pub use state::{LocalNames, LocalSecrets, LocalState, SecretToken, StateError, StateStore};
 pub use tenants::{
-    check_replication_capacity, TenantError, TenantReport, TenantSettings, Tenants, TenantsConfig,
-    DEFAULT_MAX_TENANT_BUILDS, DEFAULT_TENANT_COMPRESS_ABOVE_BYTES, DEFAULT_TENANT_HOLD_OPEN,
-    DEFAULT_TENANT_WARM_DAYS,
+    check_postgres_capacity, ConnectionLimit, TenantError, TenantReport, TenantSettings, Tenants,
+    TenantsConfig, DEFAULT_MAX_TENANT_BUILDS, DEFAULT_TENANT_COMPRESS_ABOVE_BYTES,
+    DEFAULT_TENANT_HOLD_OPEN, DEFAULT_TENANT_WARM_DAYS,
 };

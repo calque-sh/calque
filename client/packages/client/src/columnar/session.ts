@@ -119,6 +119,7 @@ import {
 import {
   LOADING,
   QuerySubscription,
+  RELEASED_SUBSCRIPTIONS,
   type SubscriptionResult,
 } from "./query-subscription.js";
 import {
@@ -181,6 +182,12 @@ export class ColumnarSession {
   readonly #listeners = new ObserverRegistry<true>();
   readonly #publicationListeners = new Set<PublicationListener>();
   readonly #subscriptions = new Map<string, QuerySubscription>();
+  /**
+   * The most recently released subscriptions, oldest first, which `subscribe`
+   * hands out again: a render React retries after the grace period gets its
+   * rows back instead of suspending on a second read.
+   */
+  readonly #released = new Map<string, QuerySubscription>();
   #nextSubscriptionKey = 0;
   /**
    * Subscriptions with a read in flight, including one nobody listens to that
@@ -507,13 +514,14 @@ export class ColumnarSession {
       "none",
       "the client is closed",
     );
-    for (const subscription of this.#subscriptions.values()) {
+    for (const subscription of this.#resident()) {
       subscription.stopIdle();
       subscription.publish(
         Object.freeze({ status: "error", error: closedError }),
       );
     }
     this.#subscriptions.clear();
+    this.#released.clear();
     if (previous) await teardownActivation(previous);
     this.#setStatus({ state: "closed" });
   }
@@ -601,7 +609,7 @@ export class ColumnarSession {
     // canonicalizes one specification, not every live one. An invalid
     // specification throws here, before any rows.
     const canonical = canonicalQuerySpecification(specification);
-    for (const candidate of this.#subscriptions.values())
+    for (const candidate of this.#resident())
       if (
         candidate.options.maxRows === options.maxRows &&
         candidate.options.maxBytes === options.maxBytes &&
@@ -609,6 +617,8 @@ export class ColumnarSession {
         candidate.window?.count === window?.count &&
         candidate.canonical === canonical
       ) {
+        this.#released.delete(candidate.key);
+        this.#subscriptions.set(candidate.key, candidate);
         candidate.touch();
         return candidate as unknown as LiveQueryResource<Result>;
       }
@@ -1263,8 +1273,14 @@ export class ColumnarSession {
   }
 
   release(subscription: QuerySubscription): void {
-    if (this.#subscriptions.get(subscription.key) === subscription)
+    if (this.#subscriptions.get(subscription.key) === subscription) {
       this.#subscriptions.delete(subscription.key);
+      this.#released.set(subscription.key, subscription);
+      for (const key of this.#released.keys()) {
+        if (this.#released.size <= RELEASED_SUBSCRIPTIONS) break;
+        this.#released.delete(key);
+      }
+    }
     // Nobody is left to read the frame's rows, so the worker stops computing
     // them and gives back their share of the query pool.
     const frame = this.#frame;
@@ -1278,6 +1294,7 @@ export class ColumnarSession {
    */
   retain(subscription: QuerySubscription): boolean {
     if (this.#closed) return false;
+    this.#released.delete(subscription.key);
     this.#subscriptions.set(subscription.key, subscription);
     const activation = this.#activation;
     return (
@@ -1427,8 +1444,13 @@ export class ColumnarSession {
    * retracted.
    */
   #discardResidentQueryState(): void {
-    for (const subscription of this.#subscriptions.values())
-      subscription.publish(LOADING);
+    for (const subscription of this.#resident()) subscription.publish(LOADING);
+    this.#released.clear();
+  }
+
+  /** Every subscription a query can still be served from. */
+  #resident(): QuerySubscription[] {
+    return [...this.#subscriptions.values(), ...this.#released.values()];
   }
 
   /**
@@ -1468,8 +1490,9 @@ export class ColumnarSession {
       { cause },
     );
     this.#abandonPendingMutations(LOCKED_ABANDON_MESSAGE);
-    for (const subscription of this.#subscriptions.values())
+    for (const subscription of this.#resident())
       subscription.publish(Object.freeze({ status: "error", error }));
+    this.#released.clear();
     this.#setStatus({ state: "locked", reason, error });
     if (activation) void teardownActivation(activation);
   }
@@ -1490,12 +1513,11 @@ export class ColumnarSession {
   }
 
   #rerun(activation: Activation, everything: boolean): void {
-    if (everything)
-      for (const subscription of [
-        ...this.#subscriptions.values(),
-        ...this.#reading,
-      ])
+    if (everything) {
+      for (const subscription of [...this.#resident(), ...this.#reading])
         subscription.forget();
+      this.#released.clear();
+    }
     for (const subscription of this.#subscriptions.values())
       if (
         subscription.listenerCount > 0 &&

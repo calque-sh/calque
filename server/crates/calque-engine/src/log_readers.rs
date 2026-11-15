@@ -18,7 +18,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// the change tail cannot serve.
 pub(crate) const MAX_LOG_READERS: usize = 8;
 /// One for each bootstrap planner that may run at once.
-const PLANNER_LOG_READERS: usize = crate::backend::MAX_CONCURRENT_PLANNERS;
+pub(crate) const PLANNER_LOG_READERS: usize = crate::backend::MAX_CONCURRENT_PLANNERS;
 
 /// A connection the pool hands out again only while it is open.
 pub trait PooledLogReader: Send + Sync + 'static {

@@ -1773,6 +1773,7 @@ mod tests {
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                row_security_active: false,
                 unlisted_columns: Vec::new(),
                 columns: vec![ColumnInspection {
                     attribute_number: 1,
@@ -1902,6 +1903,7 @@ mod tests {
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                row_security_active: false,
                 unlisted_columns: Vec::new(),
                 columns: vec![
                     ColumnInspection {
@@ -3089,6 +3091,7 @@ mod tests {
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                row_security_active: false,
                 unlisted_columns: Vec::new(),
                 columns: vec![
                     inspection(1, "tenant_id", "uuid", 1),

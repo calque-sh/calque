@@ -20,6 +20,7 @@ use sync_types::{SourceEpoch, SourceId};
 use thiserror::Error;
 
 use crate::{
+    column_versions::{read_column_versions, ColumnVersion, ColumnVersionGuard},
     enum_labels::{
         enrolled_labels, lock, published_enum_types, read_enum_values, EnumLabelGuard,
         EnumLabelState, EnumReading,
@@ -112,6 +113,9 @@ pub struct SlotEnrollment {
     pub(crate) enum_labels: Vec<ServedEnumLabel>,
     /// The versions of those enums' values readings saw, as last recorded.
     pub(crate) enum_versions: Vec<SeenEnumVersion>,
+    /// Every served column's version as last recorded; empty for an
+    /// enrollment an earlier release made.
+    pub(crate) column_versions: Vec<ColumnVersion>,
 }
 
 impl SlotEnrollment {
@@ -170,6 +174,7 @@ impl SlotEnrollment {
             enum_labels_from_lsn_text: row.get(12),
             enum_labels: Vec::new(),
             enum_versions: Vec::new(),
+            column_versions: Vec::new(),
         })
     }
 }
@@ -345,6 +350,8 @@ pub fn provision_persistent_slot(
             .collect();
     enum_types.sort_unstable();
     enum_types.dedup();
+    let column_versions =
+        read_column_versions(&mut controller, binding.columns()).map_err(source_error)?;
     let before = read_enum_values(&mut controller, &enum_types).map_err(enum_reading_error)?;
     while_renewing(authority, provisional, || {
         create_slot(&mut controller, config)
@@ -370,6 +377,7 @@ pub fn provision_persistent_slot(
         enum_labels_from_lsn_text: Some(format_lsn(before.bound)),
         enum_labels: enrolled_labels(&before, &after),
         enum_versions: Vec::new(),
+        column_versions,
     };
     authority.record_slot_enrollment(provisional, &enrollment)?;
     Ok(enrollment)
@@ -477,6 +485,7 @@ where
         fingerprint,
         wal_sender_timeout,
         enum_guard,
+        mut column_guard,
     } = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -507,6 +516,14 @@ where
             return Err(error.into());
         }
     };
+    // What this start saw is recorded before it streams, so a session that
+    // ends before its watch records anything leaves the next start nothing
+    // stale to compare against. The watch retries a failed record.
+    if let Some(versions) = column_guard.take_unrecorded() {
+        if authority.record_column_versions(&lease, &versions).is_err() {
+            column_guard.record_failed();
+        }
+    }
     let expected_source = activated_source
         .registry_binding()
         .source_identity()
@@ -518,7 +535,7 @@ where
         expected_source.clone(),
         slot.slot_name.clone(),
         backend_pid,
-        PublicationWatch::new(activated_source, fingerprint, &enum_guard),
+        PublicationWatch::new(activated_source, fingerprint, &enum_guard, column_guard),
     ) {
         Ok(watchdog) => watchdog,
         Err(error) => {
@@ -572,6 +589,7 @@ struct PreparedSession {
     fingerprint: String,
     wal_sender_timeout: Duration,
     enum_guard: EnumLabelGuard,
+    column_guard: ColumnVersionGuard,
 }
 
 fn prepare_source_session<F>(
@@ -605,6 +623,14 @@ where
         changed_column(&mut controller, binding.columns()).map_err(source_error)?
     {
         return Err(column_changed(column));
+    }
+    if enrollment.column_versions.is_empty() {
+        return Err(SourceRuntimeError::EnrolledByEarlierRelease);
+    }
+    let mut column_guard = ColumnVersionGuard::new(&enrollment.column_versions);
+    let reading = read_column_versions(&mut controller, binding.columns()).map_err(source_error)?;
+    if let Some(rewritten) = column_guard.observe(&reading) {
+        return Err(column_rewritten(binding.columns(), rewritten));
     }
     let enum_guard = check_enum_labels(
         &mut controller,
@@ -678,6 +704,7 @@ where
         fingerprint: publication.fingerprint,
         wal_sender_timeout,
         enum_guard,
+        column_guard,
     })
 }
 
@@ -727,6 +754,23 @@ fn column_changed(column: &RegisteredColumn) -> SourceRuntimeError {
     SourceRuntimeError::ColumnChanged {
         table: column.table.display_name(),
         column: column.name.clone(),
+    }
+}
+
+fn column_rewritten(columns: &[RegisteredColumn], rewritten: ColumnVersion) -> SourceRuntimeError {
+    let column = columns.iter().find(|column| {
+        column.relation_oid == rewritten.relation_oid
+            && column.attribute_number == rewritten.attribute_number
+    });
+    SourceRuntimeError::ColumnRewritten {
+        table: column.map_or_else(
+            || rewritten.relation_oid.to_string(),
+            |column| column.table.display_name(),
+        ),
+        column: column.map_or_else(
+            || rewritten.attribute_number.to_string(),
+            |column| column.name.clone(),
+        ),
     }
 }
 
@@ -932,10 +976,16 @@ struct PublicationWatch {
     /// enums' values differ from `planned`, the values they were read at.
     plan_labels: SharedEnumLabels,
     planned: Option<EnumReading>,
+    column_versions: ColumnVersionGuard,
 }
 
 impl PublicationWatch {
-    fn new(source: &ActivatedSource, fingerprint: String, guard: &EnumLabelGuard) -> Self {
+    fn new(
+        source: &ActivatedSource,
+        fingerprint: String,
+        guard: &EnumLabelGuard,
+        column_versions: ColumnVersionGuard,
+    ) -> Self {
         let binding = source.registry_binding();
         Self {
             name: binding.publication().name.clone(),
@@ -946,6 +996,7 @@ impl PublicationWatch {
             enum_labels: guard.state(),
             plan_labels: source.enum_labels().clone(),
             planned: None,
+            column_versions,
         }
     }
 
@@ -985,6 +1036,21 @@ impl PublicationWatch {
                     "a served column was dropped, renamed or retyped while CDC streamed; stopping the session"
                 );
                 return true;
+            }
+            Err(_) => {
+                *controller = None;
+                return false;
+            }
+        }
+        match read_column_versions(client, &self.columns) {
+            Ok(reading) => {
+                if let Some(rewritten) = self.column_versions.observe(&reading) {
+                    tracing::warn!(
+                        error = %column_rewritten(&self.columns, rewritten),
+                        "stopping the session"
+                    );
+                    return true;
+                }
             }
             Err(_) => {
                 *controller = None;
@@ -1036,6 +1102,18 @@ impl PublicationWatch {
         };
         if record(&versions).is_err() {
             lock(&self.enum_labels).record_failed();
+        }
+    }
+
+    /// Records the served column versions last seen, once they differ from
+    /// the ones last recorded, so a later start compares against them. A
+    /// failed record is tried again at the next check.
+    fn record_columns(&mut self, record: impl FnOnce(&[ColumnVersion]) -> Result<(), FenceError>) {
+        let Some(versions) = self.column_versions.take_unrecorded() else {
+            return;
+        };
+        if record(&versions).is_err() {
+            self.column_versions.record_failed();
         }
     }
 }
@@ -1237,6 +1315,9 @@ fn start_session_watchdog(
                 }
                 publication
                     .record_seen(|versions| recorder.record_enum_versions(&kill.lease, versions));
+                publication.record_columns(|versions| {
+                    recorder.record_column_versions(&kill.lease, versions)
+                });
             }
         });
     let publication_join = match publication_join {
@@ -1555,11 +1636,13 @@ pub enum SourceRuntimeError {
     PublicationDrift,
     #[error("column {column} of {table} was dropped, renamed, or given another type or type modifier, which PostgreSQL applies to every row without a row change, so the working set may no longer match PostgreSQL's rows.")]
     ColumnChanged { table: String, column: String },
+    #[error("column {column} of {table} and the file its table is stored in both changed since calque last read them, as they do when ALTER COLUMN ... TYPE with a USING expression rewrites every row without a row change, so the working set may no longer match PostgreSQL's rows. A change to the column, such as a grant, and a VACUUM FULL, CLUSTER or TRUNCATE of the table between two of calque's reads look the same.")]
+    ColumnRewritten { table: String, column: String },
     #[error(transparent)]
     EnumLabel(#[from] EnumLabelDrift),
     #[error(transparent)]
     EnumUnservable(InspectError),
-    #[error("this source was enrolled by an earlier release of calque, which did not record the enum labels it serves, so this release cannot resume it.")]
+    #[error("this source was enrolled by an earlier release of calque, which did not record what this release checks a start against, so this release cannot resume it.")]
     EnrolledByEarlierRelease,
     #[error("activated source epoch does not match the provisional lease")]
     ActivatedSourceLeaseMismatch,

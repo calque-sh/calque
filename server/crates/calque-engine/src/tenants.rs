@@ -160,49 +160,85 @@ pub enum TenantError {
     Log(#[from] LogError),
     #[error(transparent)]
     Source(#[from] crate::LocalSourceError),
-    #[error("PostgreSQL leaves {free_slots} replication slots and {free_senders} WAL senders free; {needed} of each are needed, one per tenant build and one for change capture. Raise max_replication_slots and max_wal_senders, or lower --max-tenant-builds.")]
+    #[error("PostgreSQL leaves {free_slots} replication slots and {free_senders} WAL senders free; {needed} of each are needed, one per preparation that may run at once and one for change capture. Raise max_replication_slots and max_wal_senders, or, with a partitioned scope, lower --max-tenant-builds.")]
     ReplicationCapacity {
         free_slots: i64,
         free_senders: i64,
         needed: i64,
     },
+    #[error("PostgreSQL lets calque's role open {allowed} connections, set by {limit}; calque may hold {needed}: {steady} to capture changes and serve, and {per_build} for each of {builds} preparations at once. Raise that limit, or, with a partitioned scope, lower --max-tenant-builds.", steady = STEADY_POSTGRES_CONNECTIONS, per_build = POSTGRES_CONNECTIONS_PER_BUILD)]
+    ConnectionCapacity {
+        allowed: i64,
+        limit: ConnectionLimit,
+        needed: i64,
+        builds: i64,
+    },
     #[error("tenant task failed")]
     Task,
 }
 
-/// Refuses to start when PostgreSQL leaves fewer replication slots or WAL
-/// senders than `max_builds` plus one: each build holds one of each until it
-/// reaches its cut, and change capture holds one more. `cdc_slot` is this
-/// source's own slot, which counts as free since it is change capture's.
-pub async fn check_replication_capacity(
+/// Ordinary connections one process may hold beside its preparations: the
+/// source's lease, session, publication watch and enum check (4), the change
+/// log's writers and receipts (4), its readers (8 for changes, 2 for
+/// planners, 1 for the tail, 1 for tenants), the slot lag sampler,
+/// mutations, the authorization fence, and one short-lived check.
+pub const STEADY_POSTGRES_CONNECTIONS: i64 =
+    12 + (crate::log_readers::MAX_LOG_READERS + crate::log_readers::PLANNER_LOG_READERS + 2) as i64;
+
+/// Ordinary connections one preparation holds: its control, DDL guard and
+/// pressure connections, two copy workers, and the registry check after its
+/// cut. Its replication connection counts against `max_wal_senders` instead.
+pub const POSTGRES_CONNECTIONS_PER_BUILD: i64 = 6;
+
+/// Refuses to start when PostgreSQL cannot hold `builds` preparations at once
+/// beside change capture.
+///
+/// Each preparation holds a replication slot and a WAL sender until it reaches
+/// its cut, and change capture holds one more of each. `cdc_slot` is this
+/// source's own slot, which counts as free since it is change capture's. The
+/// ordinary connections are checked against the most PostgreSQL lets this
+/// role open in this database, which other clients share; a limit at least
+/// that large still runs out when they hold the rest.
+pub async fn check_postgres_capacity(
     database_url: &DatabaseUrl,
-    max_builds: usize,
+    builds: usize,
     cdc_slot: &str,
 ) -> Result<(), TenantError> {
     let database_url = database_url.clone();
     let cdc_slot = cdc_slot.to_owned();
-    let (free_slots, free_senders) = tokio::task::spawn_blocking(move || {
+    let row = tokio::task::spawn_blocking(move || {
         let mut client = connect_owned(
             &database_url,
             PostgresConnectionFamily::Inspect,
-            "calque-tenant-capacity",
+            "calque-capacity",
         )?;
-        let row = client
+        client
             .query_one(
                 "SELECT current_setting('max_replication_slots')::bigint
                         - (SELECT count(*) FROM pg_replication_slots WHERE slot_name <> $1),
                         current_setting('max_wal_senders')::bigint
-                        - (SELECT count(*) FROM pg_stat_replication)",
+                        - (SELECT count(*) FROM pg_stat_replication),
+                        current_setting('max_connections')::bigint
+                        - CASE WHEN role.rolsuper THEN 0
+                               ELSE current_setting('superuser_reserved_connections')::bigint END
+                        - CASE WHEN role.rolsuper
+                                    OR pg_has_role(session_user, 'pg_use_reserved_connections',
+                                                   'USAGE')
+                               THEN 0
+                               ELSE current_setting('reserved_connections')::bigint END,
+                        role.rolconnlimit::bigint,
+                        database.datconnlimit::bigint
+                   FROM pg_catalog.pg_roles AS role, pg_catalog.pg_database AS database
+                  WHERE role.rolname = session_user AND database.datname = current_database()",
                 &[&cdc_slot],
             )
-            .map_err(crate::LocalSourceError::from)?;
-        Ok::<_, TenantError>((row.get::<_, i64>(0), row.get::<_, i64>(1)))
+            .map_err(crate::LocalSourceError::from)
     })
     .await
     .map_err(|_| TenantError::Task)??;
-    let needed = i64::try_from(max_builds)
-        .unwrap_or(i64::MAX)
-        .saturating_add(1);
+    let builds = i64::try_from(builds).unwrap_or(i64::MAX);
+    let (free_slots, free_senders) = (row.get::<_, i64>(0), row.get::<_, i64>(1));
+    let needed = builds.saturating_add(1);
     if free_slots < needed || free_senders < needed {
         return Err(TenantError::ReplicationCapacity {
             free_slots,
@@ -210,7 +246,52 @@ pub async fn check_replication_capacity(
             needed,
         });
     }
+    let needed = builds
+        .saturating_mul(POSTGRES_CONNECTIONS_PER_BUILD)
+        .saturating_add(STEADY_POSTGRES_CONNECTIONS);
+    let limits = [
+        (Some(row.get::<_, i64>(2)), ConnectionLimit::Server),
+        (
+            Some(row.get::<_, i64>(3)).filter(|limit| *limit >= 0),
+            ConnectionLimit::Role,
+        ),
+        (
+            Some(row.get::<_, i64>(4)).filter(|limit| *limit >= 0),
+            ConnectionLimit::Database,
+        ),
+    ];
+    if let Some((allowed, limit)) = limits
+        .into_iter()
+        .filter_map(|(allowed, limit)| allowed.map(|allowed| (allowed, limit)))
+        .min_by_key(|(allowed, _)| *allowed)
+        .filter(|(allowed, _)| *allowed < needed)
+    {
+        return Err(TenantError::ConnectionCapacity {
+            allowed,
+            limit,
+            needed,
+            builds,
+        });
+    }
     Ok(())
+}
+
+/// What caps the connections calque's role may open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionLimit {
+    Server,
+    Role,
+    Database,
+}
+
+impl std::fmt::Display for ConnectionLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Server => "max_connections less the connections it reserves",
+            Self::Role => "the role's CONNECTION LIMIT",
+            Self::Database => "the database's CONNECTION LIMIT",
+        })
+    }
 }
 
 /// Where tenant builds journal, beside the source-wide build's journals.

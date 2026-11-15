@@ -59,10 +59,17 @@ avoids the second case.
 Dropping or renaming a published column, or changing its type or type
 modifier, changes it for every row with no row change logged either. Calque
 reads the definition of every published column every second while it streams
-and at every start, and stops change capture the same way. One rewrite
-escapes that check: `ALTER COLUMN ... TYPE` to the column's own type and
-modifier with a `USING` expression changes every value and leaves the
-definition as it was. Run `calque destroy` and start again after one.
+and at every start, and stops change capture the same way.
+
+`ALTER COLUMN ... TYPE` to the column's own type and modifier with a `USING`
+expression changes every value and leaves the definition as it was. It does
+give the column's catalog row and the table's storage file new versions in one
+transaction, and Calque reads both with the definition: when both changed
+since its last read, it stops change capture the same way. A change to the
+column alone, such as a grant, a default or `NOT NULL`, keeps it serving, and
+so does a new file alone, from `VACUUM FULL`, `CLUSTER` or `TRUNCATE`. Both
+between two of Calque's reads stop it too: within the same second while it
+streams, or both while it is stopped.
 
 Change capture gives up a replication stream that carries nothing for its
 walsender's `wal_sender_timeout`, at least 5 s and 60 s when it is 0, and
@@ -90,7 +97,18 @@ CREATE PUBLICATION calque_app FOR TABLE public.projects, public.tasks;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.projects, public.tasks TO calque_sync;
 ```
 
-A table in a schema other than `public` also needs
+A table under row-level security needs Calque's role to read past its
+policies. Otherwise PostgreSQL hands the snapshot only the rows the policies
+allow while change capture sends every row, so Calque refuses the table with
+`ROW_LEVEL_SECURITY_ACTIVE`. A superuser, or a role that has `BYPASSRLS`,
+grants it:
+
+```sql
+ALTER ROLE calque_sync BYPASSRLS;
+```
+
+What each browser receives is decided by Calque's own authorization, not by
+the table's policies. A table in a schema other than `public` also needs
 `GRANT USAGE ON SCHEMA <schema> TO calque_sync`. When the publication is
 missing, Calque creates it only if its role owns every table, and otherwise
 refuses with that `CREATE PUBLICATION` statement for the owner to run.
@@ -244,8 +262,8 @@ publication, `calque_sync` the role.
 | `POSTGRES_VERSION_UNSUPPORTED` | The server is not PostgreSQL 18. | Upgrade to 18. |
 | `SERVER_ENCODING_UNSUPPORTED` | The database is not UTF-8. | A database's encoding cannot change: create one with `CREATE DATABASE app ENCODING 'UTF8' TEMPLATE template0` and move the tables. |
 | `WAL_LEVEL_NOT_LOGICAL` | `wal_level` is `replica`, which is what a stock server starts with. | `ALTER SYSTEM SET wal_level = 'logical'`, then restart PostgreSQL. On a managed database, turn on logical replication in its console. |
-| `NO_REPLICATION_SLOT_CAPACITY` | `max_replication_slots` is 0. When it is positive but every slot is taken, PostgreSQL itself refuses the connection with SQLSTATE `53400`. | `ALTER SYSTEM SET max_replication_slots = 10`, then restart. Each server uses one slot, so allow for every server and for leftovers: `SELECT slot_name, active FROM pg_replication_slots` lists them, and `calque destroy` removes the ones Calque made. |
-| `NO_WAL_SENDER_CAPACITY` | `max_wal_senders` is 0. | `ALTER SYSTEM SET max_wal_senders = 10`, then restart. Each server uses one WAL sender, and so does every standby and every other replication client. |
+| `NO_REPLICATION_SLOT_CAPACITY` | `max_replication_slots` is 0. When it is positive but every slot is taken, PostgreSQL itself refuses the connection with SQLSTATE `53400`. | `ALTER SYSTEM SET max_replication_slots = 10`, then restart. Each server uses two at once, one for change capture and one while it prepares, so allow for every server and for leftovers: `SELECT slot_name, active FROM pg_replication_slots` lists them, and `calque destroy` removes the ones Calque made. |
+| `NO_WAL_SENDER_CAPACITY` | `max_wal_senders` is 0. | `ALTER SYSTEM SET max_wal_senders = 10`, then restart. Each server uses two at once, as it does slots, and every standby and every other replication client uses one. |
 | `SUPERUSER_NOT_LEAST_PRIVILEGE` | The role in `CALQUE_DATABASE_URL` is a superuser. | Connect as the role from [The role](#the-role), which is not one. |
 | `REPLICATION_PRIVILEGE_REQUIRED` | The role has no `REPLICATION` attribute and is not a member of `rds_replication`. | `ALTER ROLE calque_sync REPLICATION`. On RDS and Aurora, `GRANT rds_replication TO calque_sync`. |
 | `SOURCE_IDENTITY_MISMATCH` | The database now reached is not the cluster and timeline the state directory enrolled: it was restored, promoted or replaced. | `calque destroy --state-dir <dir> --yes`, then start the server again. |
@@ -253,6 +271,19 @@ publication, `calque_sync` the role.
 | `PUBLICATION_OPERATION_MISSING` | The publication leaves out `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE`. | `ALTER PUBLICATION calque_app SET (publish = 'insert, update, delete, truncate')` |
 | `PUBLICATION_VIA_PARTITION_ROOT_UNSUPPORTED` | The publication sets `publish_via_partition_root`. | `ALTER PUBLICATION calque_app SET (publish_via_partition_root = false)` |
 | `TABLE_MISSING`, `TABLE_NOT_INSPECTED` | A `--table` names no table in the database, or no table the inspection could read. | Write the table as `schema.name`, as `public.tasks`, and check it with `\dt public.*`. |
+
+`calque dev` and `calque serve` also refuse to start when PostgreSQL could not
+hold every preparation they may run at once beside change capture. Each
+preparation holds a replication slot, a WAL sender and 6 ordinary
+connections, and change capture and serving hold one slot, one WAL sender and
+up to 24 connections. A server whose scope is source-wide runs one
+preparation at a time, so it needs 2 slots, 2 WAL senders and 30
+connections. One whose scope is partitioned runs up to
+`--max-tenant-builds`, 4 by default, so it needs 5, 5 and 48. The slots and
+WAL senders must be free. The connections are checked against the lowest of
+`max_connections` less the connections it reserves, the role's `CONNECTION
+LIMIT` and the database's. Your application's connections count against the
+same limits, so leave room for them.
 | `TABLE_NOT_IN_PUBLICATION` | The table exists but the publication does not list it. | `ALTER PUBLICATION calque_app ADD TABLE public.tasks` |
 | `RELATION_KIND_UNSUPPORTED` | The table is a view, a partitioned table or a partition. | Enroll an ordinary table instead, such as a projection table that your application keeps in step. |
 | `TABLE_NOT_PERMANENT` | The table is `UNLOGGED` or temporary. | `ALTER TABLE tasks SET LOGGED` |
@@ -262,6 +293,7 @@ publication, `calque_sync` the role.
 | `PRIMARY_KEY_COLLATION_NONDETERMINISTIC` | A `text` or `varchar` key uses a nondeterministic collation. | `ALTER TABLE tasks ALTER COLUMN k TYPE text COLLATE "default"` |
 | `REPLICA_IDENTITY_INSUFFICIENT`, `CUSTOM_REPLICA_IDENTITY_UNSUPPORTED` | The replica identity is `NOTHING`, or `USING INDEX`. | `ALTER TABLE tasks REPLICA IDENTITY DEFAULT` |
 | `PUBLICATION_ROW_FILTER_UNSUPPORTED` | The publication lists the table with a `WHERE` clause. | Publish every row. `SET TABLE` replaces the list, so name every table: `ALTER PUBLICATION calque_app SET TABLE public.tasks, public.projects` |
+| `ROW_LEVEL_SECURITY_ACTIVE` | Row-level security applies to Calque's role on the table: the role does not own it, or the table forces its policies on the owner too. | `ALTER ROLE calque_sync BYPASSRLS`, as a superuser or a role that has `BYPASSRLS` |
 | `PUBLICATION_COLUMN_LIST_OMITS_KEY` | The publication's column list leaves out a primary-key column. | Add the column to the collection's `columns`, or to the list, as in `ALTER PUBLICATION calque_app SET TABLE public.tasks (id, title), public.projects` |
 | `PUBLICATION_COLUMN_LIST_WITH_FULL_IDENTITY` | The publication lists the columns of a table with `REPLICA IDENTITY FULL`, on which PostgreSQL then refuses every update and delete. | Publish the table whole, or `ALTER TABLE tasks REPLICA IDENTITY DEFAULT` |
 | `TYPE_CODEC_UNSUPPORTED` | A column has a type outside the list above, such as an array or a range. | Leave the column out of the publication's column list, change the type, as in `ALTER TABLE tasks ALTER COLUMN tags TYPE jsonb USING to_jsonb(tags)`, or enroll a projection table without the column. |

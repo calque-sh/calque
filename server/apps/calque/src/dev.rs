@@ -20,7 +20,7 @@ use authz::{
 };
 use blob_store::LocalFilesystemBlobStore;
 use calque_engine::{
-    check_replication_capacity, destroy_local_source, inspect_local_identity, local_router,
+    check_postgres_capacity, destroy_local_source, inspect_local_identity, local_router,
     metrics_router, prepare_local_source, prepare_selected_local_source,
     start_local_source_runtime, ArtifactBuilder, CanonicalHeadSignal, GenerationArtifactPublisher,
     HttpBinding, LocalArtifactResolver, LocalBackend, LocalBackendConfig, LocalCredentialPolicy,
@@ -409,14 +409,16 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
         refresh: command.recut.policy(),
         ..TenantSettings::default()
     };
-    if partitioned {
-        check_replication_capacity(
-            &database_url,
-            tenant_settings.max_builds,
-            &state.names.slot_name,
-        )
-        .await?;
-    }
+    check_postgres_capacity(
+        &database_url,
+        if partitioned {
+            tenant_settings.max_builds
+        } else {
+            1
+        },
+        &state.names.slot_name,
+    )
+    .await?;
     state_store.write_client_env(&binding, &secrets.bearer_token)?;
 
     let mut catalog = SqliteArtifactCatalog::open(state_store.root().join("catalog.sqlite3"))?;

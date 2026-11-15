@@ -15,7 +15,7 @@ use blob_store::{
     S3Endpoint,
 };
 use calque_engine::{
-    check_replication_capacity, inspect_local_identity, local_router, metrics_router,
+    check_postgres_capacity, inspect_local_identity, local_router, metrics_router,
     prepare_selected_local_source, start_local_source_runtime, AllowedOrigin, ArtifactBuilder,
     AuthorizationFenceStore, CanonicalHeadSignal, CommandOperation, DatabaseUrl,
     GenerationArtifactPublisher, GuardError, HttpBinding, LocalArtifactResolver, LocalBackend,
@@ -375,16 +375,19 @@ async fn serve_configured(
     let mount = MutationMount::compile(&commands);
     let partitioned = config.partition_attribute.is_some();
     // Before change capture takes its own slot and sender, so a PostgreSQL
-    // that cannot hold every tenant build at once is refused at startup
-    // rather than when the cap's last build cannot get a slot.
-    if partitioned {
-        check_replication_capacity(
-            &database_url,
-            command.tenants.max_tenant_builds,
-            &state.names.slot_name,
-        )
-        .await?;
-    }
+    // that cannot hold every build that may run at once is refused at
+    // startup rather than when the last of them cannot get a slot or a
+    // connection.
+    check_postgres_capacity(
+        &database_url,
+        if partitioned {
+            command.tenants.max_tenant_builds
+        } else {
+            1
+        },
+        &state.names.slot_name,
+    )
+    .await?;
 
     let mut catalog = SqliteArtifactCatalog::open(state_store.root().join("catalog.sqlite3"))?;
     let store = open_object_store(object_store_kind, state_store.root())?;
@@ -2184,6 +2187,7 @@ mod tests {
             is_partition: false,
             has_publication_row_filter: false,
             has_publication_column_list: false,
+            row_security_active: false,
             unlisted_columns: Vec::new(),
             columns,
         }

@@ -367,7 +367,8 @@ docker run --name calque-pg-live --rm -d \
   -c max_connections=400
 
 # Waits for the server, checks wal_level, slots, senders, connections and the
-# major version, creates the role and database (idempotent), and asserts the
+# major version, creates the role and database (idempotent), drops the
+# replication slots earlier runs left idle for 10 minutes, and asserts the
 # role is not a superuser. Then runs the suite and fails if fewer distinct
 # tests passed than `cargo test -- --ignored --list` names under the same
 # harness args, so `run 55433 --exact <name>` runs one test and a filter

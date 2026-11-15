@@ -2,8 +2,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { stubBrowserFeatures } from "../browser.fixture.js";
 import { eq } from "../facade/predicates.js";
-import { UNLISTENED_GRACE_MS as GRACE_MS } from "./query-subscription.js";
-import { makeClient, settled } from "./session.fixture.js";
+import {
+  RELEASED_SUBSCRIPTIONS,
+  UNLISTENED_GRACE_MS as GRACE_MS,
+} from "./query-subscription.js";
+import {
+  makeClient,
+  makePublishingClient,
+  settled,
+  until,
+} from "./session.fixture.js";
 
 describe("subscriptions no component listens to", () => {
   beforeEach(() => {
@@ -15,7 +23,7 @@ describe("subscriptions no component listens to", () => {
     vi.unstubAllGlobals();
   });
 
-  it("releases the resources of renders React discarded", async () => {
+  it("keeps only the newest released resources of renders React discarded", async () => {
     const { client } = makeClient();
     expect(await settled(client)).toEqual({ state: "ready" });
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -29,9 +37,54 @@ describe("subscriptions no component listens to", () => {
       discarded.push({ query, resource });
     }
     vi.advanceTimersByTime(GRACE_MS);
-    for (const { query, resource } of discarded)
+    const forgotten = discarded.length - RELEASED_SUBSCRIPTIONS;
+    for (const { query, resource } of discarded.slice(0, forgotten))
       expect(query.subscribe()).not.toBe(resource);
+    for (const { query, resource } of discarded.slice(forgotten))
+      expect(query.subscribe()).toBe(resource);
     vi.useRealTimers();
+    await client.close();
+  });
+
+  it("gives a released resource back with its rows and reads again only once they are stale", async () => {
+    const { client, worker } = makeClient();
+    expect(await settled(client)).toEqual({ state: "ready" });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const query = client.db.events.query().where(eq("level", "error"));
+    const resource = query.subscribe();
+    await resource.promise;
+    const reads = () =>
+      worker.requests.filter(({ type }) => type === "frame").length;
+    const first = reads();
+    vi.advanceTimersByTime(GRACE_MS * 2);
+    expect(query.subscribe()).toBe(resource);
+    expect(resource.getSnapshot()).toMatchObject({ status: "ready" });
+    const stop = resource.subscribe(() => undefined);
+    for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+    expect(reads()).toBe(first);
+    stop();
+    vi.useRealTimers();
+    await client.close();
+  });
+
+  it("reads a released resource again when a publication moved its rows meanwhile", async () => {
+    const { client, worker, publish } = makePublishingClient();
+    expect(await settled(client)).toEqual({ state: "ready" });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const query = client.db.events.query().where(eq("level", "error"));
+    const resource = query.subscribe();
+    await resource.promise;
+    vi.advanceTimersByTime(GRACE_MS * 2);
+    vi.useRealTimers();
+    const reads = () =>
+      worker.requests.filter(({ type }) => type === "frame").length;
+    const first = reads();
+    await publish();
+    expect(reads()).toBe(first);
+    expect(query.subscribe()).toBe(resource);
+    const stop = resource.subscribe(() => undefined);
+    await until(() => reads() === first + 1, "the read of the stale rows");
+    stop();
     await client.close();
   });
 

@@ -12,7 +12,8 @@
 
 use std::{
     collections::BTreeSet,
-    sync::{Arc, Mutex as StdMutex},
+    ops::{Deref, DerefMut},
+    sync::{Arc, Mutex as StdMutex, MutexGuard},
     time::Duration,
 };
 
@@ -58,6 +59,55 @@ pub struct AuthorizationFenceStore {
     /// The scopes this process has recorded as issued, so each costs one
     /// write per process.
     issued: Arc<StdMutex<IssuedScopes>>,
+    /// The one connection every clone uses in turn, so a burst of first
+    /// bootstraps of new scopes waits for it rather than opening a
+    /// connection each.
+    connection: Arc<StdMutex<KeptConnection>>,
+}
+
+/// The store's connection between operations. A `postgres::Client` closes by
+/// blocking on a runtime of its own, which panics on a thread that drives
+/// async tasks, so one dropped there closes on a thread of its own.
+#[derive(Default)]
+struct KeptConnection {
+    client: Option<postgres::Client>,
+}
+
+impl Drop for KeptConnection {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::spawn(move || drop(client));
+        }
+    }
+}
+
+/// How long a check that the kept connection still answers may take.
+const CONNECTION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The store's connection, held for one operation.
+struct FenceConnection<'a>(MutexGuard<'a, KeptConnection>);
+
+impl Deref for FenceConnection<'_> {
+    type Target = postgres::Client;
+
+    fn deref(&self) -> &postgres::Client {
+        self.0
+            .client
+            .as_ref()
+            .expect("a fence connection holds a client")
+    }
+}
+
+impl DerefMut for FenceConnection<'_> {
+    fn deref_mut(&mut self) -> &mut postgres::Client {
+        self.0
+            .client
+            .as_mut()
+            .expect("a fence connection holds a client")
+    }
 }
 
 /// Generation and scope hash.
@@ -122,6 +172,7 @@ impl AuthorizationFenceStore {
             database_url,
             source_id,
             issued: Arc::default(),
+            connection: Arc::default(),
         }
     }
 
@@ -283,7 +334,7 @@ impl AuthorizationFenceStore {
         revoked
             .into_iter()
             .map(|revoked| {
-                retirement_in(&mut client, source_id, revoked)?
+                retirement_in(&mut *client, source_id, revoked)?
                     .ok_or(AuthorizationFenceError::Corrupt)
             })
             .collect()
@@ -346,12 +397,25 @@ impl AuthorizationFenceStore {
         lock(&self.issued).contains(&(generation, *scope_hash))
     }
 
-    fn connect(&self) -> Result<postgres::Client, AuthorizationFenceError> {
-        Ok(connect_owned(
-            &self.database_url,
-            PostgresConnectionFamily::FenceControl,
-            "calque-authorization-fence",
-        )?)
+    /// The kept connection while it still answers, and otherwise a new one
+    /// kept in its place.
+    fn connect(&self) -> Result<FenceConnection<'_>, AuthorizationFenceError> {
+        let mut slot = lock(&self.connection);
+        if slot
+            .client
+            .as_mut()
+            .is_some_and(|client| client.is_valid(CONNECTION_CHECK_TIMEOUT).is_err())
+        {
+            slot.client = None;
+        }
+        if slot.client.is_none() {
+            slot.client = Some(connect_owned(
+                &self.database_url,
+                PostgresConnectionFamily::FenceControl,
+                "calque-authorization-fence",
+            )?);
+        }
+        Ok(FenceConnection(slot))
     }
 }
 
@@ -940,6 +1004,51 @@ mod tests {
             barrier_cursor,
             issued_at_unix_micros: 7,
         }
+    }
+
+    /// A burst of first bootstraps of new scopes records them all through the
+    /// store's one connection, and a connection PostgreSQL closed is replaced
+    /// on the next use rather than failing it.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn every_issue_shares_one_connection_and_a_closed_one_is_replaced() {
+        let live = LiveFence::new();
+        live.store.establish(1).unwrap();
+        let backend = |store: &AuthorizationFenceStore| -> i32 {
+            store
+                .connect()
+                .unwrap()
+                .query_one("SELECT pg_backend_pid()", &[])
+                .unwrap()
+                .get(0)
+        };
+        let first = backend(&live.store);
+        std::thread::scope(|scope| {
+            for scope_byte in 0..32_u8 {
+                let store = live.store.clone();
+                scope.spawn(move || store.issue(1, [scope_byte; 32]).unwrap());
+            }
+        });
+        assert_eq!(live.issued().len(), 32);
+        assert_eq!(backend(&live.store), first);
+
+        let terminated: bool = live
+            .client()
+            .query_one("SELECT pg_terminate_backend($1, 5000)", &[&first])
+            .unwrap()
+            .get(0);
+        assert!(terminated);
+        live.store.issue(1, [99; 32]).unwrap();
+        assert_eq!(live.issued().len(), 33);
+        assert_ne!(backend(&live.store), first);
+
+        // `serve` drops its store on a thread that drives async tasks.
+        let store = live.other_process();
+        store.issue(1, [100; 32]).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async move { drop(store) });
     }
 
     /// One barrier for each scope issued under the retired generation, by

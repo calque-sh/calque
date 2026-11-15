@@ -1029,6 +1029,7 @@ mod tests {
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: !relation.unlisted_required_columns.is_empty(),
+                row_security_active: false,
                 unlisted_columns: relation
                     .unlisted_required_columns
                     .iter()

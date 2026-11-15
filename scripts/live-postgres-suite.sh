@@ -12,7 +12,8 @@
 #       wal_level/slots/senders/connections, and create the least-privilege
 #       role and database inside it, with the functions
 #       scripts/live-postgres-suite.sql installs for what only a superuser may
-#       create (idempotent; safe to rerun).
+#       create (idempotent; safe to rerun). It also drops the replication
+#       slots earlier runs left idle.
 #
 #   scripts/live-postgres-suite.sh env <port>
 #       Print the seven `export` lines the suite reads (eval or source them):
@@ -42,10 +43,12 @@
 # would hide an uncovered provider behind a green run.
 #
 # Tunables (all optional): CALQUE_LIVEPG_ROLE, CALQUE_LIVEPG_PASSWORD,
-# CALQUE_LIVEPG_DATABASE, CALQUE_LIVEPG_HOST, CALQUE_LIVEPG_SUPERUSER, and
+# CALQUE_LIVEPG_DATABASE, CALQUE_LIVEPG_HOST, CALQUE_LIVEPG_SUPERUSER,
 # CALQUE_LIVEPG_PACKAGES, the cargo package selection `run` tests (default
 # `--workspace --exclude blob-store`; CI splits the suite into shards with it,
-# and the completeness check below counts the same selection).
+# and the completeness check below counts the same selection), and
+# CALQUE_LIVEPG_IDLE_SLOT_MINUTES, how long a replication slot stays idle
+# before `bootstrap` drops it as a leftover (default 10).
 set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -56,6 +59,7 @@ database=${CALQUE_LIVEPG_DATABASE:-calque_verify}
 host=${CALQUE_LIVEPG_HOST:-127.0.0.1}
 superuser=${CALQUE_LIVEPG_SUPERUSER:-postgres}
 packages=${CALQUE_LIVEPG_PACKAGES:---workspace --exclude blob-store}
+idle_slot_minutes=${CALQUE_LIVEPG_IDLE_SLOT_MINUTES:-10}
 
 # All of these want the same connection string, and no single one covers the
 # suite. Five are each required by some ignored test, which fails rather than
@@ -99,6 +103,9 @@ container_psql() {
 bootstrap() {
   container=${1:-}
   [ -n "$container" ] || usage
+  case "$idle_slot_minutes" in
+    ''|*[!0-9]*) printf '%s\n' 'CALQUE_LIVEPG_IDLE_SLOT_MINUTES must be a whole number of minutes' >&2; exit 2 ;;
+  esac
   # Over TCP, not the Unix socket. The image's entrypoint first runs a
   # temporary initdb server that listens on the socket only, and `pg_isready`
   # against the socket reports it ready just before it shuts down to make way
@@ -207,6 +214,25 @@ SQL
     pg_catalog.pg_replication_origin_create(text), pg_catalog.pg_replication_origin_drop(text),
     pg_catalog.pg_replication_origin_session_setup(text),
     pg_catalog.pg_replication_origin_session_reset() TO \"$role\";"
+
+  # A live test that panics before its cleanup leaves its replication slot
+  # behind, and a container kept between runs collects them until unrelated
+  # tests fail with SQLSTATE 53400, all replication slots are in use. No test
+  # leaves a slot idle for $idle_slot_minutes minutes, so one idle that long
+  # is a leftover even while another run uses the server. A logical slot is
+  # dropped from its own database.
+  container_psql "$container" -F ' ' -c "SELECT database, slot_name FROM pg_catalog.pg_replication_slots
+     WHERE slot_type = 'logical' AND NOT active AND NOT temporary
+       AND inactive_since < now() - make_interval(mins => $idle_slot_minutes)" |
+    while read -r slot_database slot_name; do
+      [ -n "$slot_name" ] || continue
+      if container_psql "$container" -d "$slot_database" \
+        -c "SELECT pg_catalog.pg_drop_replication_slot('$slot_name')" </dev/null >/dev/null; then
+        printf 'dropped replication slot %s, idle in %s for over %s minutes\n' "$slot_name" "$slot_database" "$idle_slot_minutes"
+      else
+        printf 'could not drop idle replication slot %s in %s\n' "$slot_name" "$slot_database" >&2
+      fi
+    done
 
   privileges=$(container_psql "$container" -c "SELECT rolsuper, rolreplication, rolcreatedb, rolcreaterole FROM pg_catalog.pg_roles WHERE rolname = '$role';")
   if [ "$privileges" != 'f|t|t|t' ]; then

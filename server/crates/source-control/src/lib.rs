@@ -273,6 +273,10 @@ pub struct TableInspection {
     pub is_partition: bool,
     pub has_publication_row_filter: bool,
     pub has_publication_column_list: bool,
+    /// Row-level security filters what Calque's role reads of the table.
+    /// Serialized only when it does, which a served table never does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub row_security_active: bool,
     /// The columns the publication carries, in attribute order.
     pub columns: Vec<ColumnInspection>,
     /// The columns its column list leaves out. Serialized only when there
@@ -547,7 +551,8 @@ pub fn inspect_source(
                        WHERE publication.pubname = $1
                          AND publication_relation.prrelid = class.oid
                          AND publication_relation.prattrs IS NOT NULL
-                    )
+                    ),
+                    pg_catalog.row_security_active(class.oid)
                FROM unnest($2::name[], $3::name[])
                     WITH ORDINALITY AS required(schema_name, table_name, ordinality)
                JOIN pg_catalog.pg_namespace AS namespace
@@ -689,6 +694,7 @@ pub fn inspect_source(
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                row_security_active: false,
                 unlisted_columns: Vec::new(),
                 columns: Vec::new(),
             });
@@ -705,6 +711,7 @@ pub fn inspect_source(
             is_partition: relation.get(5),
             has_publication_row_filter: relation.get(6),
             has_publication_column_list: relation.get(7),
+            row_security_active: relation.get(8),
             columns: columns.remove(&relation_oid).unwrap_or_default(),
             unlisted_columns: unlisted.remove(&relation_oid).unwrap_or_default(),
         });
@@ -1078,6 +1085,18 @@ fn validate_tables(
                 required,
             ));
         }
+        if table.row_security_active {
+            diagnostics.push(table_error(
+                "ROW_LEVEL_SECURITY_ACTIVE",
+                format!(
+                    "row-level security filters what role {:?} reads of {}, so a snapshot would hold only the rows its policies allow while change capture sends every row; run ALTER ROLE {} BYPASSRLS",
+                    snapshot.settings.current_user,
+                    required.display_name(),
+                    quote_identifier(&snapshot.settings.current_user)
+                ),
+                required,
+            ));
+        }
         for column in &table.unlisted_columns {
             if column.primary_key {
                 diagnostics.push(column_error(
@@ -1289,6 +1308,7 @@ mod tests {
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                row_security_active: false,
                 unlisted_columns: Vec::new(),
                 columns: vec![ColumnInspection {
                     attribute_number: 1,
@@ -1860,6 +1880,7 @@ mod tests {
         snapshot.tables[0].is_partition = true;
         snapshot.tables[0].replica_identity = 'i';
         snapshot.tables[0].has_publication_row_filter = true;
+        snapshot.tables[0].row_security_active = true;
         let report = validate_enrollment(&snapshot, &requirements());
         let codes: BTreeSet<_> = report
             .diagnostics
@@ -1871,6 +1892,7 @@ mod tests {
         assert!(codes.contains("RELATION_KIND_UNSUPPORTED"));
         assert!(codes.contains("CUSTOM_REPLICA_IDENTITY_UNSUPPORTED"));
         assert!(codes.contains("PUBLICATION_ROW_FILTER_UNSUPPORTED"));
+        assert!(codes.contains("ROW_LEVEL_SECURITY_ACTIVE"));
     }
 
     /// Each publication refusal names what to change, not only what is wrong.

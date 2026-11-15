@@ -908,6 +908,10 @@ fn snapshot_endpoint(
         .map_err(|_| LocalSnapshotError::Connection)?;
     endpoint.config_mut().application_name("calque-snapshot");
     endpoint.bound_replies(SNAPSHOT_STATEMENT_TIMEOUT);
+    // PostgreSQL then refuses a read that row-level security would filter, so
+    // a policy that applies to Calque's role fails the build instead of
+    // leaving rows out of a snapshot that change capture keeps sending.
+    endpoint.append_options("-c row_security=off");
     // A COPY runs as long as its table takes, so only the reply bound limits
     // the copy connections.
     if family != PostgresConnectionFamily::SnapshotCopy {
@@ -1273,7 +1277,69 @@ pub(crate) mod tests {
                 statement_timeout,
                 "{family:?}: {options}"
             );
+            assert!(
+                options.contains("row_security=off"),
+                "{family:?}: {options}"
+            );
         }
+    }
+
+    /// Every snapshot connection refuses a read that row-level security would
+    /// filter, so a role that loses BYPASSRLS while a build copies fails the
+    /// build instead of leaving rows out of it.
+    #[tokio::test]
+    #[ignore = "requires CALQUE_CONTROL_DATABASE_URL or CALQUE_DATABASE_URL"]
+    async fn every_snapshot_connection_refuses_a_read_row_level_security_filters() {
+        let database = DatabaseUrl::parse(
+            &std::env::var("CALQUE_CONTROL_DATABASE_URL")
+                .or_else(|_| std::env::var("CALQUE_DATABASE_URL"))
+                .expect("live database URL"),
+        )
+        .unwrap();
+        let (owner, connection) = database
+            .endpoint(PostgresConnectionFamily::SnapshotRegistry)
+            .unwrap()
+            .connect_async()
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        let table = format!("public.rls_{}", Uuid::new_v4().simple());
+        owner
+            .batch_execute(&format!(
+                "CREATE TABLE {table} (id bigint PRIMARY KEY);
+                 INSERT INTO {table} VALUES (1), (2);
+                 ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE {table} FORCE ROW LEVEL SECURITY;
+                 CREATE POLICY hide_every_row ON {table} USING (false);"
+            ))
+            .await
+            .unwrap();
+        let count = format!("SELECT count(*) FROM {table}");
+        let filtered: i64 = owner.query_one(&count, &[]).await.unwrap().get(0);
+        assert_eq!(
+            filtered, 0,
+            "an ordinary connection reads through the policy"
+        );
+
+        let failures = ConnectionFailures::default();
+        for family in [
+            PostgresConnectionFamily::SnapshotControl,
+            PostgresConnectionFamily::SnapshotDdlGuard,
+            PostgresConnectionFamily::SnapshotPressure,
+            PostgresConnectionFamily::SnapshotCopy,
+        ] {
+            let client = connect_owned(&database, family, &failures).await.unwrap();
+            let refused = client.query_one(&count, &[]).await.unwrap_err();
+            assert_eq!(
+                refused.code(),
+                Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+                "{family:?}: {refused:?}"
+            );
+        }
+        owner
+            .batch_execute(&format!("DROP TABLE {table}"))
+            .await
+            .unwrap();
     }
 
     #[test]

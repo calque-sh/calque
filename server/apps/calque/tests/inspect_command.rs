@@ -13,7 +13,6 @@ use std::{
         Arc,
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use postgres::{Client, NoTls};
@@ -116,14 +115,7 @@ impl LiveRelation {
         let database_url = std::env::var("TEST_DATABASE_URL")
             .expect("TEST_DATABASE_URL is required; run through scripts/live-postgres-suite.sh");
         let mut client = Client::connect(&database_url, NoTls).unwrap();
-        let suffix = format!(
-            "{}_{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
         let table = format!("inspect_blockers_{suffix}");
         let publication = format!("inspect_blockers_{suffix}");
         client
@@ -197,6 +189,47 @@ fn inspect_names_each_blocker_and_its_fix() {
     assert!(!stderr.contains("EnrollmentDiagnostic"), "{stderr}");
 }
 
+/// `inspect` refuses a table whose row-level security applies to the role it
+/// connects as, naming the role and the fix, and passes the table once the
+/// role reads every row of it. The suite's role owns the table, so `FORCE`
+/// stands in for a policy on a table another role owns.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn inspect_refuses_a_table_row_level_security_filters() {
+    let database_url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let mut relation = LiveRelation::create("id bigint PRIMARY KEY, title text");
+    let table = format!("public.{}", relation.table);
+    relation
+        .client
+        .batch_execute(&format!(
+            "ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY first_rows ON {table} USING (id < 10);"
+        ))
+        .unwrap();
+    let (success, stderr) = inspect_table(&database_url, &relation.publication, &table);
+    assert!(success, "the owner reads past an unforced policy: {stderr}");
+
+    relation
+        .client
+        .batch_execute(&format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY"))
+        .unwrap();
+    let role: String = relation
+        .client
+        .query_one("SELECT current_user::text", &[])
+        .unwrap()
+        .get(0);
+    let (success, stderr) = inspect_table(&database_url, &relation.publication, &table);
+    assert!(!success);
+    assert!(
+        stderr.contains(&format!(
+            "ROW_LEVEL_SECURITY_ACTIVE: row-level security filters what role {role:?} reads of {table}, \
+             so a snapshot would hold only the rows its policies allow while change capture sends every row; \
+             run ALTER ROLE \"{role}\" BYPASSRLS [{table}]"
+        )),
+        "{stderr}"
+    );
+}
+
 /// `inspect` refuses an enum of more labels than `dev` and `serve` start
 /// with, naming the column, and passes one of exactly as many.
 #[test]
@@ -205,14 +238,7 @@ fn inspect_refuses_an_enum_of_more_labels_than_calque_serves() {
     let database_url = std::env::var("TEST_DATABASE_URL").unwrap();
     let mut client = Client::connect(&database_url, NoTls).unwrap();
     for count in [4_096, 4_097] {
-        let kind = format!(
-            "inspect_labels_{}_{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
+        let kind = format!("inspect_labels_{}", uuid::Uuid::new_v4().simple());
         let labels = (0..count)
             .map(|label| format!("'l{label}'"))
             .collect::<Vec<_>>()

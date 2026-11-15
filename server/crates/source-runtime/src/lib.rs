@@ -22,11 +22,13 @@ use postgres::{error::SqlState, Client, Transaction};
 use sync_types::{SourceEpoch, SourceId};
 use thiserror::Error;
 
+mod column_versions;
 mod enum_labels;
 mod persistent_ingest;
 mod publication;
 mod slot_owner;
 
+pub use column_versions::ColumnVersion;
 pub use enum_labels::{EnumLabelDrift, SeenEnumVersion, ServedEnumLabel};
 
 pub use persistent_ingest::{
@@ -217,6 +219,16 @@ CREATE TABLE IF NOT EXISTS calque_control.source_enum_version (
     value_xmin bigint NOT NULL,
     seen_from_lsn text NOT NULL,
     PRIMARY KEY (source_id, value_oid, value_xmin)
+);
+CREATE TABLE IF NOT EXISTS calque_control.source_column_version (
+    source_id text NOT NULL
+        REFERENCES calque_control.source_slot_enrollment (source_id) ON DELETE CASCADE,
+    source_epoch text NOT NULL,
+    relation_oid bigint NOT NULL,
+    attribute_number smallint NOT NULL,
+    attribute_xmin bigint NOT NULL,
+    relation_filenode bigint NOT NULL,
+    PRIMARY KEY (source_id, relation_oid, attribute_number)
 );
 "#;
 
@@ -475,6 +487,14 @@ pub trait FenceStore: Send + Sync {
         &self,
         lease: &LeaseIdentity,
         versions: &[SeenEnumVersion],
+    ) -> Result<(), FenceError>;
+
+    /// Replaces the served column versions an active lease's enrollment
+    /// records as last seen with `versions`.
+    fn record_column_versions(
+        &self,
+        lease: &LeaseIdentity,
+        versions: &[ColumnVersion],
     ) -> Result<(), FenceError>;
 
     fn transition_active(
@@ -869,6 +889,16 @@ where
         })
     }
 
+    pub(crate) fn record_column_versions(
+        &self,
+        lease: &ActiveLease,
+        versions: &[ColumnVersion],
+    ) -> Result<(), FenceError> {
+        self.operate_active(lease, |identity| {
+            self.store.record_column_versions(identity, versions)
+        })
+    }
+
     fn release_revoked_active(&self, lease: &ActiveLease) -> Result<(), FenceError> {
         let result = self.store.release(lease.identity());
         lease.revoke();
@@ -1248,6 +1278,17 @@ impl FenceStore for PostgresFenceStore {
                 .into_iter()
                 .map(seen_enum_version_from_row)
                 .collect::<Result<_, _>>()?;
+            enrollment.column_versions = transaction
+                .query(
+                    "SELECT relation_oid, attribute_number, attribute_xmin, relation_filenode
+                       FROM calque_control.source_column_version
+                      WHERE source_id = $1 AND source_epoch = $2",
+                    &[&lease.source_id.as_str(), &lease.source_epoch.as_str()],
+                )
+                .map_err(store_error)?
+                .into_iter()
+                .map(column_version_from_row)
+                .collect::<Result<_, _>>()?;
             // The canonical log creates its retention table on first connect.
             let log_installed: bool = transaction
                 .query_one(
@@ -1317,7 +1358,8 @@ impl FenceStore for PostgresFenceStore {
             if affected != 1 {
                 return Err(FenceError::SlotLifecycleAlreadyInitialized);
             }
-            insert_enum_labels(transaction, lease, &enrollment.enum_labels)
+            insert_enum_labels(transaction, lease, &enrollment.enum_labels)?;
+            replace_column_versions(transaction, lease, &enrollment.column_versions)
         })
     }
 
@@ -1422,6 +1464,22 @@ impl FenceStore for PostgresFenceStore {
                 return Err(FenceError::SlotEnrollmentMismatch);
             }
             Ok(())
+        })
+    }
+
+    fn record_column_versions(
+        &self,
+        lease: &LeaseIdentity,
+        versions: &[ColumnVersion],
+    ) -> Result<(), FenceError> {
+        self.with_owned_lease(lease, |transaction, current| {
+            if current.phase != LeasePhase::Active {
+                return Err(FenceError::WrongLeasePhase {
+                    expected: LeasePhase::Active,
+                    actual: current.phase,
+                });
+            }
+            replace_column_versions(transaction, lease, versions)
         })
     }
 
@@ -1771,6 +1829,59 @@ fn seen_enum_version_from_row(row: postgres::Row) -> Result<SeenEnumVersion, Fen
         seen_from: pg_walstream::parse_lsn(row.get::<_, &str>(2))
             .map_err(|_| FenceError::SlotEnrollmentMismatch)?,
     })
+}
+
+fn column_version_from_row(row: postgres::Row) -> Result<ColumnVersion, FenceError> {
+    let oid = |index: usize| {
+        u32::try_from(row.get::<_, i64>(index)).map_err(|_| FenceError::SlotEnrollmentMismatch)
+    };
+    Ok(ColumnVersion {
+        relation_oid: oid(0)?,
+        attribute_number: row.get(1),
+        attribute_xmin: oid(2)?,
+        relation_filenode: oid(3)?,
+    })
+}
+
+fn replace_column_versions(
+    transaction: &mut Transaction<'_>,
+    lease: &LeaseIdentity,
+    versions: &[ColumnVersion],
+) -> Result<(), FenceError> {
+    transaction
+        .execute(
+            "DELETE FROM calque_control.source_column_version WHERE source_id = $1",
+            &[&lease.source_id.as_str()],
+        )
+        .map_err(store_error)?;
+    let column = |field: fn(&ColumnVersion) -> i64| versions.iter().map(field).collect::<Vec<_>>();
+    let attributes: Vec<i16> = versions
+        .iter()
+        .map(|version| version.attribute_number)
+        .collect();
+    let affected = transaction
+        .execute(
+            "INSERT INTO calque_control.source_column_version (
+                source_id, source_epoch, relation_oid, attribute_number, attribute_xmin,
+                relation_filenode
+             )
+             SELECT $1, $2, version.relation, version.attnum, version.xmin, version.filenode
+               FROM unnest($3::int8[], $4::int2[], $5::int8[], $6::int8[])
+                    AS version(relation, attnum, xmin, filenode)",
+            &[
+                &lease.source_id.as_str(),
+                &lease.source_epoch.as_str(),
+                &column(|version| i64::from(version.relation_oid)),
+                &attributes,
+                &column(|version| i64::from(version.attribute_xmin)),
+                &column(|version| i64::from(version.relation_filenode)),
+            ],
+        )
+        .map_err(store_error)?;
+    if usize::try_from(affected).ok() != Some(versions.len()) {
+        return Err(FenceError::SlotEnrollmentMismatch);
+    }
+    Ok(())
 }
 
 fn served_enum_label_from_row(row: postgres::Row) -> Result<ServedEnumLabel, FenceError> {
@@ -2134,6 +2245,14 @@ mod tests {
             &self,
             _: &LeaseIdentity,
             _: &[SeenEnumVersion],
+        ) -> Result<(), FenceError> {
+            unreachable!("not scripted")
+        }
+
+        fn record_column_versions(
+            &self,
+            _: &LeaseIdentity,
+            _: &[ColumnVersion],
         ) -> Result<(), FenceError> {
             unreachable!("not scripted")
         }

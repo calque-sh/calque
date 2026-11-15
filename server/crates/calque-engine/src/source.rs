@@ -393,6 +393,7 @@ fn destroy_local_source_unexplained(
         "calque_control.canonical_log_head",
         "calque_control.canonical_log_retention",
         "calque_internal.mutation_receipts",
+        "calque_control.source_column_version",
         "calque_control.source_enum_version",
         "calque_control.source_enum_label",
         "calque_control.source_slot_enrollment",
@@ -2475,6 +2476,7 @@ impl LocalSourceError {
                 SourceRuntimeError::SlotMissing { .. }
                 | SourceRuntimeError::SlotLost { .. }
                 | SourceRuntimeError::ColumnChanged { .. }
+                | SourceRuntimeError::ColumnRewritten { .. }
                 | SourceRuntimeError::EnumLabel(_)
                 | SourceRuntimeError::EnrolledByEarlierRelease,
             )
@@ -3417,6 +3419,10 @@ mod tests {
             LocalSourceError::Ingest(PersistentIngestError::EnumLabel(renamed())),
             LocalSourceError::Runtime(SourceRuntimeError::EnrolledByEarlierRelease),
             LocalSourceError::Runtime(SourceRuntimeError::ColumnChanged {
+                table: "public.items".to_owned(),
+                column: "kind".to_owned(),
+            }),
+            LocalSourceError::Runtime(SourceRuntimeError::ColumnRewritten {
                 table: "public.items".to_owned(),
                 column: "kind".to_owned(),
             }),
@@ -5772,6 +5778,169 @@ mod tests {
         assert_eq!(remedy, CdcStopRemedy::DestroyState);
     }
 
+    const PLAIN_ITEMS: &str =
+        "CREATE TABLE public.items (id bigint PRIMARY KEY, value text NOT NULL)";
+
+    impl ReconnectFixture {
+        fn insert_row(&mut self, id: i64) {
+            let logged = self.canonical_operations().len();
+            self.client
+                .execute(
+                    "INSERT INTO public.items (id, value) VALUES ($1, 'row')",
+                    &[&id],
+                )
+                .unwrap();
+            wait_until(
+                Duration::from_secs(10),
+                "the row in the canonical log",
+                || self.canonical_operations().len() > logged,
+            );
+        }
+
+        /// Whether the source's control rows record the current version of
+        /// both of `public.items`'s columns.
+        fn column_versions_current(&mut self) -> bool {
+            self.client
+                .query_one(
+                    "SELECT count(*) = 2
+                            AND bool_and(attribute.xmin::text::int8 = recorded.attribute_xmin
+                                         AND class.relfilenode::int8 = recorded.relation_filenode)
+                       FROM calque_control.source_column_version AS recorded
+                       JOIN pg_catalog.pg_attribute AS attribute
+                         ON attribute.attrelid = recorded.relation_oid::oid
+                        AND attribute.attnum = recorded.attribute_number
+                       JOIN pg_catalog.pg_class AS class ON class.oid = recorded.relation_oid::oid
+                      WHERE recorded.source_id = $1",
+                    &[&self.state.names.source_id.as_str()],
+                )
+                .unwrap()
+                .get::<_, Option<bool>>(0)
+                == Some(true)
+        }
+
+        fn wait_until_column_versions_recorded(&mut self) {
+            wait_until(
+                Duration::from_secs(10),
+                "the column versions recorded",
+                || self.column_versions_current(),
+            );
+        }
+
+        /// The error a start refuses with, or the one its runtime stops on.
+        fn start_stopping(&self) -> LocalSourceError {
+            match self.try_start(OperationsMetrics::new()) {
+                Err(error) => error,
+                Ok(runtime) => stopped_on(runtime).0,
+            }
+        }
+    }
+
+    fn is_rewritten_value(error: &LocalSourceError) -> bool {
+        matches!(
+            error,
+            LocalSourceError::Runtime(SourceRuntimeError::ColumnRewritten { table, column })
+                if table == "public.items" && column == "value"
+        )
+    }
+
+    /// `ALTER COLUMN ... TYPE` to the column's own type with a `USING`
+    /// expression rewrites every row, and the stream carries none of it. The
+    /// runtime stops on the column's catalog row and table file, which both
+    /// moved.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_served_column_rewritten_to_its_own_type_stops_the_runtime() {
+        let mut fixture = ReconnectFixture::create_holding("column_rewritten", false, PLAIN_ITEMS);
+        let runtime = fixture.start(OperationsMetrics::new());
+        fixture.insert_row(1);
+        fixture
+            .client
+            .batch_execute(
+                "ALTER TABLE public.items ALTER COLUMN value TYPE text USING value || '!'",
+            )
+            .unwrap();
+        let (error, remedy) = stopped_on(runtime);
+        assert!(is_rewritten_value(&error), "{error:?}");
+        assert_eq!(remedy, CdcStopRemedy::DestroyState);
+    }
+
+    /// The same rewrite while nothing runs refuses the next start, even after
+    /// a table grant wrote the table's catalog row again.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_served_column_rewritten_while_stopped_refuses_the_next_start() {
+        let mut fixture =
+            ReconnectFixture::create_holding("column_rewritten_stopped", false, PLAIN_ITEMS);
+        fixture.run_until_current();
+        fixture
+            .client
+            .batch_execute(
+                "ALTER TABLE public.items ALTER COLUMN value TYPE text USING value || '!';
+                 GRANT SELECT ON public.items TO PUBLIC",
+            )
+            .unwrap();
+        let error = fixture.start_stopping();
+        assert!(is_rewritten_value(&error), "{error:?}");
+        assert!(error.requires_destroying_state());
+    }
+
+    /// A new table file without a column change, or a column change without
+    /// one, changes no served value. Each is recorded once seen, so the next
+    /// one is judged alone too, while streaming and across restarts.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_new_table_file_or_a_column_change_alone_keeps_the_runtime_serving() {
+        let mut fixture = ReconnectFixture::create_holding("column_maintained", false, PLAIN_ITEMS);
+        let runtime = fixture.start(OperationsMetrics::new());
+        let health = runtime.health();
+        fixture.insert_row(1);
+        for change in [
+            "VACUUM FULL public.items",
+            "GRANT SELECT (value) ON public.items TO PUBLIC",
+            "CLUSTER public.items USING items_pkey",
+            "ALTER TABLE public.items ALTER COLUMN value SET STATISTICS 200",
+        ] {
+            fixture.client.batch_execute(change).unwrap();
+            fixture.wait_until_column_versions_recorded();
+        }
+        fixture.insert_row(2);
+        assert_eq!(health.failure(), None);
+        runtime.shutdown().unwrap();
+        for change in [
+            "ALTER TABLE public.items ALTER COLUMN value SET DEFAULT 'x'",
+            "VACUUM FULL public.items",
+        ] {
+            fixture.client.batch_execute(change).unwrap();
+            fixture.run_until_current();
+        }
+    }
+
+    /// An enrollment that records no column versions was made by an earlier
+    /// release, which could not have seen a rewrite since.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn an_enrollment_without_column_versions_refuses_the_start() {
+        let mut fixture = ReconnectFixture::create_holding("column_earlier", false, PLAIN_ITEMS);
+        fixture.run_until_current();
+        let cleared = fixture
+            .client
+            .execute(
+                "DELETE FROM calque_control.source_column_version WHERE source_id = $1",
+                &[&fixture.state.names.source_id.as_str()],
+            )
+            .unwrap();
+        assert_eq!(cleared, 2);
+        let error = fixture.start_stopping();
+        assert!(
+            matches!(
+                error,
+                LocalSourceError::Runtime(SourceRuntimeError::EnrolledByEarlierRelease)
+            ),
+            "{error:?}"
+        );
+        assert!(error.requires_destroying_state());
+    }
+
     /// An enum grown past the 4,096 labels Calque serves while it streams
     /// stops the runtime at the reconnect the watch forces, as it refuses a
     /// start, instead of reconnecting for ever.
@@ -5953,6 +6122,75 @@ mod tests {
             ),
             "{error:?}"
         );
+    }
+
+    /// A start is refused when the role's or the database's connection limit
+    /// is below the connections calque may hold at once, and allowed again
+    /// once it is not.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_connection_limit_below_what_calque_may_hold_refuses_the_start() {
+        use crate::tenants::{
+            check_postgres_capacity, ConnectionLimit, TenantError, POSTGRES_CONNECTIONS_PER_BUILD,
+            STEADY_POSTGRES_CONNECTIONS,
+        };
+        let fixture = ReconnectFixture::create_with_own_role("connection_limit");
+        let check = |builds| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(check_postgres_capacity(
+                    &fixture.database_url,
+                    builds,
+                    &fixture.state.names.slot_name,
+                ))
+        };
+        let needed = STEADY_POSTGRES_CONNECTIONS + 2 * POSTGRES_CONNECTIONS_PER_BUILD;
+        check(2).unwrap();
+
+        fixture.alter_role(&format!("CONNECTION LIMIT {}", needed - 1));
+        match check(2) {
+            Err(TenantError::ConnectionCapacity {
+                allowed,
+                limit: ConnectionLimit::Role,
+                needed: refused,
+                builds: 2,
+            }) => assert_eq!((allowed, refused), (needed - 1, needed)),
+            other => panic!("{other:?}"),
+        }
+        check(1).unwrap();
+        fixture.alter_role(&format!("CONNECTION LIMIT {needed}"));
+        check(2).unwrap();
+
+        let limit_database = |limit: i64| {
+            Client::connect(&fixture.admin_url, postgres::NoTls)
+                .unwrap()
+                .batch_execute(&format!(
+                    "ALTER DATABASE {} CONNECTION LIMIT {limit}",
+                    fixture.database_name
+                ))
+                .unwrap();
+        };
+        limit_database(needed - 2);
+        let refused = check(2).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                TenantError::ConnectionCapacity {
+                    limit: ConnectionLimit::Database,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("CONNECTION LIMIT")
+                && refused.to_string().contains("--max-tenant-builds"),
+            "{refused}"
+        );
+        limit_database(-1);
+        check(2).unwrap();
     }
 
     /// Amazon RDS and Aurora grant replication through membership in

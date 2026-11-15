@@ -773,8 +773,14 @@ renaming one, or changing its type or type modifier, stops the runtime with
 `state_must_be_destroyed` `true` and a `failure` that names the table and the
 column: PostgreSQL applies each to every row and logs no row change.
 `ALTER COLUMN ... TYPE` to the column's own type and modifier with a `USING`
-expression rewrites every value and leaves the definition as it was, so
-nothing stops for it: run `calque destroy` and restart after one.
+expression rewrites every value and leaves the definition as it was, but it
+writes the column's `pg_attribute` row and gives the table a new
+`relfilenode` in one transaction. A served column whose row and table file
+both changed since the runtime last read them stops it the same way, with a
+`failure` that names the table and the column. A grant, statistics target,
+default or `NOT NULL` changes only the row, and `VACUUM FULL`, `CLUSTER` or
+`TRUNCATE` only the file, so each alone keeps it serving; both between two
+reads, within a second while it streams or both while it is stopped, stop it.
 
 #### When the server is stopped or killed
 
@@ -957,11 +963,13 @@ state directory another build wrote, and name the command that clears it:
   <NAME> --yes, then rerun <command> to prepare the working set anew.
   ```
 
-- a source an earlier release enrolled, which recorded no enum labels:
+- a source an earlier release enrolled, which recorded no enum labels or no
+  column versions:
 
   ```text
   this source was enrolled by an earlier release of calque, which did not
-  record the enum labels it serves, so this release cannot resume it. Run
+  record what this release checks a start against, so this release cannot
+  resume it. Run
   calque destroy --state-dir <dir> --database-url-env <NAME> --yes, then
   rerun <command> to prepare the working set anew.
   ```
@@ -1014,6 +1022,11 @@ At most `--max-tenant-builds` preparations run at once, 4 by default. Each
 holds a replication slot and a WAL sender until it reaches its cut, so
 `serve` refuses to start unless PostgreSQL's `max_replication_slots` and
 `max_wal_senders` leave that many plus one free, the one for change capture.
+Each also holds 6 ordinary connections beside the 24 change capture and
+serving may hold, and `serve` refuses to start when the lowest of
+`max_connections` less its reserved connections, the role's `CONNECTION
+LIMIT` and the database's is below that sum: 48 at the default. A source-wide
+scope counts one preparation, so 2 slots, 2 WAL senders and 30 connections.
 A request a user waits on is prepared first, then a warm order from the
 application, then a refresh. While requests wait, a warm order or a refresh
 queued for `--recut-min-interval` or longer takes every other start, so a

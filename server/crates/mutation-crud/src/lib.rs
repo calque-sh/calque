@@ -1041,6 +1041,7 @@ mod tests {
                 is_partition: false,
                 has_publication_row_filter: false,
                 has_publication_column_list: false,
+                row_security_active: false,
                 unlisted_columns: Vec::new(),
                 columns: vec![
                     column(1, "id", "int8", false, Some(1), false),

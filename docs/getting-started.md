@@ -22,15 +22,16 @@ says what changes for a deployment.
 
 ## 1. Check PostgreSQL
 
-`calque` needs `wal_level=logical`, and one free replication slot and one free
-WAL sender for each server it runs. Read what your server has:
+`calque` needs `wal_level=logical`, and two free replication slots and two
+free WAL senders for each server it runs: one of each for change capture, and
+one while it prepares the working set. Read what your server has:
 
 ```sh
 export ADMIN_URL='postgresql://postgres:postgres@127.0.0.1:5432/app'
 psql "$ADMIN_URL" -x -c "SELECT current_setting('server_version') AS version, current_setting('wal_level') AS wal_level, current_setting('max_replication_slots')::int - (SELECT count(*) FROM pg_replication_slots) AS free_slots, current_setting('max_wal_senders')::int - (SELECT count(*) FROM pg_stat_replication) AS free_wal_senders"
 ```
 
-`wal_level` has to read `logical`, and both free counts at least 1. If not, set
+`wal_level` has to read `logical`, and both free counts at least 2. If not, set
 them. A stock PostgreSQL starts with `wal_level=replica`:
 
 ```sh
