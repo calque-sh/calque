@@ -9,9 +9,9 @@ shell history. From a checkout, `cargo run -q -p calque --` builds and runs it,
 as the commands below do, and `cargo install --locked --path server/apps/calque`
 installs it.
 
-Before anything is enrolled, check that a PostgreSQL 18 publication's tables
-can be served, and print their schema as the `calque.pg-inspection.v1` document
-`init` reads:
+Before anything is enrolled, check that a PostgreSQL 17 or 18 publication's
+tables can be served, and print their schema as the `calque.pg-inspection.v1`
+document `init` reads:
 
 ```sh
 export CALQUE_DATABASE_URL='postgresql://...'
@@ -24,7 +24,8 @@ cargo run -q -p calque -- inspect \
 ```
 
 When PostgreSQL bounds neither `max_slot_wal_keep_size` nor
-`idle_replication_slot_timeout`, `inspect` also warns on stderr, and so do
+`idle_replication_slot_timeout` (on PostgreSQL 17, which lacks the second, when
+`max_slot_wal_keep_size` is unset), `inspect` also warns on stderr, and so do
 `serve` and `dev` on each start: a stopped Calque's slot would hold WAL until
 the disk fills ([docs/postgresql.md](postgresql.md#protecting-the-primarys-disk)).
 

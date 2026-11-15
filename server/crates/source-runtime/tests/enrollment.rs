@@ -30,8 +30,8 @@ fn request(source_id: &SourceId, epoch: &SourceEpoch, owner: &str) -> AcquireReq
 }
 
 #[test]
-#[ignore = "requires disposable PostgreSQL 18 admin, control, and least-privilege source URLs"]
-fn pg18_least_privilege_enrollment_binds_slot_identity_and_epoch() {
+#[ignore = "requires disposable PostgreSQL 17 or 18 admin, control, and least-privilege source URLs"]
+fn least_privilege_enrollment_binds_slot_identity_and_epoch() {
     let admin_url = required("CALQUE_ADMIN_DATABASE_URL");
     let source_url = required("CALQUE_SOURCE_DATABASE_URL");
     let control_url = required("CALQUE_CONTROL_DATABASE_URL");
@@ -60,7 +60,7 @@ fn pg18_least_privilege_enrollment_binds_slot_identity_and_epoch() {
     let tables = BTreeSet::from([table]);
     let mut source = Client::connect(&source_url, NoTls).unwrap();
     let snapshot = inspect_source(&mut source, &publication, &tables).unwrap();
-    assert_eq!(snapshot.settings.server_version_num / 10_000, 18);
+    assert!((17..=18).contains(&(snapshot.settings.server_version_num / 10_000)));
     assert!(!snapshot.settings.current_user_is_superuser);
     assert!(snapshot.settings.current_user_has_replication);
     let requirements = EnrollmentRequirements {

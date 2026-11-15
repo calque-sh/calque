@@ -4,7 +4,7 @@ This document defines the state model and target architecture for the pre-alpha.
 
 ## Supported profile
 
-- PostgreSQL 18 is the only required source version.
+- PostgreSQL 17 and 18 are the supported source versions; the benchmarks run on 18.
 - Chrome or Chromium on a 16 GiB reference client is the supported browser profile.
 - The pre-alpha feasibility path is a Calque-owned direct columnar local-query
   engine. Generated, typed Calque facades are the only public collection,
@@ -233,7 +233,7 @@ The target for every reported run is to separate download, decode, materializati
 
 No performance result counts unless the reference PostgreSQL-state oracle passes in the same run. Experiments freeze their dataset, environment, metric boundaries, candidates, failure matrix and decision rule before execution. Raw samples, versions, hashes, timeouts and exclusions are retained. Timeouts are failures; best-of-N is forbidden.
 
-Protocol changes require cross-language golden vectors, malformed/truncated/oversized cases and compatibility decisions. CDC requires PostgreSQL 18 normal and large-transaction fixtures, append/ACK failpoints, duplicate/restart and reference convergence. Snapshot/artifact work requires exact-cut, corruption, interruption and provider tests. Client work requires real-Chrome atomicity, memory, cancellation, reload and long-task evidence. Mutation work requires accept/reject, lost response, idempotency, revocation, reload and randomized rollback/replay equivalence.
+Protocol changes require cross-language golden vectors, malformed/truncated/oversized cases and compatibility decisions. CDC requires PostgreSQL 17 and 18 normal and large-transaction fixtures, append/ACK failpoints, duplicate/restart and reference convergence. Snapshot/artifact work requires exact-cut, corruption, interruption and provider tests. Client work requires real-Chrome atomicity, memory, cancellation, reload and long-task evidence. Mutation work requires accept/reject, lost response, idempotency, revocation, reload and randomized rollback/replay equivalence.
 
 The review question is: can this produce a fast and locally plausible
 public Calque result that is incomplete, unauthorized, not equal to the

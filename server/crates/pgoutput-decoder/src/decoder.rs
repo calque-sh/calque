@@ -2016,8 +2016,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires TEST_DATABASE_URL and disposable PostgreSQL 18 with wal_level=logical"]
-    fn live_pg18_streamed_large_transaction_matches_postgres_after_nested_abort() {
+    #[ignore = "requires TEST_DATABASE_URL and disposable PostgreSQL 17 or 18 with wal_level=logical"]
+    fn live_streamed_large_transaction_matches_postgres_after_nested_abort() {
         use std::{
             collections::BTreeMap,
             sync::mpsc,
@@ -2030,7 +2030,7 @@ mod tests {
         use tokio_util::sync::CancellationToken;
 
         let database_url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL must name a disposable PostgreSQL 18 database");
+            .expect("TEST_DATABASE_URL must name a disposable PostgreSQL 17 or 18 database");
         let suffix = format!(
             "{}_{}",
             std::process::id(),
@@ -2047,7 +2047,7 @@ mod tests {
             .query_one("SELECT current_setting('server_version_num')::int", &[])
             .unwrap()
             .get(0);
-        assert!((180_000..190_000).contains(&version));
+        assert!((170_000..190_000).contains(&version));
         source
             .batch_execute(&format!(
                 "CREATE TABLE public.{table} (id bigint PRIMARY KEY, body text NOT NULL);

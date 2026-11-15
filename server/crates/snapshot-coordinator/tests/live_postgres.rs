@@ -27,7 +27,9 @@ static FIXTURE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 fn regular_connection_string() -> String {
     std::env::var("DATABASE_URL")
         .or_else(|_| std::env::var("TEST_DATABASE_URL"))
-        .expect("set DATABASE_URL or TEST_DATABASE_URL to a disposable PostgreSQL 18 database")
+        .expect(
+            "set DATABASE_URL or TEST_DATABASE_URL to a disposable PostgreSQL 17 or 18 database",
+        )
 }
 
 fn replication_connection_string() -> String {

@@ -198,8 +198,8 @@ fn prepare_local_source_unexplained(
     if inspect_identity(&mut client)? != state.source_identity {
         return Err(LocalSourceError::SourceIdentityChanged);
     }
-    if slot_wal_unbounded(&mut client)? {
-        tracing::warn!("{UNBOUNDED_SLOT_WAL_WARNING}");
+    if let Some(warning) = slot_wal_warning(&mut client)? {
+        tracing::warn!("{warning}");
     }
     ensure_owned_publication(
         database_url,
@@ -207,6 +207,7 @@ fn prepare_local_source_unexplained(
         &state.names.publication_name,
         &state.tables,
         columns,
+        persisted_registry.is_some(),
     )?;
 
     let tables = state.tables.iter().cloned().collect::<BTreeSet<_>>();
@@ -1878,12 +1879,17 @@ fn connect_owned_waiting(
     Ok(client)
 }
 
+/// Creates the publication when it is missing, and otherwise checks it.
+/// Before the first enrollment, one that exists without the definition was
+/// made for another table set or by hand, not altered, so the refusal names
+/// the statements that replace it rather than a destroy that would keep it.
 fn ensure_owned_publication(
     database_url: &DatabaseUrl,
     client: &mut Client,
     publication: &str,
     tables: &[QualifiedTable],
     columns: Option<&SelectedColumns>,
+    enrolled: bool,
 ) -> Result<(), LocalSourceError> {
     if tables.is_empty() {
         return Err(LocalSourceError::EmptyTableSet);
@@ -1930,6 +1936,20 @@ fn ensure_owned_publication(
             }
             created => created,
         };
+    }
+    if !enrolled {
+        let requested = tables.iter().cloned().collect::<BTreeSet<_>>();
+        if inspect_owned_publication(client, publication, &requested)? == OwnedPublication::Drifted
+        {
+            let quoted = quote_identifier(publication);
+            return Err(LocalSourceError::PublicationDefinitionDiffers {
+                publication: publication.to_owned(),
+                statement: format!(
+                    "DROP PUBLICATION {quoted}; CREATE PUBLICATION {quoted} FOR TABLE {};",
+                    selection.clauses.join(", ")
+                ),
+            });
+        }
     }
     validate_owned_publication(client, publication, tables)?;
     let Some(columns) = columns else {
@@ -2111,23 +2131,34 @@ fn first_table_not_owned(
 /// segment from the slot's position on, until the disk fills.
 pub const UNBOUNDED_SLOT_WAL_WARNING: &str = "neither max_slot_wal_keep_size nor idle_replication_slot_timeout is set on this PostgreSQL, so while Calque is stopped its replication slot keeps every WAL segment written since, until the disk fills; set one of them, as docs/postgresql.md describes under \"Protecting the primary's disk\"";
 
-/// Whether the source leaves the WAL a slot holds back unbounded: neither
-/// `max_slot_wal_keep_size` nor `idle_replication_slot_timeout` is set.
-fn slot_wal_unbounded(client: &mut impl postgres::GenericClient) -> Result<bool, postgres::Error> {
-    let unbounded: Option<bool> = client
-        .query_one(
-            "SELECT (SELECT setting::int8 < 0 FROM pg_catalog.pg_settings
-                      WHERE name = 'max_slot_wal_keep_size')
-                AND (SELECT setting::int8 = 0 FROM pg_catalog.pg_settings
-                      WHERE name = 'idle_replication_slot_timeout')",
-            &[],
-        )?
-        .get(0);
-    Ok(unbounded == Some(true))
+/// [`UNBOUNDED_SLOT_WAL_WARNING`] for PostgreSQL 17, which has no
+/// `idle_replication_slot_timeout`.
+pub const UNBOUNDED_SLOT_WAL_WARNING_WITHOUT_IDLE_TIMEOUT: &str = "max_slot_wal_keep_size is not set on this PostgreSQL, so while Calque is stopped its replication slot keeps every WAL segment written since, until the disk fills; set it, as docs/postgresql.md describes under \"Protecting the primary's disk\"";
+
+/// The warning the source deserves when nothing bounds the WAL a slot holds
+/// back: `max_slot_wal_keep_size` is unset, and so is
+/// `idle_replication_slot_timeout` where the server has it.
+fn slot_wal_warning(
+    client: &mut impl postgres::GenericClient,
+) -> Result<Option<&'static str>, postgres::Error> {
+    let row = client.query_one(
+        "SELECT (SELECT setting::int8 < 0 FROM pg_catalog.pg_settings
+                  WHERE name = 'max_slot_wal_keep_size'),
+                (SELECT setting::int8 = 0 FROM pg_catalog.pg_settings
+                  WHERE name = 'idle_replication_slot_timeout')",
+        &[],
+    )?;
+    let keep_size_unset: Option<bool> = row.get(0);
+    let idle_timeout_unset: Option<bool> = row.get(1);
+    Ok(match (keep_size_unset, idle_timeout_unset) {
+        (Some(true), Some(true)) => Some(UNBOUNDED_SLOT_WAL_WARNING),
+        (Some(true), None) => Some(UNBOUNDED_SLOT_WAL_WARNING_WITHOUT_IDLE_TIMEOUT),
+        _ => None,
+    })
 }
 
-/// [`UNBOUNDED_SLOT_WAL_WARNING`] when the source at `database_url` deserves
-/// it, for `calque inspect` to print.
+/// The warning [`slot_wal_warning`] finds for the source at `database_url`,
+/// for `calque inspect` to print.
 pub fn inspect_slot_wal_bound(
     database_url: &DatabaseUrl,
 ) -> Result<Option<&'static str>, LocalSourceError> {
@@ -2136,7 +2167,7 @@ pub fn inspect_slot_wal_bound(
         PostgresConnectionFamily::Inspect,
         "calque-inspect",
     )?;
-    Ok(slot_wal_unbounded(&mut client)?.then_some(UNBOUNDED_SLOT_WAL_WARNING))
+    Ok(slot_wal_warning(&mut client)?)
 }
 
 fn create_owned_publication(
@@ -2408,6 +2439,11 @@ pub enum LocalSourceError {
     PublicationMissing {
         publication: String,
         table: String,
+        statement: String,
+    },
+    #[error("the PostgreSQL publication {publication} already exists, but does not publish exactly the configured tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters; it was likely created for another table set. Have its owner replace it: {statement}")]
+    PublicationDefinitionDiffers {
+        publication: String,
         statement: String,
     },
     #[error("the PostgreSQL publication {publication} publishes columns {published} of {table}, and the manifest selects {selected}; Calque publishes exactly the selected columns, as {statement}", published = .published.join(", "), selected = .selected.join(", "))]
@@ -4152,6 +4188,56 @@ mod tests {
         start(&fixture, Some(registry))
             .unwrap_or_else(|error| panic!("the restored publication was refused: {error:?}"));
         assert!(fixture.publication_exists());
+        fixture.remove();
+    }
+
+    /// A publication that exists before the first enrollment without the
+    /// definition, as one made for another table set does, is refused with
+    /// the statements that replace it. Drift would name a destroy, which
+    /// keeps a publication another role owns. After them, the source enrolls.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_publication_made_for_another_table_set_is_refused_with_its_replacement() {
+        let mut fixture = EnrollmentLockFixture::create_with_tables("pub_other", 2);
+        let start = |fixture: &EnrollmentLockFixture| {
+            prepare_local_source(
+                &fixture.database_url,
+                &fixture.state,
+                &LocalSecrets::generate().unwrap(),
+                None,
+            )
+        };
+        let publication = quote_identifier(&fixture.state.names.publication_name);
+        fixture
+            .source
+            .batch_execute(&format!(
+                "CREATE PUBLICATION {publication} FOR TABLE {}",
+                fixture.relation(0)
+            ))
+            .unwrap();
+
+        let statement = match start(&fixture) {
+            Err(LocalSourceError::PublicationDefinitionDiffers {
+                publication: named,
+                statement,
+            }) => {
+                assert_eq!(named, fixture.state.names.publication_name);
+                statement
+            }
+            other => panic!(
+                "a publication of another table set was not refused as differing: {:?}",
+                other.err()
+            ),
+        };
+        assert!(
+            statement.starts_with(&format!(
+                "DROP PUBLICATION {publication}; CREATE PUBLICATION {publication} FOR TABLE "
+            )),
+            "{statement}"
+        );
+        fixture.source.batch_execute(&statement).unwrap();
+        start(&fixture)
+            .unwrap_or_else(|error| panic!("the replaced publication was refused: {error:?}"));
         fixture.remove();
     }
 

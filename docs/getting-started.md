@@ -1,14 +1,14 @@
 # Getting started
 
-This page takes an existing PostgreSQL 18 database and an existing Vite app to
-a page that shows your own tables and follows a change made in `psql`. It runs
+This page takes an existing PostgreSQL 17 or 18 database and an existing Vite
+app to a page that shows your own tables and follows a change made in `psql`. It runs
 Calque's development server, `calque dev`, which serves one disposable
 database on your machine without signed grants. [Production](#production)
 says what changes for a deployment.
 
 ## What you need
 
-- PostgreSQL 18 that you can reach as a superuser once, to create a role and a
+- PostgreSQL 17 or 18 that you can reach as a superuser once, to create a role and a
   publication, and `psql` to run SQL. The examples use a database named `app`
   on `127.0.0.1:5432` with a superuser named `postgres`.
 - A table to serve. Calque serves the columns its collection in
@@ -76,6 +76,15 @@ psql "$ADMIN_URL" -c "GRANT app_owner TO calque_sync"
 Here `tasks` belongs to `app_owner`; write your tables' owner. The other way is
 `ALTER TABLE tasks OWNER TO calque_sync`, which hands the table over: its
 former owner then has to be a member of `calque_sync` to alter it.
+
+On Supabase, `postgres` owns the tables and is not a superuser, so it cannot
+make `calque_sync` a member of itself, and it may not run `ALTER SYSTEM`,
+which step 1 does not need there: `wal_level` is already `logical`. Grant the
+rows instead, `GRANT SELECT, INSERT, UPDATE, DELETE ON public.tasks TO
+calque_sync`, through `$ADMIN_URL`, and create step 3's publication through
+`$ADMIN_URL` too. `calque dev` then stops once with the `CREATE PUBLICATION`
+statement for its own publication: run it the same way, then start `calque
+dev` again.
 
 ## 3. Publish the tables
 

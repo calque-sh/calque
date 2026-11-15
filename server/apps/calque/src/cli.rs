@@ -29,8 +29,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Check that a PostgreSQL 18 publication's tables can be served, and print
-    /// their schema as JSON for `init`.
+    /// Check that a PostgreSQL 17 or 18 publication's tables can be served, and
+    /// print their schema as JSON for `init`.
     Inspect(InspectCommand),
     /// Generate a configuration manifest from an inspection document.
     Init(InitCommand),

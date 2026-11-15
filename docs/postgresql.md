@@ -195,14 +195,14 @@ A replication slot keeps every WAL segment written since Calque last confirmed
 a position. A running Calque confirms continually, but while it is stopped the
 slot holds WAL back until the primary's disk fills. PostgreSQL 18 bounds that
 two ways; set at least one, in `postgresql.conf` or with `ALTER SYSTEM`, and
-reload:
+reload. PostgreSQL 17 has only the first:
 
 ```
 max_slot_wal_keep_size = 10GB        # give up a slot that holds back more WAL than this
 idle_replication_slot_timeout = 1d   # give up a slot unused for this long
 ```
 
-`calque serve`, `calque dev` and `calque inspect` warn when neither is set.
+`calque serve`, `calque dev` and `calque inspect` warn when none is set.
 Once PostgreSQL gives up the slot, the WAL Calque needs to resume is gone:
 Calque stops and names the cause, and `calque destroy`, then a new start,
 prepares the working set again from a snapshot. Choose the bound by the
@@ -259,7 +259,7 @@ publication, `calque_sync` the role.
 
 | Code | Cause | Fix |
 | --- | --- | --- |
-| `POSTGRES_VERSION_UNSUPPORTED` | The server is not PostgreSQL 18. | Upgrade to 18. |
+| `POSTGRES_VERSION_UNSUPPORTED` | The server is not PostgreSQL 17 or 18. | Upgrade to 18. |
 | `SERVER_ENCODING_UNSUPPORTED` | The database is not UTF-8. | A database's encoding cannot change: create one with `CREATE DATABASE app ENCODING 'UTF8' TEMPLATE template0` and move the tables. |
 | `WAL_LEVEL_NOT_LOGICAL` | `wal_level` is `replica`, which is what a stock server starts with. | `ALTER SYSTEM SET wal_level = 'logical'`, then restart PostgreSQL. On a managed database, turn on logical replication in its console. |
 | `NO_REPLICATION_SLOT_CAPACITY` | `max_replication_slots` is 0. When it is positive but every slot is taken, PostgreSQL itself refuses the connection with SQLSTATE `53400`. | `ALTER SYSTEM SET max_replication_slots = 10`, then restart. Each server uses two at once, one for change capture and one while it prepares, so allow for every server and for leftovers: `SELECT slot_name, active FROM pg_replication_slots` lists them, and `calque destroy` removes the ones Calque made. |

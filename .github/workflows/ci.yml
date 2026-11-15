@@ -244,7 +244,7 @@ jobs:
         run: pnpm quickstart:e2e
 
   # The `#[ignore]`d tests `cargo test --workspace` never runs, blob-store's
-  # two aside, need a live PostgreSQL 18 with logical decoding, except
+  # two aside, need a live PostgreSQL 17 or 18 with logical decoding, except
   # snapshot_recovery_child_exits_without_cleanup, a re-exec fixture that
   # rides along under the same filter. scripts/live-postgres-suite.sh is the
   # setup the README documents, so CI and a local run cannot drift apart, and it
@@ -273,14 +273,19 @@ jobs:
   # package. `rest` excludes the other three, so together they cover the
   # workspace by construction, and each shard's completeness check counts its
   # own selection.
+  #
+  # Every shard runs once per supported source major, 17 and 18, because the
+  # catalog columns and settings enrollment reads differ between them.
   live-postgres:
-    name: Live PostgreSQL suite (${{ matrix.shard }})
+    name: Live PostgreSQL ${{ matrix.postgres }} suite (${{ matrix.shard }})
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
+        postgres: ["17", "18"]
+        shard: [calque, source-runtime, engine, rest]
         include:
           - shard: calque
             packages: -p calque
@@ -297,15 +302,15 @@ jobs:
       CALQUE_LIVEPG_PACKAGES: ${{ matrix.packages }}
     services:
       postgres:
-        image: postgres:18
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_PASSWORD: postgres
           # A service container has no `command:` override, so the server
           # settings go through initdb: PostgreSQL 16+ `initdb -c` writes them
-          # into postgresql.conf. Verified against postgres:18 -- SHOW reports
-          # logical/64/64/400 -- and `bootstrap` below re-checks all four before
-          # creating anything, so a regression here fails at setup with the
-          # setting named rather than as a slot error deep in a test.
+          # into postgresql.conf. Verified against postgres:17 and 18 -- SHOW
+          # reports logical/64/64/400 -- and `bootstrap` below re-checks all
+          # four before creating anything, so a regression here fails at setup
+          # with the setting named rather than as a slot error deep in a test.
           POSTGRES_INITDB_ARGS: -c wal_level=logical -c max_replication_slots=64 -c max_wal_senders=64 -c max_connections=400
         ports:
           - 55444:5432
@@ -378,9 +383,10 @@ jobs:
       # compose file, with run-scoped credentials and one bucket. The test
       # does not create the bucket; a deployment's operator does, and so does
       # this step, with the `mc` the image carries. Without a bucket the test
-      # finds no store and fails, as it is written to.
+      # finds no store and fails, as it is written to. It runs on one major
+      # only: what it covers is the object store, not the source.
       - name: Start MinIO for the S3 recovery test
-        if: ${{ !cancelled() && matrix.shard == 'engine' }}
+        if: ${{ !cancelled() && matrix.shard == 'engine' && matrix.postgres == '18' }}
         run: |
           df -h /
           user="rm$(openssl rand -hex 12)"
@@ -402,7 +408,7 @@ jobs:
       # Only here are the four variables set, and only this test runs, so the
       # completeness check expects exactly one pass.
       - name: Run the S3 recovery test against MinIO
-        if: ${{ !cancelled() && matrix.shard == 'engine' }}
+        if: ${{ !cancelled() && matrix.shard == 'engine' && matrix.postgres == '18' }}
         env:
           CALQUE_TEST_TIME_SCALE: "10"
           CALQUE_S3_ENDPOINT: http://127.0.0.1:29000

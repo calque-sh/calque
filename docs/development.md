@@ -72,10 +72,10 @@ the toolchain inputs. `.github/workflows/ci.yml` runs `pnpm verify` itself,
 the browser end-to-end scripts (`pnpm demo:e2e:latency`,
 `pnpm demo:e2e:mutation` and `pnpm serve:e2e`), `pnpm selfhost:e2e`,
 `pnpm quickstart:e2e` and blob-store's MinIO conformance on every push to
-`main` and pull request, and the live-PostgreSQL suite, against a
-`postgres:18` service container, on pushes to `main` and by manual dispatch
-only. Those last two run the Rust tests that need an S3 provider or a live
-PostgreSQL 18, which are `#[ignore]`d, so `pnpm verify` skips them. A passing
+`main` and pull request, and the live-PostgreSQL suite, once against a
+`postgres:17` and once against a `postgres:18` service container, on pushes to
+`main` and by manual dispatch only. Those last two run the Rust tests that need
+an S3 provider or a live PostgreSQL, which are `#[ignore]`d, so `pnpm verify` skips them. A passing
 `pnpm verify` does not mean the performance targets are met; `pnpm bench`
 measures those.
 

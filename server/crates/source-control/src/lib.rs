@@ -19,7 +19,7 @@ pub use registry::{
 };
 pub use type_codec::PostgresTypeCodec;
 
-pub const MIN_POSTGRES_MAJOR: u32 = 18;
+pub const MIN_POSTGRES_MAJOR: u32 = 17;
 pub const MAX_POSTGRES_MAJOR: u32 = 18;
 
 /// PostgreSQL's identifier length limit (`NAMEDATALEN - 1`). The server
@@ -1345,6 +1345,22 @@ mod tests {
         let mut container_default = snapshot();
         container_default.settings.time_zone = "Etc/UTC".to_owned();
         assert!(validate_enrollment(&container_default, &requirements()).is_ready());
+    }
+
+    #[test]
+    fn postgresql_17_and_18_are_the_supported_majors() {
+        for (version, ready) in [
+            (160_013, false),
+            (170_000, true),
+            (170_012, true),
+            (180_004, true),
+            (190_000, false),
+        ] {
+            let mut snapshot = snapshot();
+            snapshot.settings.server_version_num = version;
+            let report = validate_enrollment(&snapshot, &requirements());
+            assert_eq!(report.is_ready(), ready, "{version}: {report}");
+        }
     }
 
     #[test]

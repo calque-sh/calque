@@ -1,5 +1,5 @@
 //! Revoking an authorization generation on a running `calque serve`, against a
-//! live PostgreSQL 18, and the same deployment meeting many clients at once.
+//! live PostgreSQL, and the same deployment meeting many clients at once.
 //!
 //! The test plays the application backend: it holds the signing key, signs the
 //! fence order, and signs every barrier draft Calque returns. Everything it

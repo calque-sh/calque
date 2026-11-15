@@ -2,13 +2,13 @@
 # The ignored live-PostgreSQL suite, set up the same way in CI and locally.
 #
 # `cargo test` skips every `#[ignore]`d test silently, so the suite has to be
-# asked for, and it has to be asked for against a PostgreSQL 18 with logical
+# asked for, and it has to be asked for against a PostgreSQL 17 or 18 with logical
 # decoding and a NON-superuser role that holds REPLICATION: enrollment refuses
 # a superuser, so running as the image's bootstrap role fails at setup instead
 # of testing anything.
 #
 #   scripts/live-postgres-suite.sh bootstrap <container>
-#       Wait for the postgres:18 container to accept connections, verify
+#       Wait for the postgres:17 or postgres:18 container to accept connections, verify
 #       wal_level/slots/senders/connections, and create the least-privilege
 #       role and database inside it, with the functions
 #       scripts/live-postgres-suite.sql installs for what only a superuser may
@@ -151,10 +151,13 @@ bootstrap() {
   rest=${rest#*|}
   time_zone=${rest%%|*}
   bytea_output=${rest#*|}
-  if [ "$major" != 18 ]; then
-    printf 'PostgreSQL 18 is the only supported source; the container runs major %s\n' "$major" >&2
-    exit 1
-  fi
+  case "$major" in
+    17 | 18) ;;
+    *)
+      printf 'PostgreSQL 17 and 18 are the supported sources; the container runs major %s\n' "$major" >&2
+      exit 1
+      ;;
+  esac
   if [ "$wal_level" != logical ]; then
     printf 'wal_level must be logical, found %s\n' "$wal_level" >&2
     exit 1

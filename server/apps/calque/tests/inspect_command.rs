@@ -1,5 +1,5 @@
 //! `calque inspect` run through the binary: its database URL refusals, and the
-//! enrollment blockers it reports against a live PostgreSQL 18.
+//! enrollment blockers it reports against a live PostgreSQL.
 //!
 //! The live test is `#[ignore]`d and runs through
 //! `scripts/live-postgres-suite.sh`; without `TEST_DATABASE_URL` it fails
@@ -268,28 +268,36 @@ fn inspect_refuses_an_enum_of_more_labels_than_calque_serves() {
 
 /// `inspect` warns on stderr, after a successful inspection, exactly when the
 /// server bounds neither the WAL a slot may hold back nor how long it may sit
-/// idle.
+/// idle. PostgreSQL 17 has no idle timeout, so there the first bound decides.
 #[test]
 #[ignore = "requires TEST_DATABASE_URL"]
 fn inspect_warns_when_nothing_bounds_the_wal_a_slot_holds() {
     let mut relation = LiveRelation::create("id bigint PRIMARY KEY, title text");
     let table = format!("public.{}", relation.table);
-    let unbounded: bool = relation
+    let settings = relation
         .client
         .query_one(
-            "SELECT current_setting('max_slot_wal_keep_size')::text = '-1' \
-                AND current_setting('idle_replication_slot_timeout')::text = '0'",
+            "SELECT current_setting('max_slot_wal_keep_size') = '-1', \
+                    (SELECT setting = '0' FROM pg_catalog.pg_settings \
+                      WHERE name = 'idle_replication_slot_timeout')",
             &[],
         )
-        .unwrap()
-        .get(0);
+        .unwrap();
+    let keep_size_unset: bool = settings.get(0);
+    let idle_timeout_unset: Option<bool> = settings.get(1);
     let (success, stderr) = inspect_table(
         &std::env::var("TEST_DATABASE_URL").unwrap(),
         &relation.publication,
         &table,
     );
     assert!(success, "{stderr}");
-    let warning = "calque: warning: neither max_slot_wal_keep_size nor \
-                   idle_replication_slot_timeout is set on this PostgreSQL";
+    let warning = match idle_timeout_unset {
+        Some(_) => {
+            "calque: warning: neither max_slot_wal_keep_size nor \
+             idle_replication_slot_timeout is set on this PostgreSQL"
+        }
+        None => "calque: warning: max_slot_wal_keep_size is not set on this PostgreSQL",
+    };
+    let unbounded = keep_size_unset && idle_timeout_unset != Some(false);
     assert_eq!(stderr.contains(warning), unbounded, "{stderr}");
 }

@@ -1,5 +1,5 @@
 //! `calque serve`'s mutation route, gated by the signed command capability,
-//! against a live PostgreSQL 18.
+//! against a live PostgreSQL.
 //!
 //! Mounting `mutation-http` on `serve` must not make every principal that can
 //! bootstrap a writer of PostgreSQL rows: the signed command capability a

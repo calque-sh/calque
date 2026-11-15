@@ -1,4 +1,4 @@
-//! `calque serve` on a source-wide dataset, against a live PostgreSQL 18.
+//! `calque serve` on a source-wide dataset, against a live PostgreSQL.
 //!
 //! Checks that the published artifact is one the public client mounts, that a
 //! grant carrying no command capability reaches no write surface, that a

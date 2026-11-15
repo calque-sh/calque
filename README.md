@@ -71,8 +71,8 @@ schema:
   projection table your application maintains.
 - Writes are inserts, updates and deletes checked against the grant. No
   backend code runs on a write yet.
-- The source must be PostgreSQL 18. Under `calque serve`, Calque's role needs
-  `REPLICATION`, read access to the tables and write access if pages write,
+- The source must be PostgreSQL 17 or 18. Under `calque serve`, Calque's role
+  needs `REPLICATION`, read access to the tables and write access if pages write,
   and owns none of them; `calque dev` creates its own publication when its
   role owns the tables, and otherwise names the statement for their owner to
   run. Enums and domains are carried as their text or
@@ -134,8 +134,8 @@ backend signs. A Node backend signs them with `@calque/grant`.
 
 ## Querying the working set
 
-[Getting started](docs/getting-started.md) takes an existing PostgreSQL 18
-database and Vite app to a live page, including the role and the publication
+[Getting started](docs/getting-started.md) takes an existing PostgreSQL 17 or
+18 database and Vite app to a live page, including the role and the publication
 that the commands below read. `calque inspect` reads the tables of that
 publication, and `calque init` turns them into `calque.config.json`, one
 collection per table ([the `calque` command](docs/cli.md)):

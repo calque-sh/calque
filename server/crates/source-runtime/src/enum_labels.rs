@@ -925,7 +925,7 @@ mod tests {
     /// schema publication comes from `calque_live.create_schema_publication`,
     /// which `scripts/live-postgres-suite.sh bootstrap` installs.
     #[test]
-    #[ignore = "requires disposable PostgreSQL 18 admin URL bootstrapped by scripts/live-postgres-suite.sh"]
+    #[ignore = "requires disposable PostgreSQL 17 or 18 admin URL bootstrapped by scripts/live-postgres-suite.sh"]
     fn the_enums_watched_are_those_the_published_columns_use() {
         use std::collections::BTreeSet;
 

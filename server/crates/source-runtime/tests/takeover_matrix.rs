@@ -444,7 +444,7 @@ impl Fixture {
             .get::<_, String>(0)
             .parse::<u32>()
             .unwrap();
-        assert_eq!(postgres_version_num / 10_000, 18);
+        assert!((17..=18).contains(&(postgres_version_num / 10_000)));
         let fixture = Self {
             admin_url,
             source_url,
@@ -1511,7 +1511,7 @@ fn run_parent() {
 }
 
 #[test]
-#[ignore = "requires live PostgreSQL 18 source/control URLs and process kill support"]
+#[ignore = "requires live PostgreSQL 17 or 18 source/control URLs and process kill support"]
 fn deterministic_process_takeover_matrix() {
     if env::var("CALQUE_TAKEOVER_ROLE").as_deref() == Ok("worker") {
         run_worker();

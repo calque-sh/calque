@@ -1,6 +1,6 @@
-//! `calque inspect` — check that a PostgreSQL 18 publication's tables can be
-//! served, and print their schema as a `calque.pg-inspection.v1` document on
-//! stdout.
+//! `calque inspect` — check that a PostgreSQL 17 or 18 publication's tables
+//! can be served, and print their schema as a `calque.pg-inspection.v1`
+//! document on stdout.
 
 use std::{collections::BTreeSet, error::Error};
 
@@ -80,9 +80,6 @@ pub fn run(
 ) -> Result<InspectionOutput, Box<dyn Error>> {
     let snapshot = inspect_local_source(database_url, publication, &tables)?;
     let server_major = snapshot.settings.server_version_num / 10_000;
-    if server_major != 18 {
-        return Err(format!("calque inspect requires PostgreSQL 18, found {server_major}").into());
-    }
     let requirements = EnrollmentRequirements {
         expected_identity: snapshot.identity.clone(),
         publication_name: publication.to_owned(),

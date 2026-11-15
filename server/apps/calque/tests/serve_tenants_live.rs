@@ -1,5 +1,5 @@
 //! Per-tenant working sets on a running `calque serve`, against a live
-//! PostgreSQL 18.
+//! PostgreSQL.
 //!
 //! The test plays the application backend: it mints each user's grant with
 //! the tenant attribute and signs the tenant orders. Every tenant repeats the
