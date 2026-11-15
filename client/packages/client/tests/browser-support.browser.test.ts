@@ -135,7 +135,11 @@ describe("an artifact body read through BYOB readers, in this browser", () => {
         at += buffer.byteLength;
       }
       expect(at).toBe(bytes.length);
-      expect(joined).toEqual(bytes);
+      // The first differing byte, not toEqual: a deep comparison of 3 MiB
+      // element by element outlasts the test's time limit on CI's runners.
+      expect(joined.findIndex((value, index) => value !== bytes[index])).toBe(
+        -1,
+      );
 
       await expect(async () => {
         for await (const buffer of exactResponseBuffers(
