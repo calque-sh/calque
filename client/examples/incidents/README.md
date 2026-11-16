@@ -1,11 +1,11 @@
 # Incident operations
 
-This page synchronizes seven PostgreSQL tables of the 1M-row
-incident-operations fixture (schema `incidents`) from the `calque` binary into
+This page synchronizes seven PostgreSQL tables of the incident-operations
+fixture's 100k-row cut (schema `incidents`) from the `calque` binary into
 the browser, then answers every view with a local query over the complete
 working set:
 
-- an events grid over all 800,001 events, virtualized through `window`
+- an events grid over all 80,001 events, virtualized through `window`
   over each view's whole result, with a level filter and a timestamp sort;
 - a chart of every issue by status and priority, drawn as SVG from
   `groupBy("status", "priority").count()`;
@@ -14,6 +14,15 @@ working set:
 - comment insert, edit and delete, and issue status and priority changes,
   through the generated facades. Each write is marked pending until its CDC
   echo arrives, and failed if it ends any other way.
+
+`showcase/index.html` is a second view of the same tables, the console the
+README's recording shows (`src/showcase/`): level and service filters with
+counts over every event, a virtualized list of all of them, the top open issue
+with a resolve button, and the issues by status. It measures the times it
+shows itself: navigation to the complete paint, a filter's click to the frame
+that shows its rows, and a write's click to PostgreSQL's confirmation.
+`pnpm build:showcase` builds it beside the page, and `pnpm incidents` serves it
+at `/showcase/`.
 
 The page is also the benchmark's subject. `pnpm build:harness` builds
 it with `src/harness.ts` as its entry, which runs the page's own entry, reads
@@ -31,19 +40,21 @@ pnpm incidents
 It starts PostgreSQL 18 in its own compose project (`<checkout>-incidents`),
 seeds the fixture unless that exact dataset is already there, builds and
 starts a release `calque dev` over the seven tables, builds the page with its
-harness entry, serves it with `vite preview` and prints the URL. A second run
+harness entry and the showcase console, serves both with `vite preview` and
+prints their URLs. A second run
 reuses the seed and calque's prepared state; `pnpm incidents -- --fresh` prepares again from
 PostgreSQL. `pnpm incidents -- --dataset content-v1` seeds
 `dataset.incident-ops-1m.content-v1` instead: v1's rows with generated words,
 hashed version 4 UUIDs and append-ordered times
-(`scripts/bench-content-fixture.ts`); switching datasets reseeds.
-`pnpm incidents -- --rows 100k` seeds the benchmark's cut instead of the whole
-fixture: each table's first tenth, 100,007 rows with the sentinels, of v1 or,
-with `--dataset content-v1`, of the content variant.
+(`scripts/bench-content-fixture.ts`). `--dataset readable` seeds content-v1
+and rewrites the text the page shows into service names, people, issue titles
+and log lines a person can read (`scripts/incidents-readable.ts`), as the
+README's recording does. Switching datasets reseeds. Each is the benchmark's
+cut: each table's first tenth, 100,007 rows with the sentinels.
 `CALQUE_INCIDENTS_POSTGRES_PORT`, `CALQUE_INCIDENTS_PORT` and
 `CALQUE_INCIDENTS_UI_PORT` choose the ports.
 
-`pnpm incidents:e2e` drives two headless Chromium pages at 1M rows and checks
+`pnpm incidents:e2e` drives two headless Chromium pages at 100k rows and checks
 the grid, the chart, the joins and every write against PostgreSQL; see
 `scripts/incidents-e2e.ts`. It takes the same `--dataset`.
 

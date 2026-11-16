@@ -165,9 +165,11 @@ locks the page whose application cannot renew it, while the page whose
 application renews it rebuilds without going blank.
 
 `pnpm record:incidents` regenerates `docs/assets/calque-incidents-100k.gif`, the
-README's recording of `pnpm incidents -- --dataset content-v1`. It
-drives the page in headless Chromium, commits a transaction through `psql`,
-and needs Docker, Rust and `ffmpeg`.
+README's recording of the incident console that
+`pnpm incidents -- --dataset readable` serves at `/showcase/`. It drives the
+console in headless Chromium over the benchmark's emulated 100 Mbit/s link,
+commits a transaction through `psql`, and needs Docker, Rust and `ffmpeg`. The
+console names macOS fonts (Avenir Next and Menlo), so record on a Mac.
 
 ## The demo by hand
 

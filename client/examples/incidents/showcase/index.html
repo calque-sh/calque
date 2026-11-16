@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Incident console, on Calque</title>
+    <script>
+      // The load clock: from navigation until the frame after every panel
+      // holds its first result, which the page marks with data-ready.
+      (() => {
+        const tick = (now) => {
+          const clock = document.getElementById("clock");
+          const root = document.documentElement;
+          if (clock && root.hasAttribute("data-ready")) {
+            root.dataset.loadMs = String(now);
+            clock.textContent = `${(now / 1000).toFixed(2)} s`;
+            document.getElementById("clock-label").textContent = "Loaded in";
+            return;
+          }
+          if (clock) clock.textContent = `${(now / 1000).toFixed(2)} s`;
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      })();
+    </script>
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <img
+          src="../../../../docs/assets/calque-logo-dark.svg"
+          alt=""
+          width="46"
+          height="26"
+        />
+        <span class="product">Incident console</span>
+      </div>
+      <div id="status" class="status"></div>
+      <p class="clock">
+        <span id="clock-label">Loading</span> <b id="clock">0.00 s</b>
+      </p>
+    </header>
+    <div id="root" class="console"></div>
+    <footer id="narration"></footer>
+    <script type="module" src="/src/showcase/main.ts"></script>
+  </body>
+</html>

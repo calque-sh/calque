@@ -193,6 +193,14 @@ test("the launcher takes --no-open, --fresh and --dataset and refuses anything e
     fresh: false,
     dataset: "v1",
   });
+  assert.deepEqual(
+    parseIncidentsArguments(["--fresh", "--dataset", "readable"]),
+    {
+      open: true,
+      fresh: true,
+      dataset: "readable",
+    },
+  );
   for (const refused of [["--rows", "100k"], ["--rows", "1m"], ["--rows"]])
     assert.throws(
       () => parseIncidentsArguments(refused),

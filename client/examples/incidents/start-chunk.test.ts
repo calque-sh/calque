@@ -10,8 +10,11 @@ const repositoryRoot = fileURLToPath(new URL("../../..", import.meta.url));
 
 type Output = Rolldown.RolldownOutput["output"];
 
-/** The page alone, and the page with the harness entry the benchmark loads. */
-const MODES = ["production", "harness"] as const;
+/**
+ * The page alone, the page with the harness entry the benchmark loads, and the
+ * showcase console the README's recording loads.
+ */
+const MODES = ["production", "harness", "showcase"] as const;
 type Mode = (typeof MODES)[number];
 
 const outputs = new Map<Mode, Output>();
@@ -70,4 +73,5 @@ test("only the harness build publishes the page on __incidents", () => {
     chunksOf(mode).some((chunk) => chunk.code.includes("__incidents"));
   expect(publishes("production")).toBe(false);
   expect(publishes("harness")).toBe(true);
+  expect(publishes("showcase")).toBe(false);
 });

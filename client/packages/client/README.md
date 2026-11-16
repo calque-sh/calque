@@ -31,6 +31,11 @@ of it. By default it rejects a result over 1,000 rows or 4 MiB;
 16 MiB. `window(offset, count)` reads up to 10,000 consecutive rows from
 anywhere in a result of any size, together with the result's total row count.
 
+Live queries are re-read together, so when one change moves several of them,
+a quick one is painted only once the slowest is ready. Under sustained writes,
+a long query that has restarted three times runs to completion in one step,
+and every change batch waits for it.
+
 ## Writes and errors
 
 `insert`, `update` and `delete` show the change on the page at once and send

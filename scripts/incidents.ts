@@ -13,7 +13,9 @@
  *
  * `--fresh` removes calque's local state first, so the working set is
  * prepared from PostgreSQL again. `--no-open` skips Chrome. `--dataset
- * content-v1` seeds v1's rows with realistic content instead.
+ * content-v1` seeds v1's rows with realistic content instead, and `--dataset
+ * readable` seeds content-v1 with text a person can read
+ * (`scripts/incidents-readable.ts`).
  * `CALQUE_INCIDENTS_POSTGRES_PORT`, `CALQUE_INCIDENTS_PORT` and
  * `CALQUE_INCIDENTS_UI_PORT` choose the ports.
  */
@@ -66,6 +68,7 @@ import {
   waitForHttp,
   type PageCommand,
 } from "./demo.ts";
+import { readableTextSql } from "./incidents-readable.ts";
 import { CARGO_TARGET_ARGUMENTS } from "./lib/cargo-target.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -146,10 +149,20 @@ export function isSeededDataset(output: string): boolean {
 export const issueTagsRekeyedSql =
   "SELECT count(*) FROM pg_constraint WHERE conrelid = to_regclass('incidents.issue_tags') AND conname = 'issue_tags_issue_id_tag_key';";
 
-/** The fixture `pnpm incidents` seeds: v1, or v1's rows with realistic content. */
-export type IncidentsDataset = "v1" | "content-v1";
+/**
+ * The fixture `pnpm incidents` seeds: v1, v1's rows with realistic content, or
+ * that content rewritten for a person to read.
+ */
+export type IncidentsDataset = "v1" | "content-v1" | "readable";
+
+const INCIDENTS_DATASETS: readonly IncidentsDataset[] = [
+  "v1",
+  "content-v1",
+  "readable",
+];
 
 export function incidentsDatasetVersion(dataset: IncidentsDataset): string {
+  if (dataset === "readable") return `${CONTENT_DATASET_VERSION}+readable`;
   return dataset === "content-v1" ? CONTENT_DATASET_VERSION : DATASET_VERSION;
 }
 
@@ -167,8 +180,8 @@ export function cutSchemaMarker(dataset: IncidentsDataset): string {
  * Whether the source holds this fixture with its own schema. PostgreSQL
  * resolves every relation in a statement when it parses it, so `metadata` is
  * read only after a statement of its own has found it. A source an earlier run
- * re-keyed is reseeded. Both datasets' metadata names v1, so the schema's
- * comment tells them apart: v1 has none, and the content variant's names it
+ * re-keyed is reseeded. Every dataset's metadata names v1, so the schema's
+ * comment tells them apart: v1 has none, and each content variant's names it
  * only once its seed passed.
  */
 export function holdsSeededDataset(
@@ -218,16 +231,16 @@ export function parseIncidentsArguments(
 ): IncidentsOptions {
   const rest = arguments_[0] === "--" ? arguments_.slice(1) : arguments_;
   const usage = new Error(
-    "usage: pnpm incidents [--] [--no-open] [--fresh] [--dataset v1|content-v1]",
+    "usage: pnpm incidents [--] [--no-open] [--fresh] [--dataset v1|content-v1|readable]",
   );
   let dataset: IncidentsDataset | undefined;
   for (let index = 0; index < rest.length; index += 1) {
     const argument = rest[index];
     if (argument === "--dataset") {
       const value = rest[index + 1];
-      if (dataset !== undefined || (value !== "v1" && value !== "content-v1"))
-        throw usage;
-      dataset = value;
+      const chosen = INCIDENTS_DATASETS.find((name) => name === value);
+      if (dataset !== undefined || chosen === undefined) throw usage;
+      dataset = chosen;
       index += 1;
     } else if (argument !== "--no-open" && argument !== "--fresh") {
       throw usage;
@@ -338,7 +351,8 @@ async function main(): Promise<void> {
             chunks,
           ),
       };
-      if (options.dataset === "content-v1") {
+      if (options.dataset === "v1") seedCut(seams.runSql);
+      else {
         await seedContentFixture(
           seedEnvironment,
           contentSeams,
@@ -346,10 +360,11 @@ async function main(): Promise<void> {
           createContentGenerator(),
           benchValidationSql(),
         );
+        if (options.dataset === "readable") sql(readableTextSql);
         sql(
-          `COMMENT ON SCHEMA incidents IS '${cutSchemaMarker("content-v1")}';`,
+          `COMMENT ON SCHEMA incidents IS '${cutSchemaMarker(options.dataset)}';`,
         );
-      } else seedCut(seams.runSql);
+      }
       process.stdout.write(
         `Seeded the fixture in ${formatSeconds(performance.now() - started)} s.\n`,
       );
@@ -403,10 +418,12 @@ async function main(): Promise<void> {
     runChecked("pnpm", ["--filter", "@calque/config", "build"]);
     runChecked("node", [...buildIncidentsBindingsCheckArguments()]);
     heading("Building the page");
-    // The page's dependencies, then the page with the entry that publishes
-    // what this reads on `globalThis.__incidents`.
+    // The page's dependencies, the page with the entry that publishes what
+    // this reads on `globalThis.__incidents`, then the showcase console the
+    // README's recording shows, at /showcase/.
     runChecked("pnpm", ["--filter", "@calque/incidents^...", "build"]);
     runChecked("pnpm", ["--filter", "@calque/incidents", "build:harness"]);
+    runChecked("pnpm", ["--filter", "@calque/incidents", "build:showcase"]);
 
     heading("Starting the page");
     const page = buildIncidentsPageCommand(uiPort);
@@ -436,6 +453,7 @@ async function main(): Promise<void> {
         "",
         "The incident-operations page is ready.",
         `Open: ${uiOrigin}/`,
+        `The console the README's recording shows: ${uiOrigin}/showcase/`,
         "Every panel is a local query over the complete synchronized tables.",
         "Press Ctrl-C here to stop; PostgreSQL and calque's local state are kept.",
         "",

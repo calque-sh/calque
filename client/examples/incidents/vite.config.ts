@@ -26,6 +26,16 @@ function harnessEntry(): Plugin {
 }
 
 export default defineConfig(({ mode }) => ({
+  // `vite build --mode showcase` builds `showcase/index.html`, the console
+  // the README's recording shows, beside the page `build:harness` wrote.
+  ...(mode === "showcase"
+    ? {
+        build: {
+          emptyOutDir: false,
+          rolldownOptions: { input: "showcase/index.html" },
+        },
+      }
+    : {}),
   plugins: [
     react(),
     calque({

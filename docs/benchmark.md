@@ -22,6 +22,34 @@ and a p95 of 142 ms, spent on request round trips, digest checks, decoding,
 indexing and painting. The run was directional, and Chrome's emulation
 serializes decode with the wire, so the emulated figure errs pessimistic.
 
+## The published run
+
+The run the README cites, `2026-10-31T22-17-18-799Z`, passed every
+threshold. It ran on an Apple M5 Pro laptop (18 cores, 48 GiB, macOS 26.5.1)
+while a container and other work kept its one-minute load average above 4,
+so every number is directional.
+
+| Measure                                         | Threshold   | Result                 |
+| ----------------------------------------------- | ----------- | ---------------------- |
+| Server preparation, slowest of 3                | < 10,000 ms | 1,466 ms               |
+| Cold load to a complete stable paint, p95 of 30 | < 2,000 ms  | 760 ms (median 747 ms) |
+| PostgreSQL commit to paint, p95 of 30           | < 250 ms    | 41 ms                  |
+| PostgreSQL commit to paint, p99 of 30           | < 1,000 ms  | 45 ms                  |
+| Background write load, source row changes/s     | ≥ 10,000    | 11,000                 |
+| Peak browser process-tree RSS                   | ≤ 8 GiB     | 1.3 GiB                |
+| Longest main-thread task                        | ≤ 50 ms     | none over 50 ms        |
+| Filter and sort after the load, p95 of 30       | none        | 35 ms (median 26 ms)   |
+| Bytes downloaded per cold load, median of 30    | none        | 7.7 MB                 |
+| Time those bytes need at 100 Mbit/s, median     | none        | 618 ms                 |
+| Above the wire, p95 of 30                       | none        | 142 ms (median 129 ms) |
+| Peak browser process-tree RSS, an empty page    | none        | 0.89 GiB               |
+
+The README's returning-visit figure, a median paint of 172.3 ms from the copy
+the browser keeps against 719.3 ms for a returning page that downloads the
+artifact again, compares runs under `--returning` and under
+`--returning --no-stored-rows` with the same emulation, and is also
+directional ([Returning visits](#returning-visits)).
+
 ## Running it
 
 Fetch the pinned browser once, then run it:

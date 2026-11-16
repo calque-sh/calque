@@ -18,7 +18,7 @@ opening a public issue.
 ## Running the checks
 
 To check a fix before you describe it in an issue, install what
-[Try it locally](README.md#try-it-locally) lists, and Playwright's Chromium
+[Try it](README.md#try-it) lists, and Playwright's Chromium
 and Firefox, which the browser suites run in:
 `pnpm exec playwright install chromium firefox`. Then build once with
 `pnpm install && pnpm -r build` and run `pnpm verify`. It builds every crate

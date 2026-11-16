@@ -8,7 +8,7 @@ Caddy, over HTTPS.
 
 ## What you need
 
-You need what [Try it locally](../README.md#try-it-locally) lists, plus
+You need what [Try it](../README.md#try-it) lists, plus
 `openssl` and `curl`, and on Linux NSS's `certutil` (`libnss3-tools` on Debian
 and Ubuntu). `calque inspect` and `calque init` below build with Rust, so you also need the
 Rust toolchain through rustup, a C compiler, and libpq with `pg_config` on

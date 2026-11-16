@@ -16,6 +16,7 @@
   "scripts": {
     "build": "vite build",
     "build:harness": "vite build --mode harness",
+    "build:showcase": "vite build --mode showcase",
     "dev": "vite",
     "format": "prettier --write .",
     "lint": "eslint . --max-warnings 0 && prettier --check .",

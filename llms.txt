@@ -1,13 +1,13 @@
 # Calque
 
-> Calque syncs the complete, authorized contents of PostgreSQL 18 tables into the browser, keeps them current through logical replication, and answers the page's queries locally through TypeScript bindings generated from the tables. It is pre-alpha: PostgreSQL 18 is the only source, and Chrome the only browser with benchmark evidence.
+> Calque syncs the complete, authorized contents of PostgreSQL 17 or 18 tables into the browser, keeps them current through logical replication, and answers the page's queries locally through TypeScript bindings generated from the tables. It is pre-alpha: PostgreSQL 17 and 18 are the only sources, and Chrome the only browser with benchmark evidence.
 
 This file walks a coding agent through adding Calque to a web application, from an empty database to a page with a live query. Run the steps in order.
 
 ## Before you start
 
 - There is no SQL API and no server-side pagination. The page holds every row of each collection its grant allows, and every query runs locally through `client.db.<collection>`.
-- Calque is built and measured for working sets of about 100,000 rows. Every page load downloads the whole working set again, so its load time grows with its bytes.
+- Calque is built and measured for working sets of about 100,000 rows. A first visit downloads the whole working set, so its load time grows with its bytes; a returning page reads the encrypted copy the browser keeps and catches up from it.
 - A collection is one PostgreSQL table with a primary key. `calque inspect` refuses any table or column Calque cannot serve and names the reason; [docs/postgresql.md](docs/postgresql.md) lists the supported types.
 - Every column a collection names reaches the browser. If a table holds anything a user must not read, such as a password hash or an internal note, delete that column from the collection's `columns` and its command's `writableColumns` in `calque.config.json`: `calque serve` and `calque dev` then publish the table with a column list that leaves it out, as in `CREATE PUBLICATION calque_app FOR TABLE public.users (id, name)`, so PostgreSQL never sends it. Only `calque dev --table`, run where there is no `calque.config.json`, publishes every column.
 - A grant gives a page whole tables, or one tenant's rows of them by a tenant column that leads the primary key. Visibility per user or per team needs a projection table the application maintains.
@@ -19,7 +19,7 @@ This file walks a coding agent through adding Calque to a web application, from 
 
 ## 1. PostgreSQL
 
-The database must be PostgreSQL 18 with `wal_level=logical`, a free replication slot and WAL sender for each Calque server, and UTF-8. Calque connects as a role that is not a superuser, has `REPLICATION` (on Amazon RDS and Aurora, membership in `rds_replication`) and `CREATE` on the database. `calque serve` reads a publication the tables' owner creates, and its role needs only `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the tables. `calque dev` creates its own publication when its role owns the tables or is a member of the role that does, and otherwise refuses with the `CREATE PUBLICATION` statement for the tables' owner to run once. For a database on this machine, write `127.0.0.1` in the connection string: any host name, `localhost` included, needs `sslmode=verify-full&sslrootcert=<absolute path of a CA file>`, as [docs/postgresql.md](docs/postgresql.md#the-database-url) shows. A managed database needs logical replication turned on and its direct endpoint, not a transaction pooler.
+The database must be PostgreSQL 17 or 18 with `wal_level=logical`, a free replication slot and WAL sender for each Calque server, and UTF-8. Calque connects as a role that is not a superuser, has `REPLICATION` (on Amazon RDS and Aurora, membership in `rds_replication`) and `CREATE` on the database. `calque serve` reads a publication the tables' owner creates, and its role needs only `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the tables. `calque dev` creates its own publication when its role owns the tables or is a member of the role that does, and otherwise refuses with the `CREATE PUBLICATION` statement for the tables' owner to run once. For a database on this machine, write `127.0.0.1` in the connection string: any host name, `localhost` included, needs `sslmode=verify-full&sslrootcert=<absolute path of a CA file>`, as [docs/postgresql.md](docs/postgresql.md#the-database-url) shows. A managed database needs logical replication turned on and its direct endpoint, not a transaction pooler.
 
 Create the role as [docs/postgresql.md](docs/postgresql.md#the-role) shows. For a new table that `calque dev` will serve, as `calque_sync`:
 

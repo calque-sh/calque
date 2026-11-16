@@ -215,8 +215,8 @@ the content-v1 dataset, below 2,000 ms p95 over 30 cold samples to complete
 stable paint, in headless Chrome for Testing at Chrome-emulated 100 Mbit/s and
 30 ms. A run on a loaded machine counts, labelled directional.
 The 16 GiB reference machine, headed Chrome, the 1 Gbps profile and the
-200 Mbps office result above are not judged. The README's [benchmark](../../README.md#the-benchmark)
-section has its thresholds and its most recent full run.
+200 Mbps office result above are not judged. [The benchmark](../benchmark.md#the-published-run)
+has its thresholds and its most recent full run.
 
 The target for every reported run is to separate download, decode, materialization, indexing, query and stable paint, and to publish transfer bytes, CPU, RSS, JS heap, ArrayBuffer use, GC and long tasks. The benchmark records the browser's process-tree RSS, `calque`'s RSS, the benchmark's CPU time, long tasks and GC, and no JS heap or ArrayBuffer figure. Server-cold process recovery, server-warm client load, client-warm load, dataset preparation and live update are distinct scenarios.
 
