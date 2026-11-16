@@ -8,7 +8,7 @@
 <h1 align="center">Calque</h1>
 
 <p align="center">
-  <strong>Your PostgreSQL tables in the browser, complete and live.</strong>
+  <strong>Make your PostgreSQL-backed web app answer every filter and sort in milliseconds, and stay live as the data changes.</strong>
 </p>
 
 Calque copies the tables you choose into the browser, whole or narrowed to one
