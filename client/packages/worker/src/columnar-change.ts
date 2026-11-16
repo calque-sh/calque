@@ -18,6 +18,7 @@ import {
 import type {
   CellValue,
   Operation,
+  PrimaryKey,
 } from "@calque/protocol/generated/change_stream";
 import { OperationKind } from "@calque/protocol/generated/change_stream";
 import { directColumnarTimestampText, equalBytes } from "@calque/core";
@@ -295,8 +296,10 @@ export async function decodeColumnarChangeBatch(
       )
         latestCommitTimeUnixMicros = fragment.commitTimeUnixMicros;
       operationCount += fragment.operations.length;
-      for (const operation of fragment.operations)
-        operations.push(decodeOperation(operation, binding));
+      const keys = state.primaryKeys;
+      fragment.operations.forEach((operation, index) =>
+        operations.push(decodeOperation(operation, binding, keys[index])),
+      );
       if (fragment.finalFragment) {
         transactions.push(
           Object.freeze({
@@ -486,9 +489,14 @@ export function decodeOptimisticMutation(
   return Object.freeze({ mutationId, actions: Object.freeze(actions) });
 }
 
+/**
+ * `validated` is the operation's primary key as `ChangeStreamState` decoded
+ * it; without it the key is decoded here.
+ */
 function decodeOperation(
   operation: Operation,
   binding: CompiledColumnarChangeBinding,
+  validated?: PrimaryKey,
 ): CanonicalOperation {
   const table = binding.byTableId.get(operation.tableId);
   if (!table)
@@ -498,7 +506,7 @@ function decodeOperation(
       invalid(`${operation.tableId} truncate has no truncate payload`);
     return Object.freeze({ kind: "truncate", collection: table.collection });
   }
-  const key = decodeKey(operation.primaryKey, table);
+  const key = decodeKey(operation.primaryKey, table, validated);
   switch (operation.kind) {
     case OperationKind.INSERT_FULL_ROW: {
       if (operation.payload.case !== "insert")
@@ -581,10 +589,11 @@ function requireColumn(table: CompiledTable, columnId: number): CompiledColumn {
 function decodeKey(
   encoded: Uint8Array,
   table: CompiledTable,
+  validated?: PrimaryKey,
 ): readonly KeyPart[] {
   let parts;
   try {
-    parts = decodePrimaryKey(encoded).parts;
+    parts = (validated ?? decodePrimaryKey(encoded)).parts;
   } catch (error) {
     invalid(`${table.tableId} primary key is invalid: ${String(error)}`);
   }

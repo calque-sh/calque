@@ -42,7 +42,9 @@ import {
 } from "./columnar-change.js";
 import {
   ColumnarLiveSession,
+  sendCatchUp,
   type ColumnarLiveMount,
+  type ColumnarLiveRequestOptions,
   type ColumnarLiveSessionOptions,
 } from "./columnar-live.js";
 import type {
@@ -926,6 +928,64 @@ const BATCH_TRANSACTIONS = 250;
 const requestKey = (from: string, through: string | undefined): string =>
   `${from}|${through ?? "live"}`;
 
+/** The request options every test session shares. */
+const REQUEST: ColumnarLiveRequestOptions = {
+  endpoint: "https://change.test/v1/change",
+  planId: PLAN_ID,
+  authorizationScopeToken: "scope-token",
+  tableIds: CONTRACT.tables.map((table) => table.tableId),
+  clientInstanceId: "instance-1",
+  deviceId: "device-1",
+  cursor: text.encode("cursor-0"),
+  maxBatchBytes: 1_048_576,
+  longPollTimeoutMs: 10,
+};
+
+/**
+ * A change endpoint answering from `responses`, recording each request in
+ * `observed`.
+ */
+function changeEndpoint(
+  responses: ReadonlyMap<string, Uint8Array>,
+  observed?: ObservedRequest[],
+): typeof globalThis.fetch {
+  return async (_input, init) => {
+    const body = init?.body;
+    if (!(body instanceof Uint8Array)) throw new Error("unexpected body");
+    const request = fromBinary(change.ChangeRequestSchema, body);
+    const from = utf8.decode(
+      request.fromCursorExclusive?.token ?? new Uint8Array(),
+    );
+    const through = request.throughCursorInclusive
+      ? utf8.decode(request.throughCursorInclusive.token)
+      : undefined;
+    observed?.push({
+      from,
+      through,
+      shardCursors: request.tables.map((table) =>
+        table.shardSnapshotCursor
+          ? utf8.decode(table.shardSnapshotCursor.token)
+          : undefined,
+      ),
+      pendingMutationIds: [...request.pendingMutationIds],
+      stream: request.stream,
+      wait: request.longPollTimeoutMs,
+      transactions: request.maxTransactions,
+    });
+    // A live response is keyed by its cursor alone; a fenced one by
+    // `from|through`.
+    const served =
+      responses.get(requestKey(from, through)) ??
+      (through === undefined ? responses.get(from) : undefined);
+    // Nothing left for this cursor: hold the poll open the way a real
+    // endpoint does rather than answering with a batch that repeats.
+    if (!served) return new Response(null, { status: 503 });
+    return new Response(served.slice() as unknown as BodyInit, {
+      status: 200,
+    });
+  };
+}
+
 function sessionOver(
   mount: ColumnarLiveMount,
   responses: ReadonlyMap<string, Uint8Array>,
@@ -936,51 +996,9 @@ function sessionOver(
 ): ColumnarLiveSession {
   const { observed, ...options } = extra;
   return new ColumnarLiveSession(mount, {
-    endpoint: "https://change.test/v1/change",
-    planId: PLAN_ID,
-    authorizationScopeToken: "scope-token",
-    tableIds: CONTRACT.tables.map((table) => table.tableId),
-    clientInstanceId: "instance-1",
-    deviceId: "device-1",
-    cursor: text.encode("cursor-0"),
-    maxBatchBytes: 1_048_576,
-    longPollTimeoutMs: 10,
+    ...REQUEST,
     ...(onFailed ? { onFailed } : {}),
-    fetch: async (_input, init) => {
-      const body = init?.body;
-      if (!(body instanceof Uint8Array)) throw new Error("unexpected body");
-      const request = fromBinary(change.ChangeRequestSchema, body);
-      const from = utf8.decode(
-        request.fromCursorExclusive?.token ?? new Uint8Array(),
-      );
-      const through = request.throughCursorInclusive
-        ? utf8.decode(request.throughCursorInclusive.token)
-        : undefined;
-      observed?.push({
-        from,
-        through,
-        shardCursors: request.tables.map((table) =>
-          table.shardSnapshotCursor
-            ? utf8.decode(table.shardSnapshotCursor.token)
-            : undefined,
-        ),
-        pendingMutationIds: [...request.pendingMutationIds],
-        stream: request.stream,
-        wait: request.longPollTimeoutMs,
-        transactions: request.maxTransactions,
-      });
-      // A live response is keyed by its cursor alone; a fenced one by
-      // `from|through`.
-      const served =
-        responses.get(requestKey(from, through)) ??
-        (through === undefined ? responses.get(from) : undefined);
-      // Nothing left for this cursor: hold the poll open the way a real
-      // endpoint does rather than answering with a batch that repeats.
-      if (!served) return new Response(null, { status: 503 });
-      return new Response(served.slice() as unknown as BodyInit, {
-        status: 200,
-      });
-    },
+    fetch: changeEndpoint(responses, observed),
     ...options,
   });
 }
@@ -2017,6 +2035,143 @@ describe("the live session catches up to the activation fence before going live"
       }),
     ).rejects.toMatchObject({ code: "CHANGE_STREAM_INVALID" });
     expect(diff(renderOverlay(engine), before)).toEqual([]);
+  });
+
+  describe("a catch-up request sent before the mount opened", () => {
+    const fenced = (fetch: typeof globalThis.fetch) => ({
+      ...REQUEST,
+      activationFence: fenceAt("cursor-1"),
+      fetch,
+    });
+    const catchUpResponses = async () =>
+      new Map([
+        [
+          requestKey("cursor-0", "cursor-1"),
+          await encodeBatch(
+            "cursor-0",
+            "cursor-1",
+            [{ cursor: "cursor-1", operations: TAIL[0]?.operations ?? [] }],
+            { requestedFence: "cursor-1", tableStartCursor: "cursor-0" },
+          ),
+        ],
+      ]);
+    /** A fetch that records each request's signal before `inner` answers. */
+    const signalled = (
+      inner: typeof globalThis.fetch,
+      signals: AbortSignal[],
+    ): typeof globalThis.fetch => {
+      return (input, init) => {
+        if (init?.signal) signals.push(init.signal);
+        return inner(input, init);
+      };
+    };
+
+    test("is read by the session's first request, which sends none of its own", async () => {
+      const source = seedState();
+      const base = await encodeAt(source, "cursor-0");
+      const mount = liveMount(overlayOver(base.workspace), "cursor-0");
+      const responses = await catchUpResponses();
+      const observed: ObservedRequest[] = [];
+      const sent = sendCatchUp(
+        fenced(changeEndpoint(responses, observed)),
+        new AbortController().signal,
+      );
+      // It leaves at once, before any session exists.
+      expect(observed.map(({ from, through }) => [from, through])).toEqual([
+        ["cursor-0", "cursor-1"],
+      ]);
+      const failures: unknown[] = [];
+      const session = sessionOver(
+        mount,
+        responses,
+        (error) => failures.push(error),
+        {
+          activationFence: fenceAt("cursor-1"),
+          observed,
+          ...(sent ? { sent } : {}),
+        },
+      );
+      session.start();
+      await session.live;
+      expect(mount.applied).toEqual(["cursor-1"]);
+      await vi.waitFor(() => expect(observed.length).toBeGreaterThanOrEqual(2));
+      await session.stopped();
+      expect(failures).toEqual([]);
+      // Every request after the one sent ahead is live.
+      expect(
+        observed.slice(1).map(({ from, through }) => [from, through]),
+      ).toEqual(observed.slice(1).map(() => ["cursor-1", undefined]));
+    });
+
+    test("is abandoned for a session that would ask otherwise, which sends its own", async () => {
+      const source = seedState();
+      const base = await encodeAt(source, "cursor-0");
+      const mount = liveMount(overlayOver(base.workspace), "cursor-0");
+      const responses = await catchUpResponses();
+      const observed: ObservedRequest[] = [];
+      const signals: AbortSignal[] = [];
+      const sent = sendCatchUp(
+        fenced(signalled(changeEndpoint(responses, observed), signals)),
+        new AbortController().signal,
+      );
+      // The mount holds a pending mutation the request sent ahead does not
+      // name, so the bytes differ.
+      const session = sessionOver(mount, responses, undefined, {
+        activationFence: fenceAt("cursor-1"),
+        observed,
+        pendingMutationIds: () => ["mutation-1"],
+        ...(sent ? { sent } : {}),
+      });
+      session.start();
+      await session.live;
+      await session.stopped();
+      expect(signals[0]?.aborted).toBe(true);
+      expect(observed.slice(0, 2)).toMatchObject([
+        { from: "cursor-0", through: "cursor-1", pendingMutationIds: [] },
+        {
+          from: "cursor-0",
+          through: "cursor-1",
+          pendingMutationIds: ["mutation-1"],
+        },
+      ]);
+    });
+
+    test("ends with its signal, with a session that stops first, and is never sent for a mount already on the fence", async () => {
+      const responses = await catchUpResponses();
+      const signals: AbortSignal[] = [];
+      const fetch = signalled(changeEndpoint(responses), signals);
+
+      const ended = new AbortController();
+      expect(sendCatchUp(fenced(fetch), ended.signal)).toBeDefined();
+      ended.abort();
+      expect(signals[0]?.aborted).toBe(true);
+      expect(sendCatchUp(fenced(fetch), ended.signal)).toBeUndefined();
+
+      const sent = sendCatchUp(fenced(fetch), new AbortController().signal);
+      if (!sent) throw new Error("expected a catch-up request");
+      const source = seedState();
+      const base = await encodeAt(source, "cursor-0");
+      const session = sessionOver(
+        liveMount(overlayOver(base.workspace), "cursor-0"),
+        responses,
+        undefined,
+        { activationFence: fenceAt("cursor-1"), sent },
+      );
+      session.stop();
+      expect(signals[1]?.aborted).toBe(true);
+      await expect(session.live).rejects.toThrow(/stopped/u);
+
+      expect(
+        sendCatchUp(
+          { ...fenced(fetch), cursor: text.encode("cursor-1") },
+          new AbortController().signal,
+        ),
+      ).toBeUndefined();
+      expect(
+        sendCatchUp({ ...REQUEST, fetch }, new AbortController().signal),
+      ).toBeUndefined();
+      expect(signals).toHaveLength(2);
+    });
   });
 });
 

@@ -7,6 +7,7 @@ import type {
   ColumnValue,
   Cursor as ChangeCursor,
   Operation,
+  PrimaryKey,
   RevocationBarrier,
   SourceGeneration,
   StreamError,
@@ -201,14 +202,23 @@ function validateCell(cell: CellValue, path: string): void {
   }
 }
 
-function validateOperation(operation: Operation, path: string): void {
+const PAYLOAD_BY_KIND: ReadonlyMap<
+  OperationKind,
+  Operation["payload"]["case"]
+> = new Map([
+  [OperationKind.INSERT_FULL_ROW, "insert"],
+  [OperationKind.UPDATE_PATCH, "update"],
+  [OperationKind.DELETE_BY_KEY, "delete"],
+  [OperationKind.TRUNCATE_AUTHORIZED_TABLE, "truncate"],
+]);
+
+/** Returns the operation's decoded primary key, or undefined for a truncate. */
+function validateOperation(
+  operation: Operation,
+  path: string,
+): PrimaryKey | undefined {
   requireIdentifier(operation.tableId, `${path}.tableId`);
-  const expectedPayload = new Map<OperationKind, Operation["payload"]["case"]>([
-    [OperationKind.INSERT_FULL_ROW, "insert"],
-    [OperationKind.UPDATE_PATCH, "update"],
-    [OperationKind.DELETE_BY_KEY, "delete"],
-    [OperationKind.TRUNCATE_AUTHORIZED_TABLE, "truncate"],
-  ]).get(operation.kind);
+  const expectedPayload = PAYLOAD_BY_KIND.get(operation.kind);
   if (expectedPayload === undefined)
     fail(`${path}.kind`, `unknown or unspecified value ${operation.kind}`);
   if (operation.payload.case !== expectedPayload) {
@@ -218,11 +228,12 @@ function validateOperation(operation: Operation, path: string): void {
     );
   }
 
+  let key: PrimaryKey | undefined;
   if (operation.kind === OperationKind.TRUNCATE_AUTHORIZED_TABLE) {
     if (operation.primaryKey.byteLength !== 0)
       fail(`${path}.primaryKey`, "must be empty for truncate");
   } else {
-    decodePrimaryKey(operation.primaryKey, `${path}.primaryKey`);
+    key = decodePrimaryKey(operation.primaryKey, `${path}.primaryKey`);
   }
 
   if (operation.payload.case === "insert") {
@@ -246,6 +257,7 @@ function validateOperation(operation: Operation, path: string): void {
   if (operation.payload.case === "truncate") {
     requireString(operation.payload.value.reason, `${path}.truncate.reason`);
   }
+  return key;
 }
 
 function validateBatchStart(batch: BatchStart, path: string): void {
@@ -283,7 +295,7 @@ function validateBatchStart(batch: BatchStart, path: string): void {
 function validateTransactionFragment(
   fragment: TransactionFragment,
   path: string,
-): void {
+): (PrimaryKey | undefined)[] {
   requireBytes(fragment.transactionId, `${path}.transactionId`);
   validateCursor(fragment.transactionCursor, `${path}.transactionCursor`);
   if (fragment.postgresXid === 0n)
@@ -302,11 +314,12 @@ function validateTransactionFragment(
       `must contain at most ${MAX_CHANGE_BATCH_OPERATIONS} values`,
     );
   }
-  fragment.operations.forEach((operation, index) =>
+  const keys = fragment.operations.map((operation, index) =>
     validateOperation(operation, `${path}.operations[${index}]`),
   );
   if (fragment.operations.length === 0)
     fail(`${path}.operations`, "must not be empty");
+  return keys;
 }
 
 function validateBatchEnd(batch: BatchEnd, path: string): void {
@@ -486,7 +499,14 @@ function requireBarrierIdentifier(value: string, path: string): void {
   }
 }
 
-export function validateChangeStreamFrame(frame: ChangeStreamFrame): void {
+/**
+ * Refuses a frame that breaks the protocol. For a transaction fragment it
+ * returns each operation's primary key as it decoded it, in the operations'
+ * order, undefined for a truncate; for any other frame, none.
+ */
+export function validateChangeStreamFrame(
+  frame: ChangeStreamFrame,
+): readonly (PrimaryKey | undefined)[] {
   requireVersion(frame.protocolVersion, "changeStreamFrame.protocolVersion");
   if (frame.body.case === undefined)
     fail("changeStreamFrame.body", "is required");
@@ -496,11 +516,10 @@ export function validateChangeStreamFrame(frame: ChangeStreamFrame): void {
       validateBatchStart(frame.body.value, "changeStreamFrame.batchStart");
       break;
     case "transactionFragment":
-      validateTransactionFragment(
+      return validateTransactionFragment(
         frame.body.value,
         "changeStreamFrame.transactionFragment",
       );
-      break;
     case "batchEnd":
       validateBatchEnd(frame.body.value, "changeStreamFrame.batchEnd");
       break;
@@ -520,6 +539,7 @@ export function validateChangeStreamFrame(frame: ChangeStreamFrame): void {
       );
       break;
   }
+  return [];
 }
 
 function validateMutationEnvelope(

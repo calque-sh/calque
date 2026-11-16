@@ -2875,6 +2875,52 @@ describe("direct-columnar session", () => {
     await client.close();
   });
 
+  it("sends the fenced catch-up while the artifact still downloads, and reads it once the mount opened", async () => {
+    const artifact = Promise.withResolvers<undefined>();
+    const polls = releasableChangePolls(1);
+    const { client, worker, fetcher } = makeClient(
+      fencedPlan(),
+      polls.changeFetch,
+      undefined,
+      serveArtifact(new Uint8Array(ARTIFACT_BYTES), artifact.promise),
+    );
+    worker.openCursor = "cursor-a";
+    await until(() => polls.polls === 1, "the catch-up request");
+    expect(
+      worker.requests.some((request) => request.type === "artifact-end"),
+    ).toBe(false);
+    artifact.resolve(undefined);
+    polls.release(0);
+    expect(await settled(client)).toEqual({ state: "ready" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // The response it sent ahead was the catch-up's, so the next request is
+    // the live poll.
+    const changes = polls.bodies.map(decodeChangeRequest);
+    expect(changes.map(({ from, through }) => [from, through])).toEqual([
+      ["cursor-a", "cursor-p"],
+      ["cursor-p", undefined],
+    ]);
+    expect(
+      fetcher.mock.calls.filter(([input]) => String(input).endsWith("/change")),
+    ).toHaveLength(2);
+    await client.close();
+  });
+
+  it("abandons the catch-up it sent when the mount opens away from the artifact cursor", async () => {
+    const signals: AbortSignal[] = [];
+    const { client, worker } = makeClient(fencedPlan(), (input, init) => {
+      if (init?.signal) signals.push(init.signal);
+      return abortingLongPoll(input, init);
+    });
+    worker.openCursor = "cursor-x";
+    expect(await settled(client)).toMatchObject({
+      state: "error",
+      error: { code: "INTEGRITY_FAILED" },
+    });
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
   it("refuses a mount that opened away from the artifact cursor", async () => {
     const { client, worker, fetcher } = makeClient();
     worker.openCursor = "cursor-x";

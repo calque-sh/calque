@@ -23,7 +23,10 @@ import {
   type StoredArtifact,
   type StoredCopy,
 } from "@calque/worker/columnar";
-import type { ColumnarLivePublication } from "@calque/worker/columnar-live";
+import type {
+  ColumnarLivePublication,
+  ColumnarLiveRequestOptions,
+} from "@calque/worker/columnar-live";
 
 import { isAbortSignalAborted } from "../abort-signal.js";
 import type { SealedSyncClientOptions } from "../client-options.js";
@@ -1983,6 +1986,39 @@ export class ColumnarSession {
     const engine = new EngineWorkerClient(this.#workerFactory() as Worker);
     mark("worker:spawned");
     const liveModule = awaitedLater(import("@calque/worker/columnar-live"));
+    // The plan bound every table start to the artifact's snapshot cursor, and
+    // the catch-up from there to the fence asks for its first batches as soon
+    // as the change stream's module has loaded, so that its round trip
+    // overlaps the open. Nothing is read from it before the mount opened.
+    const snapshotCursor = encoder.encode(artifact.snapshotCursor);
+    const tableIds = contract.tables.map((table) => table.tableId);
+    const changeRequest: ColumnarLiveRequestOptions = {
+      endpoint: plan.changeStream.endpoint,
+      planId: plan.planId,
+      authorizationScopeToken: plan.authorization.scopeToken,
+      tableIds,
+      clientInstanceId: this.#clientInstanceId,
+      deviceId: this.#deviceId,
+      cursor: snapshotCursor,
+      activationFence: {
+        cursor: encoder.encode(plan.changeStream.throughCursorInclusive),
+        tableStarts: tableIds.map((tableId) => ({ tableId, snapshotCursor })),
+      },
+      maxBatchBytes: plan.changeStream.maxBatchBytes,
+      longPollTimeoutMs: plan.changeStream.longPollTimeoutMs,
+      // The server sends a barrier body only to a poll that says it can
+      // authenticate one.
+      acceptRevocationBarrier: this.#options.grantVerificationKey !== undefined,
+      ...(this.#options.fetch ? { fetch: this.#options.fetch } : {}),
+    };
+    const catchUp = new AbortController();
+    const sent = awaitedLater(
+      liveModule.then(({ sendCatchUp }) => {
+        const request = sendCatchUp(changeRequest, catchUp.signal);
+        if (request) mark("catch-up:sent");
+        return request;
+      }),
+    );
     const { copy, writer } = await this.#storage(
       plan.storedRowsKey,
       artifact,
@@ -2022,6 +2058,7 @@ export class ColumnarSession {
     const abandon = (): void => {
       download.abort();
       decoder?.close();
+      catchUp.abort();
     };
     epoch.addEventListener("abort", abandon, { once: true });
     try {
@@ -2154,9 +2191,8 @@ export class ColumnarSession {
       } finally {
         hashers.close();
       }
-      // The plan bound every table start to the artifact's snapshot cursor,
-      // so a mount opened anywhere else cannot run the plan's catch-up.
-      const snapshotCursor = encoder.encode(artifact.snapshotCursor);
+      // A mount opened anywhere but the artifact's cut cannot run the plan's
+      // catch-up.
       if (!state.cursor || !equalBytes(state.cursor, snapshotCursor))
         throw new SyncError(
           "INTEGRITY_FAILED",
@@ -2184,7 +2220,6 @@ export class ColumnarSession {
       // activation fence, and the activation resolves only once the mount
       // stands on the fence, so the artifact's cut is never read as live
       // state.
-      const tableIds = contract.tables.map((table) => table.tableId);
       const activation: Activation = {
         engine,
         state,
@@ -2201,28 +2236,11 @@ export class ColumnarSession {
         renewal: new AbortController(),
         tables,
       };
+      const pending = await sent;
       const live = new ColumnarLiveSession(engine, {
-        endpoint: plan.changeStream.endpoint,
-        planId: plan.planId,
-        authorizationScopeToken: plan.authorization.scopeToken,
-        tableIds,
-        clientInstanceId: this.#clientInstanceId,
-        deviceId: this.#deviceId,
+        ...changeRequest,
         cursor: state.cursor,
-        activationFence: {
-          cursor: encoder.encode(plan.changeStream.throughCursorInclusive),
-          tableStarts: tableIds.map((tableId) => ({
-            tableId,
-            snapshotCursor,
-          })),
-        },
-        maxBatchBytes: plan.changeStream.maxBatchBytes,
-        longPollTimeoutMs: plan.changeStream.longPollTimeoutMs,
-        // The server sends a barrier body only to a poll that says it can
-        // authenticate one.
-        acceptRevocationBarrier:
-          this.#options.grantVerificationKey !== undefined,
-        fetch: this.#options.fetch,
+        ...(pending ? { sent: pending } : {}),
         // Every poll names the deltas this mount still holds, so the server
         // can acknowledge them on the echo.
         pendingMutationIds: () => activation.state.pendingMutationIds,
@@ -2256,6 +2274,7 @@ export class ColumnarSession {
       if (writer) this.#keep(writer, artifact.decodedSha256);
       return activation;
     } catch (error) {
+      catchUp.abort();
       if (writer) {
         writer.abandon();
         this.#storing.delete(writer);

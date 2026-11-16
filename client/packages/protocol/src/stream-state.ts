@@ -1,5 +1,6 @@
 import type {
   ChangeStreamFrame,
+  PrimaryKey,
   RevocationBarrier,
   SourceGeneration,
   TransactionFragment,
@@ -84,6 +85,7 @@ export class ChangeStreamState {
   #transactionCount = 0n;
   #operationCount = 0n;
   #revocationBarrier: RevocationBarrier | undefined;
+  #primaryKeys: readonly (PrimaryKey | undefined)[] = [];
 
   constructor(expectation: ChangeStreamExpectation) {
     const tableIds = expectation.tableStarts.map((start) => start.tableId);
@@ -138,6 +140,15 @@ export class ChangeStreamState {
   }
 
   /**
+   * The primary keys of the operations of the frame `accept` last took, as
+   * its validation decoded them: one per operation of a transaction
+   * fragment, undefined for a truncate, and none after any other frame.
+   */
+  get primaryKeys(): readonly (PrimaryKey | undefined)[] {
+    return this.#primaryKeys;
+  }
+
+  /**
    * Accepts the next frame. `receivedBody` is its body as it arrived
    * (`decodeReceivedChangeFrames`), which the digest is then checked over.
    */
@@ -146,8 +157,9 @@ export class ChangeStreamState {
     receivedBody?: Uint8Array,
   ): Promise<CompletedBatch | undefined> {
     if (this.terminal) fail("changeStream", "is already terminal");
+    this.#primaryKeys = [];
     try {
-      validateChangeStreamFrame(frame);
+      const primaryKeys = validateChangeStreamFrame(frame);
       await verifyChangeFrameBodySha256(frame, receivedBody);
 
       switch (frame.body.case) {
@@ -158,6 +170,7 @@ export class ChangeStreamState {
         case "transactionFragment":
           this.#acceptTransactionFragment(frame.body.value);
           this.#frames.push(frame.bodySha256);
+          this.#primaryKeys = primaryKeys;
           return undefined;
         case "revocationBarrier":
           await this.#acceptRevocationBarrier(frame.body.value);

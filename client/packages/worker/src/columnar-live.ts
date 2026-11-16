@@ -111,10 +111,69 @@ export interface ColumnarLiveSessionOptions extends ColumnarLiveTerms {
    */
   readonly pendingMutationIds?: () => readonly string[];
   readonly fetch?: typeof globalThis.fetch;
+  /**
+   * The catch-up's first request, sent by `sendCatchUp` before the mount
+   * opened. The session's first request reads its response when it would
+   * have sent exactly that request itself, and abandons it otherwise.
+   */
+  readonly sent?: SentCatchUp;
   /** Called after each published batch, on the same turn the mount advanced. */
   readonly onPublished?: (applied: ColumnarLivePublication) => void;
   /** Called once when the loop stops for a reason other than `stop()`. */
   readonly onFailed?: (error: unknown) => void;
+}
+
+/** What a change request is built from, before any mount exists. */
+export type ColumnarLiveRequestOptions = Pick<
+  ColumnarLiveSessionOptions,
+  | "endpoint"
+  | "planId"
+  | "authorizationScopeToken"
+  | "tableIds"
+  | "clientInstanceId"
+  | "deviceId"
+  | "cursor"
+  | "maxBatchBytes"
+  | "longPollTimeoutMs"
+  | "acceptRevocationBarrier"
+  | "activationFence"
+  | "fetch"
+>;
+
+/** A catch-up request sent ahead of the session that reads its response. */
+export interface SentCatchUp {
+  readonly body: Uint8Array;
+  readonly response: Promise<Response>;
+  /** Abandons the request, and the body of its response. */
+  abort(): void;
+}
+
+/**
+ * Sends the fenced catch-up's first request for a mount that will open at
+ * `options.cursor`, carrying no pending mutation ids, so that its round trip
+ * overlaps the open. Sends nothing when the cursor already stands on the
+ * fence, or once `signal` has ended, which also abandons a request it sent.
+ */
+export function sendCatchUp(
+  options: ColumnarLiveRequestOptions,
+  signal: AbortSignal,
+): SentCatchUp | undefined {
+  const fence = options.activationFence;
+  if (signal.aborted || !fence || equalBytes(fence.cursor, options.cursor))
+    return undefined;
+  const controller = new AbortController();
+  const abort = (): void => controller.abort();
+  signal.addEventListener("abort", abort, { once: true });
+  const body = changeRequestBody(options, options.cursor, fence, options, []);
+  const response = awaitedLater(
+    sendChangeRequest(
+      options.fetch ?? globalThis.fetch.bind(globalThis),
+      options.endpoint,
+      body,
+      controller.signal,
+    ),
+  );
+  return { body, response, abort };
 }
 
 type ColumnarLivePhase = "catch-up" | "live";
@@ -153,6 +212,8 @@ export class ColumnarLiveSession {
   #terms: ColumnarLiveTerms;
   /** Aborts only the request in flight; the loop's own controller stays. */
   #poll: AbortController | undefined;
+  /** The request sent ahead, until the first request takes or drops it. */
+  #sent: SentCatchUp | undefined;
   /**
    * Set by `nudge()`; a request that fails while it is set restarts at once.
    */
@@ -173,6 +234,7 @@ export class ColumnarLiveSession {
       planId: options.planId,
       authorizationScopeToken: options.authorizationScopeToken,
     };
+    this.#sent = options.sent;
     const fence = options.activationFence;
     if (fence) {
       if (fence.cursor.byteLength === 0)
@@ -224,6 +286,8 @@ export class ColumnarLiveSession {
     const controller = this.#controller;
     this.#controller = undefined;
     controller?.abort();
+    this.#sent?.abort();
+    this.#sent = undefined;
     this.#live.reject(
       new RuntimeError(
         "INVALID_LIFECYCLE",
@@ -423,87 +487,118 @@ export class ColumnarLiveSession {
     fence: ColumnarChangeFence | undefined,
     terms: ColumnarLiveTerms,
   ): Promise<Response> {
-    const startsByTable = new Map(
-      fence?.tableStarts.map((start) => [start.tableId, start] as const),
+    const body = changeRequestBody(
+      this.#options,
+      this.#cursor,
+      fence,
+      terms,
+      this.#options.pendingMutationIds?.() ?? [],
     );
-    const pendingMutationIds = [
-      ...new Set(this.#options.pendingMutationIds?.() ?? []),
-    ].sort();
-    // A fenced catch-up never waits for the head, so its wait only bounds how
-    // long its response may run. A shorter one would split the catch-up into
-    // requests with a gap between each.
-    const wait =
-      fence && this.#options.longPollTimeoutMs > 0
-        ? MAX_LONG_POLL_TIMEOUT_MS
-        : this.#options.longPollTimeoutMs;
-    const request = create(change.ChangeRequestSchema, {
-      protocolVersion: 1,
-      planId: terms.planId,
-      fromCursorExclusive: create(change.CursorSchema, {
-        token: this.#cursor,
-      }),
-      ...(fence
-        ? {
-            throughCursorInclusive: create(change.CursorSchema, {
-              token: fence.cursor,
-            }),
-          }
-        : {}),
-      tables: [...this.#options.tableIds].sort().map((tableId) => {
-        const snapshotCursor = startsByTable.get(tableId)?.snapshotCursor;
-        return create(change.TableSubscriptionSchema, {
-          tableId,
-          ...(snapshotCursor
-            ? {
-                shardSnapshotCursor: create(change.CursorSchema, {
-                  token: snapshotCursor,
-                }),
-              }
-            : {}),
-        });
-      }),
-      authorizationScopeToken: encoder.encode(terms.authorizationScopeToken),
-      maxBatchBytes: BigInt(this.#options.maxBatchBytes),
-      maxTransactions: MAX_BATCH_TRANSACTIONS,
-      longPollTimeoutMs: wait,
-      clientInstanceId: this.#options.clientInstanceId,
-      deviceId: this.#options.deviceId,
-      acceptTransactionFragmentation: true,
-      acceptRevocationBarrier: this.#options.acceptRevocationBarrier === true,
-      pendingMutationIds,
-      // The wait is how long an open response may stay open, so a request
-      // without one asks for one batch.
-      stream: wait > 0,
-    });
-    const response = await this.#fetch(this.#options.endpoint, {
-      method: "POST",
-      headers: {
-        "content-type": CHANGE_MEDIA_TYPE,
-        accept: CHANGE_MEDIA_TYPE,
-      },
-      body: toBinary(change.ChangeRequestSchema, request),
-      signal,
-    });
-    if (!response.ok) {
-      const refusal = await readErrorFrame(response);
-      // The refusal's `resnapshotRequired` outranks the status: the server
-      // sends those refusals as 401, 409 or 410, and a status rule would
-      // report a client that merely fell behind as an integrity failure. An
-      // authorization refusal is named apart, because its rebuild needs a
-      // fresh grant.
-      throw new RuntimeError(
-        refusal?.code === change.StreamErrorCode.AUTHORIZATION_CHANGED
-          ? "AUTHORIZATION_EXPIRED"
-          : refusal?.resnapshotRequired
-            ? "RESNAPSHOT_REQUIRED"
-            : response.status >= 500 || response.status === 429
-              ? "CANCELLED"
-              : "CHANGE_STREAM_INVALID",
-        `change request failed with HTTP ${response.status}${describeRefusal(refusal)}`,
-      );
+    const sent = this.#sent;
+    this.#sent = undefined;
+    if (sent && equalBytes(sent.body, body)) {
+      signal.addEventListener("abort", () => sent.abort(), { once: true });
+      if (signal.aborted) sent.abort();
+      return sent.response;
     }
-    return response;
+    sent?.abort();
+    return sendChangeRequest(this.#fetch, this.#options.endpoint, body, signal);
   }
+}
+
+/** The encoded `ChangeRequest` asking from `cursor`, to `fence` if any. */
+function changeRequestBody(
+  options: ColumnarLiveRequestOptions,
+  cursor: Uint8Array,
+  fence: ColumnarChangeFence | undefined,
+  terms: ColumnarLiveTerms,
+  pendingMutationIds: readonly string[],
+): Uint8Array<ArrayBuffer> {
+  const startsByTable = new Map(
+    fence?.tableStarts.map((start) => [start.tableId, start] as const),
+  );
+  // A fenced catch-up never waits for the head, so its wait only bounds how
+  // long its response may run. A shorter one would split the catch-up into
+  // requests with a gap between each.
+  const wait =
+    fence && options.longPollTimeoutMs > 0
+      ? MAX_LONG_POLL_TIMEOUT_MS
+      : options.longPollTimeoutMs;
+  const request = create(change.ChangeRequestSchema, {
+    protocolVersion: 1,
+    planId: terms.planId,
+    fromCursorExclusive: create(change.CursorSchema, { token: cursor }),
+    ...(fence
+      ? {
+          throughCursorInclusive: create(change.CursorSchema, {
+            token: fence.cursor,
+          }),
+        }
+      : {}),
+    tables: [...options.tableIds].sort().map((tableId) => {
+      const snapshotCursor = startsByTable.get(tableId)?.snapshotCursor;
+      return create(change.TableSubscriptionSchema, {
+        tableId,
+        ...(snapshotCursor
+          ? {
+              shardSnapshotCursor: create(change.CursorSchema, {
+                token: snapshotCursor,
+              }),
+            }
+          : {}),
+      });
+    }),
+    authorizationScopeToken: encoder.encode(terms.authorizationScopeToken),
+    maxBatchBytes: BigInt(options.maxBatchBytes),
+    maxTransactions: MAX_BATCH_TRANSACTIONS,
+    longPollTimeoutMs: wait,
+    clientInstanceId: options.clientInstanceId,
+    deviceId: options.deviceId,
+    acceptTransactionFragmentation: true,
+    acceptRevocationBarrier: options.acceptRevocationBarrier === true,
+    pendingMutationIds: [...new Set(pendingMutationIds)].sort(),
+    // The wait is how long an open response may stay open, so a request
+    // without one asks for one batch.
+    stream: wait > 0,
+  });
+  return toBinary(change.ChangeRequestSchema, request);
+}
+
+/** Sends one change request; a refused one throws what its refusal means. */
+async function sendChangeRequest(
+  fetch: typeof globalThis.fetch,
+  endpoint: string,
+  body: Uint8Array<ArrayBuffer>,
+  signal: AbortSignal,
+): Promise<Response> {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": CHANGE_MEDIA_TYPE,
+      accept: CHANGE_MEDIA_TYPE,
+    },
+    body,
+    signal,
+  });
+  if (!response.ok) {
+    const refusal = await readErrorFrame(response);
+    // The refusal's `resnapshotRequired` outranks the status: the server
+    // sends those refusals as 401, 409 or 410, and a status rule would
+    // report a client that merely fell behind as an integrity failure. An
+    // authorization refusal is named apart, because its rebuild needs a
+    // fresh grant.
+    throw new RuntimeError(
+      refusal?.code === change.StreamErrorCode.AUTHORIZATION_CHANGED
+        ? "AUTHORIZATION_EXPIRED"
+        : refusal?.resnapshotRequired
+          ? "RESNAPSHOT_REQUIRED"
+          : response.status >= 500 || response.status === 429
+            ? "CANCELLED"
+            : "CHANGE_STREAM_INVALID",
+      `change request failed with HTTP ${response.status}${describeRefusal(refusal)}`,
+    );
+  }
+  return response;
 }
 
 /**

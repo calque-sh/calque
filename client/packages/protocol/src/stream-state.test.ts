@@ -4,11 +4,15 @@ import { describe, expect, it } from "vitest";
 import {
   BatchEndSchema,
   BatchStartSchema,
+  CellValueSchema,
   ChangeStreamFrameSchema,
+  ColumnValueSchema,
   CursorSchema,
+  DeleteSchema,
   HeartbeatSchema,
   OperationKind,
   OperationSchema,
+  PrimaryKeySchema,
   SourceGenerationSchema,
   StreamErrorCode,
   StreamErrorSchema,
@@ -18,6 +22,7 @@ import {
   type ChangeStreamFrame,
 } from "./gen/change_stream_pb.js";
 import { BatchFramesDigest, changeFrameBodySha256 } from "./integrity.js";
+import { encodePrimaryKey } from "./primary-key.js";
 import { ChangeStreamState } from "./stream-state.js";
 
 const bytes = (value: string) => new TextEncoder().encode(value);
@@ -182,6 +187,46 @@ describe("change stream state", () => {
       "mutation-1",
       "mutation-2",
     ]);
+  });
+
+  it("hands over the primary keys it decoded for the fragment it last took", async () => {
+    const key = (id: bigint) =>
+      create(PrimaryKeySchema, {
+        codecVersion: 1,
+        parts: [
+          create(ColumnValueSchema, {
+            columnId: 1,
+            value: create(CellValueSchema, {
+              kind: { case: "int64Value", value: id },
+            }),
+          }),
+        ],
+      });
+    const remove = (id: bigint) =>
+      create(OperationSchema, {
+        tableId: "public.tasks",
+        kind: OperationKind.DELETE_BY_KEY,
+        primaryKey: encodePrimaryKey(key(id)),
+        payload: { case: "delete", value: create(DeleteSchema) },
+      });
+    const keyed = fragment(0, true);
+    if (keyed.body.case !== "transactionFragment") {
+      throw new Error("expected a transaction fragment");
+    }
+    keyed.body.value.operations.unshift(remove(1n), remove(2n));
+
+    const stream = state();
+    const sent = await acceptAll(stream, [start()]);
+    expect(stream.primaryKeys).toEqual([]);
+    sent.push(...(await acceptAll(stream, [keyed])));
+    expect(stream.primaryKeys).toEqual([key(1n), key(2n), undefined]);
+    await stream.accept(
+      await ended(sent, {
+        relevantTransactionCount: 1n,
+        relevantOperationCount: 3n,
+      }),
+    );
+    expect(stream.primaryKeys).toEqual([]);
   });
 
   it("refuses a batch whose frames were lost, reordered or miscounted", async () => {
