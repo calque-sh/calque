@@ -261,6 +261,32 @@ function columnarPlan(): Mutable {
   return plan();
 }
 
+describe("the stored-rows key", () => {
+  const key = Buffer.alloc(32, 7).toString("base64url");
+
+  it("is read when the plan carries one and absent when it does not", () => {
+    expect(
+      parseBootstrapPlan({ ...plan(), storedRowsKey: key }).storedRowsKey,
+    ).toBe(key);
+    expect("storedRowsKey" in parseBootstrapPlan(plan())).toBe(false);
+  });
+
+  it("refuses anything but 32 bytes in unpadded base64url", () => {
+    for (const refused of [
+      "",
+      key.slice(1),
+      `${key}A`,
+      `${key}=`,
+      Buffer.alloc(32, 7).toString("base64"),
+      `${key.slice(0, 42)}B`,
+      7,
+    ])
+      expect(() =>
+        parseBootstrapPlan({ ...plan(), storedRowsKey: refused }),
+      ).toThrow(/storedRowsKey/u);
+  });
+});
+
 describe("direct-columnar bootstrap plans", () => {
   it("parses the checked-in vector the server-side schema test validates", () => {
     const parsed = parseBootstrapPlan(
@@ -273,6 +299,9 @@ describe("direct-columnar bootstrap plans", () => {
       manifestVersion: "manifest_01JZCOLUMNAR",
       authorizationScopeVersion: "authorization-generation-9",
     });
+    expect(parsed.storedRowsKey).toBe(
+      "c3RvcmVkLXJvd3Mta2V5LWV4YW1wbGUtMzItYnl0ZXM",
+    );
     expect(runtime.tables[0]?.columns?.map((column) => column.name)).toEqual(
       runtime.schema.tables[0]?.columns.map((column) => column.name),
     );

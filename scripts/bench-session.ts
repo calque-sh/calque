@@ -30,6 +30,7 @@ import {
   closeBrowser,
   fitWindow,
   launchBrowser,
+  launchPersistentBrowser,
   relaunchOnRefusal,
 } from "./bench-launch.ts";
 import {
@@ -75,12 +76,17 @@ export interface Session {
   readonly browserLaunches: number;
 }
 
+/**
+ * A new browser and its page, on a fresh context with an empty HTTP cache,
+ * or, given `profile`, on that profile directory as it was left.
+ */
 export async function openSession(
   run: Run,
   keepLastPng: boolean,
+  profile: string | null = null,
 ): Promise<Session> {
   const { value, launches } = await relaunchOnRefusal(() =>
-    launchSession(run, keepLastPng),
+    launchSession(run, keepLastPng, profile),
   );
   run.launches.push(launches);
   return { ...value, browserLaunches: launches };
@@ -89,18 +95,23 @@ export async function openSession(
 async function launchSession(
   run: Run,
   keepLastPng: boolean,
+  profile: string | null,
 ): Promise<Omit<Session, "browserLaunches">> {
   if (!run.connection || !run.server)
     throw new Error("the run has no running calque dev");
   const target = run.browser;
-  const browser = await launchBrowser(target, true);
+  const viewport = { width: VIEWPORT.width, height: VIEWPORT.height };
+  const { browser, context: persistent } =
+    profile === null
+      ? { browser: await launchBrowser(target, true), context: null }
+      : await launchPersistentBrowser(target, profile, viewport, true);
   try {
-    const context = await browser.newContext({
-      viewport: { width: VIEWPORT.width, height: VIEWPORT.height },
-      deviceScaleFactor: 1,
-    });
+    const context =
+      persistent ??
+      (await browser.newContext({ viewport, deviceScaleFactor: 1 }));
     await context.addInitScript({ content: LONG_TASK_SCRIPT });
-    const page = await context.newPage();
+    // A persistent context opens with a blank page of its own.
+    const page = context.pages()[0] ?? (await context.newPage());
     const pageErrors: string[] = [];
     page.on("pageerror", (error) => pageErrors.push(error.message));
     page.on("crash", () => browserLost("page-crash"));

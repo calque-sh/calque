@@ -40,6 +40,11 @@ export type WorkerRequest =
        * cursor and `change` is refused.
        */
       readonly changeStream?: ColumnarChangeContract;
+      /**
+       * A store worker's port. Each chunk the worker accepts goes on to it,
+       * its buffer transferred, as a `StoredRowsChunk`.
+       */
+      readonly store?: MessagePort;
     }
   | {
       readonly id: number;

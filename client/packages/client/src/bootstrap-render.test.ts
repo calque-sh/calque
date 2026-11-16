@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { importStoredRowsKey } from "@calque/worker/columnar";
+
 import { renderBootstrap } from "./bootstrap-render.js";
 import {
   type BootstrapStart,
@@ -187,6 +189,73 @@ describe("a bootstrap the backend renders into the page", () => {
     },
   );
 
+  it("names the page's stored copy in the request, and leaves out the preload only when the plan's artifact is that copy under the plan's key", async () => {
+    const storedRowsKey = "c3RvcmVkLXJvd3Mta2V5LWZpeHR1cmUtMzItYnl0ZXM";
+    const { keyId } = await importStoredRowsKey(storedRowsKey);
+    const digest = "5a".repeat(32);
+    const older = "a5".repeat(32);
+    const plan = planWith([ARTIFACT_URL]);
+    const keyed = JSON.stringify({
+      ...plan,
+      artifacts: (plan.artifacts as Record<string, unknown>[]).map(
+        (artifact) => ({ ...artifact, decodedSha256: digest }),
+      ),
+      storedRowsKey,
+    });
+    const render = async (body: string, cookie: string | undefined) => {
+      const backend = answering(body);
+      const head = parts(
+        await renderBootstrap(START, {
+          acceptEncoding: BROWSER,
+          cookie,
+          fetch: backend,
+        }),
+      );
+      const sent = JSON.parse(String(backend.mock.calls[0]?.[1]?.body)) as {
+        cachedArtifactHints: unknown;
+      };
+      return { ...head, hints: sent.cachedArtifactHints };
+    };
+
+    const held = await render(
+      keyed,
+      `theme=dark; calque-stored-rows=${keyId}.${digest}`,
+    );
+    expect(held.preloads).toEqual([]);
+    expect(held.hints).toEqual([digest]);
+    expect((JSON.parse(held.element) as { plan: string }).plan).toBe(keyed);
+
+    const preload = `<link rel="preload" as="fetch" crossorigin="anonymous" href="${ARTIFACT_URL}">`;
+    // A copy of a cut the server no longer plans, or one sealed under
+    // another key, is named but downloaded.
+    for (const [cookie, hint] of [
+      [`calque-stored-rows=${keyId}.${older}`, older],
+      [`calque-stored-rows=${"0".repeat(32)}.${digest}`, digest],
+    ] as const) {
+      const missed = await render(keyed, cookie);
+      expect(missed.preloads).toEqual([preload]);
+      expect(missed.hints).toEqual([hint]);
+    }
+    for (const cookie of [
+      undefined,
+      "",
+      `calque-stored-rows=${keyId}`,
+      `calque-stored-rows=${keyId.toUpperCase()}.${digest}`,
+      `calque-stored-rows-old=${keyId}.${digest}`,
+    ]) {
+      const none = await render(keyed, cookie);
+      expect(none.preloads).toEqual([preload]);
+      expect(none.hints).toEqual([]);
+    }
+    // A plan without a key is never read from a stored copy.
+    const unkeyed = JSON.stringify({
+      ...JSON.parse(keyed),
+      storedRowsKey: undefined,
+    });
+    expect(
+      (await render(unkeyed, `calque-stored-rows=${keyId}.${digest}`)).preloads,
+    ).toEqual([preload]);
+  });
   it("renders only the plan for a plan that names no artifact", async () => {
     const head = await renderBootstrap(START, {
       acceptEncoding: BROWSER,

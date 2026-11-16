@@ -30,7 +30,9 @@ import {
   parseTail,
   parseRecutMinInterval,
   parseRecutTailRatio,
-  recutArguments,
+  parseRecutKeepRatio,
+  parseBetweenVisits,
+  devArguments,
   unjudgedReasons,
 } from "./bench-conditions.ts";
 import { hrtimeMs } from "./bench-host.ts";
@@ -68,6 +70,7 @@ import {
   type Taken,
   type TakenSample,
 } from "./bench-samples.ts";
+import { storedRowsRecord, storedRowsSummary } from "./bench-stored-rows.ts";
 import { RealtimeMonitor, RunnerStalls } from "./bench-sampling.ts";
 import { runStop } from "./bench-stop.ts";
 import { recutWindows } from "./bench-tail.ts";
@@ -176,6 +179,8 @@ function frame(
 const PRODUCTION = {
   dataset: "content-v1",
   network: { megabitsPerSecond: 100, latencyMs: 30 },
+  storedRows: true,
+  returning: false,
 } as const;
 
 test("bench arguments take --smoke, --calque, --diagnostic, --hold-until-logged, --realtime-only and --postgres-bin once each", () => {
@@ -341,6 +346,35 @@ test("--tail writes before the reference pass and leaves the run unjudged", () =
     assert.throws(() => parseTail(bad), /whole number/u, bad);
 });
 
+test("--no-stored-rows reaches calque dev, --returning takes returning visits, and both leave the run unjudged", () => {
+  const defaults = parseBenchArguments([]);
+  assert.equal(defaults.storedRows, true);
+  assert.equal(defaults.returning, false);
+  assert.deepEqual(unjudgedReasons(defaults), []);
+  const options = parseBenchArguments([
+    "--smoke",
+    "--returning",
+    "--no-stored-rows",
+  ]);
+  assert.equal(options.storedRows, false);
+  assert.equal(options.returning, true);
+  assert.deepEqual(devArguments(options), ["--no-stored-rows"]);
+  assert.deepEqual(unjudgedReasons(options), [
+    "no stored rows",
+    "returning visits",
+  ]);
+  for (const repeated of ["--returning", "--no-stored-rows"])
+    assert.throws(
+      () => parseBenchArguments([repeated, repeated]),
+      /usage: pnpm bench/u,
+    );
+  // A realtime-only run takes no cold sample to make a returning visit of.
+  assert.throws(
+    () => parseBenchArguments(["--realtime-only", "--returning"]),
+    /--returning changes the cold samples, so it takes no --realtime-only/u,
+  );
+});
+
 test("--recut-tail-ratio and --recut-min-interval reach calque dev and leave the run unjudged", () => {
   const options = parseBenchArguments([
     "--recut-tail-ratio",
@@ -348,7 +382,7 @@ test("--recut-tail-ratio and --recut-min-interval reach calque dev and leave the
     "--recut-min-interval",
     "0",
   ]);
-  assert.deepEqual(recutArguments(options), [
+  assert.deepEqual(devArguments(options), [
     "--recut-tail-ratio",
     "0.03125",
     "--recut-min-interval",
@@ -358,7 +392,7 @@ test("--recut-tail-ratio and --recut-min-interval reach calque dev and leave the
     unjudgedReasons(options).includes("re-cut at a tail ratio of 0.03125"),
   );
   assert.ok(unjudgedReasons(options).includes("re-cut at most every 0 s"));
-  assert.deepEqual(recutArguments(parseBenchArguments([])), []);
+  assert.deepEqual(devArguments(parseBenchArguments([])), []);
   assert.equal(parseRecutTailRatio("0"), 0);
   assert.equal(parseRecutTailRatio("1000"), 1_000);
   for (const bad of ["-1", "1000.5", "1e-6", "ratio", ""])
@@ -366,6 +400,44 @@ test("--recut-tail-ratio and --recut-min-interval reach calque dev and leave the
   assert.equal(parseRecutMinInterval("86400"), 86_400);
   for (const bad of ["86401", "1.5", "-1", ""])
     assert.throws(() => parseRecutMinInterval(bad), /whole seconds/u, bad);
+});
+
+test("--recut-keep-ratio reaches calque dev, --between-visits writes between a returning sample's visits, and both leave the run unjudged", () => {
+  const options = parseBenchArguments([
+    "--smoke",
+    "--returning",
+    "--between-visits",
+    "400",
+    "--recut-keep-ratio",
+    "0",
+  ]);
+  assert.equal(options.betweenVisits, 400);
+  assert.equal(options.recutKeepRatio, 0);
+  assert.deepEqual(devArguments(options), ["--recut-keep-ratio", "0"]);
+  assert.deepEqual(unjudgedReasons(options), [
+    "older cuts kept to a log ratio of 0",
+    "returning visits",
+    "400 write transactions between the visits",
+  ]);
+  assert.equal(parseBenchArguments([]).betweenVisits, undefined);
+  for (const repeated of ["--between-visits", "--recut-keep-ratio"])
+    assert.throws(
+      () => parseBenchArguments(["--returning", repeated, "2", repeated, "2"]),
+      /usage: pnpm bench/u,
+    );
+  // Without a first visit there is nothing to write between.
+  assert.throws(
+    () => parseBenchArguments(["--between-visits", "2"]),
+    /--between-visits writes between a sample's two visits, so it needs --returning/u,
+  );
+  assert.equal(parseBetweenVisits("2"), 2);
+  assert.equal(parseBetweenVisits("100000"), 100_000);
+  for (const bad of ["0", "1", "3", "100002", "2.0", "-2", "1e3", ""])
+    assert.throws(() => parseBetweenVisits(bad), /even number/u, bad);
+  assert.equal(parseRecutKeepRatio("0.25"), 0.25);
+  assert.equal(parseRecutKeepRatio("1000"), 1_000);
+  for (const bad of ["-1", "1000.5", "1e-6", "ratio", ""])
+    assert.throws(() => parseRecutKeepRatio(bad), /decimal/u, bad);
 });
 
 test("a re-cut's window runs from the sample before its gauge rose to the one after it fell", () => {
@@ -383,6 +455,7 @@ test("a re-cut's window runs from the sample before its gauge rose to the one af
       tailEntries: 0,
       tailBytes: 0,
       thresholdBytes: 0,
+      retainedEntries: 0,
     },
     rssBytes,
     cpuSeconds,
@@ -1667,6 +1740,134 @@ test("a run whose judged cold samples did not each load its one artifact object 
   assert.equal(
     judgeArtifactObject(expected, []).reason,
     "no judged cold sample",
+  );
+
+  // Under --between-visits each sample expects the cut planned after its own
+  // writes.
+  const own = (name: string, url: string, asked = url) => ({
+    name,
+    requests: ledger(asked),
+    expectedUrl: url,
+  });
+  const recut = `${route}sha256:c1?<redacted>`;
+  assert.equal(
+    judgeArtifactObject(expected, [own("cold-0", brotli), own("cold-1", recut)])
+      .one,
+    true,
+  );
+  assert.equal(
+    judgeArtifactObject(expected, [
+      own("cold-0", brotli),
+      own("cold-1", recut, brotli),
+    ]).one,
+    false,
+  );
+
+  // A sample that read its stored copy asked for no artifact, and is not read.
+  const returning = judgeArtifactObject(expected, [
+    { name: "cold-0", requests: ledger(), storeHit: true },
+    { name: "cold-1", requests: ledger(brotli), storeHit: false },
+  ]);
+  assert.equal(returning.one, true);
+  assert.deepEqual(returning.without, []);
+  assert.deepEqual(
+    judgeArtifactObject(expected, [
+      { name: "cold-0", requests: ledger(), storeHit: true },
+    ]),
+    {
+      one: null,
+      expected: brotli,
+      objects: [],
+      without: [],
+      reason: "every judged cold sample read its stored copy",
+    },
+  );
+});
+
+test("a sample's stored-rows record reads its marks, its plan, its ledger and its resource timing", () => {
+  const page = "https://127.0.0.1:4100";
+  const request = (url: string) => ({
+    url: url.startsWith("/") ? `${page}${url}` : url,
+  });
+  // Resource timing's cache hit: a body that crossed no wire.
+  const resource = (path: string, cached: boolean) => ({
+    name: `${page}${path}`,
+    transferSize: cached ? 0 : 1_300,
+    encodedBodySize: 1_000,
+  });
+  const marks = (...names: [string, number][]) =>
+    names.map(([name, startTime]) => ({ name: `calque:${name}`, startTime }));
+
+  const stored = storedRowsRecord({
+    marks: marks(["store:miss", 40], ["store:written", 912.5]),
+    coldMs: 750,
+    requests: [
+      request("/"),
+      request(
+        "https://127.0.0.1:4101/v1/artifact-objects/sha256:b0?<redacted>",
+      ),
+    ],
+    resources: [resource("/assets/index-a.js", false)],
+    pageOrigin: page,
+    planKey: true,
+  });
+  assert.deepEqual(stored, {
+    planKey: true,
+    hit: false,
+    miss: true,
+    failed: false,
+    abandoned: false,
+    writtenMs: 912.5,
+    writtenAfterPaintMs: 162.5,
+    artifactRequests: 1,
+    scriptsFromCache: false,
+  });
+
+  const read = storedRowsRecord({
+    marks: marks(["store:hit", 35], ["store:read", 60]),
+    coldMs: 180,
+    requests: [request("/")],
+    resources: [
+      resource("/assets/index-a.js", true),
+      // A worker's script, which the page's ledger never sees answered.
+      resource("/assets/worker-b.js", true),
+      // Not a script: the page's stylesheet, from the network.
+      resource("/assets/page-c.css", false),
+    ],
+    pageOrigin: page,
+    planKey: true,
+  });
+  assert.equal(read.hit, true);
+  assert.equal(read.artifactRequests, 0);
+  assert.equal(read.scriptsFromCache, true);
+  assert.equal(read.writtenMs, null);
+  assert.equal(read.writtenAfterPaintMs, null);
+
+  const off = storedRowsRecord({
+    marks: [],
+    coldMs: null,
+    requests: [request("/")],
+    resources: [],
+    pageOrigin: page,
+    planKey: false,
+  });
+  assert.equal(off.scriptsFromCache, null);
+  assert.equal(off.planKey, false);
+
+  assert.deepEqual(
+    storedRowsSummary([
+      { name: "cold-0", storedRows: stored },
+      { name: "cold-1", storedRows: read },
+      { name: "cold-2", storedRows: off },
+    ]),
+    {
+      samples: ["cold-0", "cold-1", "cold-2"],
+      planKey: ["cold-0", "cold-1"],
+      hit: ["cold-1"],
+      written: ["cold-0"],
+      artifactRequested: ["cold-0"],
+      scriptsFromCache: ["cold-1"],
+    },
   );
 });
 

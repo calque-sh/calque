@@ -42,11 +42,11 @@
     "verify:protocol": "pnpm schema:lint && pnpm generate:check && pnpm compatibility:check && pnpm typecheck && pnpm build && pnpm fixtures:check && pnpm lint && pnpm test"
   },
   "dependencies": {
-    "@bufbuild/protobuf": "2.12.1"
+    "@bufbuild/protobuf": "2.17.0"
   },
   "devDependencies": {
     "@bufbuild/buf": "1.71.0",
-    "@bufbuild/protoc-gen-es": "2.12.1",
+    "@bufbuild/protoc-gen-es": "2.17.0",
     "@eslint/js": "^9.31.0",
     "@types/node": "^24.0.0",
     "eslint": "^9.31.0",

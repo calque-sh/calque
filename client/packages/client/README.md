@@ -97,6 +97,36 @@ So `auth()` must return a fresh grant whenever the client asks. An `auth()`
 that caches its grant until it expires renews nothing, and its page downloads
 its working set again each time a grant runs out.
 
+## Rows kept between visits
+
+Once a page has loaded its working set, the client keeps a copy of it in the
+browser's origin private file system, encrypted with AES-256-GCM, so that the
+next visit reads it from disk instead of downloading it. The key comes with
+each plan from the server and is never written to disk, so the copy opens only
+for a page that holds a plan for the same rows. The server issues the same key
+only while the rows, their scope and their authorization generation are
+unchanged. The next visit checks every chunk against its plan, as it checks a
+download, and then catches up from the copy's cursor. Each plan request names
+the copy, and after the server cuts a new artifact it still plans the copy's
+cut while the changes since it stay small, a quarter of the newest artifact's
+size by default (`--recut-keep-ratio`), so the page reads its copy and catches
+up from it. Past that, the page downloads the newest artifact and keeps it in
+place of the old one. One working set is kept per origin. The page sets a
+`calque-stored-rows` cookie on its origin naming the copy's key id, which says
+nothing of the key, and its artifact's decoded SHA-256, so that the page's
+starter and `renderBootstrap` can name the copy in their requests and
+`renderBootstrap` can leave out the preload of an artifact the page will read
+from disk.
+
+The client erases the copy when a revocation barrier arrives, when the client
+locks, when the copy fails to read, and when `clearStoredRows()` is called. An
+application whose users share a browser calls `clearStoredRows()` at sign-out.
+Create the client with `storeRows: false` to keep and read nothing; its
+`clearStoredRows()` still erases what an earlier page kept. A server started
+with `--no-stored-rows` sends no key, and its pages keep nothing. A browser
+without the origin private file system, Web Locks or WebCrypto, or one where
+writing fails, loads the page as it would without a copy.
+
 ## Starting the load early
 
 `createSyncClient` starts loading as soon as it is called: it asks `auth` for
@@ -203,9 +233,18 @@ request:
 // The backend, for each page it renders:
 const head = await renderBootstrap(
   { endpoint, bearerToken, requiredTables, memoryBudgetBytes },
-  { acceptEncoding: request.headers["accept-encoding"] },
+  {
+    acceptEncoding: request.headers["accept-encoding"],
+    cookie: request.headers.cookie,
+  },
 );
 ```
+
+The `cookie` is the page request's `Cookie` header. The request names the
+copy the page's `calque-stored-rows` cookie names, and when the plan's
+artifact is that copy, sealed under the plan's key, the head carries the plan
+and no preload, since the page reads that copy instead of downloading it. A backend that leaves `cookie` out preloads the artifact on
+every visit, and a returning page downloads it while it reads its copy.
 
 A backend has no page to read a path against, so `renderBootstrap` takes the
 endpoint as an absolute URL: for a connection that names `/_calque/`, it

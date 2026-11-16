@@ -590,6 +590,7 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
         max_open_streams: connections.max_open_streams,
         change_tail_bytes: command.change_tail_bytes,
         max_change_batch_bytes: 8 * 1024 * 1024,
+        stored_rows: !command.no_stored_rows,
         memory: dev_memory_policy(),
         metrics: metrics.clone(),
         // One shared bearer is one principal: there is nothing to narrow
@@ -1193,6 +1194,7 @@ mod tests {
             max_inflight_requests: calque_engine::DEFAULT_MAX_INFLIGHT_REQUESTS,
             max_open_streams: calque_engine::DEFAULT_MAX_OPEN_STREAMS,
             change_tail_bytes: calque_engine::DEFAULT_CHANGE_TAIL_BYTES,
+            no_stored_rows: false,
             recut: crate::cli::RecutOptions::default(),
             tenant_column: None,
             tenant: None,
@@ -1261,6 +1263,19 @@ mod tests {
             command.change_tail_bytes,
             calque_engine::DEFAULT_CHANGE_TAIL_BYTES
         );
+        assert!(!command.no_stored_rows);
+        let cli = Cli::try_parse_from([
+            "calque",
+            "dev",
+            "--table",
+            "public.tasks",
+            "--no-stored-rows",
+        ])
+        .unwrap();
+        let Command::Dev(command) = cli.command else {
+            panic!("expected dev command");
+        };
+        assert!(command.no_stored_rows);
     }
 
     #[test]

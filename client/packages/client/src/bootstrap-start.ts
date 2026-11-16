@@ -239,6 +239,41 @@ export function requestedParameters(
   };
 }
 
+/** The cookie that names the stored copy a page holds. */
+export const STORED_ROWS_COOKIE = "calque-stored-rows";
+const STORED_ROWS_HINT = /^([0-9a-f]{32})\.([0-9a-f]{64})$/u;
+
+/** The copy a page holds, as its cookie names it. */
+export interface StoredRowsHint {
+  /** The id of the key the copy is sealed under. */
+  readonly keyId: string;
+  /** The decoded SHA-256 of the artifact the copy holds. */
+  readonly decodedSha256: string;
+}
+
+/** The copy a `Cookie` header's `calque-stored-rows` names, if any. */
+export function hintedCopy(
+  cookie: string | undefined,
+): StoredRowsHint | undefined {
+  for (const pair of cookie?.split(";") ?? []) {
+    const [name, value] = pair.trim().split("=", 2);
+    if (name !== STORED_ROWS_COOKIE || value === undefined) continue;
+    const [, keyId, decodedSha256] = STORED_ROWS_HINT.exec(value) ?? [];
+    if (keyId !== undefined && decodedSha256 !== undefined)
+      return { keyId, decodedSha256 };
+  }
+  return undefined;
+}
+
+/** The copy this page's cookie names, if any; none outside a page. */
+export function heldCopy(): StoredRowsHint | undefined {
+  try {
+    return hintedCopy(globalThis.document?.cookie);
+  } catch {
+    return undefined;
+  }
+}
+
 const DEVICE_ID_STORAGE_KEY = "calque-device-id";
 const UUID_TEXT =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -278,7 +313,9 @@ function postBootstrap(requested: BootstrapParameters): void {
   try {
     response = globalThis.fetch(
       parameters.url,
-      bootstrapInit(parameters, clientInstanceId),
+      bootstrapInit(parameters, clientInstanceId, {
+        held: heldCopy()?.decodedSha256,
+      }),
     );
   } catch (error) {
     response = Promise.reject(error);
@@ -400,15 +437,24 @@ export interface ResidentState {
   readonly cursor: string;
 }
 
+/** What a bootstrap request sends beside its parameters. */
+export interface BootstrapRequestExtras {
+  readonly signal?: AbortSignal | undefined;
+  /** What a renewal presents; it installs nothing, so it names no copy. */
+  readonly resident?: ResidentState | undefined;
+  /** The decoded SHA-256 of the stored copy the page holds, if any. */
+  readonly held?: string | undefined;
+}
+
 /**
  * The request every path sends, so they cannot drift apart. Only a renewal
- * names resident state.
+ * names resident state, and only a request that installs an artifact names
+ * the copy the page holds.
  */
 export function bootstrapInit(
   parameters: Omit<BootstrapParameters, "url">,
   clientInstanceId: string,
-  signal?: AbortSignal,
-  resident?: ResidentState,
+  { signal, resident, held }: BootstrapRequestExtras = {},
 ): RequestInit & { readonly headers: Readonly<Record<string, string>> } {
   return {
     method: "POST",
@@ -421,7 +467,7 @@ export function bootstrapInit(
     body: JSON.stringify({
       protocolVersion: parameters.protocolVersion,
       requiredTables: parameters.requiredTables,
-      cachedArtifactHints: [],
+      cachedArtifactHints: resident || held === undefined ? [] : [held],
       acceptedEncodings: parameters.acceptedEncodings,
       memoryBudgetBytes: parameters.memoryBudgetBytes,
       clientHeapReserveBytes: parameters.clientHeapReserveBytes,

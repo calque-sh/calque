@@ -20,7 +20,7 @@ use bootstrap_api::BootstrapPlan;
 use http_headers::has_media_type;
 pub use http_headers::BearerToken;
 use serde::{Deserialize, Serialize};
-use sync_types::{ArtifactId, OpaqueCursor, TableId};
+use sync_types::{OpaqueCursor, TableId};
 use tracing::{info_span, Instrument};
 
 const BOOTSTRAP_PATH: &str = "/v1/bootstrap";
@@ -41,7 +41,9 @@ pub struct BootstrapHttpRequest {
     pub resident_tables: BTreeSet<TableId>,
     /// Where the resident tables stand; named exactly when they are.
     pub resident_cursor: Option<OpaqueCursor>,
-    pub cached_artifact_hints: BTreeSet<ArtifactId>,
+    /// The decoded SHA-256, 64 lowercase hex digits, of each artifact the
+    /// client holds a copy of.
+    pub cached_artifact_hints: BTreeSet<String>,
     pub accepted_encodings: Vec<RepresentationEncoding>,
     pub memory_budget_bytes: u64,
     pub client_heap_reserve_bytes: u64,
@@ -219,12 +221,14 @@ impl TryFrom<WireBootstrapRequest> for BootstrapHttpRequest {
             .map(TableId::new)
             .collect::<Result<BTreeSet<_>, _>>()
             .map_err(|_| BootstrapHttpError::InvalidRequest)?;
-        let cached_artifact_hints = wire
+        if !wire
             .cached_artifact_hints
-            .into_iter()
-            .map(ArtifactId::new)
-            .collect::<Result<BTreeSet<_>, _>>()
-            .map_err(|_| BootstrapHttpError::InvalidRequest)?;
+            .iter()
+            .all(|hint| is_sha256_hex(hint))
+        {
+            return Err(BootstrapHttpError::InvalidRequest);
+        }
+        let cached_artifact_hints: BTreeSet<_> = wire.cached_artifact_hints.into_iter().collect();
         let resident_tables = wire
             .resident_tables
             .into_iter()
@@ -391,6 +395,14 @@ fn parse_qvalue(value: &str) -> Result<bool, BootstrapHttpError> {
         "1" if fraction.bytes().all(|byte| byte == b'0') => Ok(true),
         _ => Err(BootstrapHttpError::InvalidRequest),
     }
+}
+
+/// A decoded SHA-256 as manifests and plans write it.
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn is_token_byte(byte: u8) -> bool {
@@ -1062,6 +1074,38 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), status, "{accepted}");
+        }
+    }
+
+    /// A hint is the decoded SHA-256 of an artifact the page holds, as plans
+    /// write it; anything else, an artifact id among them, is refused.
+    #[tokio::test]
+    async fn a_hint_must_be_a_decoded_sha256() {
+        let digest = "0123456789abcdef".repeat(4);
+        for (hint, status) in [
+            (digest.clone(), StatusCode::OK),
+            (digest.to_uppercase(), StatusCode::BAD_REQUEST),
+            (format!("sha256:{digest}"), StatusCode::BAD_REQUEST),
+            (digest[..63].to_owned(), StatusCode::BAD_REQUEST),
+            ("artifact-1".to_owned(), StatusCode::BAD_REQUEST),
+        ] {
+            let response = router(Backend)
+                .oneshot(request(
+                    serde_json::json!({
+                        "protocolVersion": 1,
+                        "requiredTables": ["table/tasks"],
+                        "cachedArtifactHints": [hint],
+                        "acceptedEncodings": ["zstd", "identity"],
+                        "memoryBudgetBytes": 536870912,
+                        "clientHeapReserveBytes": 67108864,
+                        "clientInstanceId": "client-1",
+                        "deviceId": "device-1"
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{hint}");
         }
     }
 

@@ -46,7 +46,7 @@ export function startCalque(
   publicBaseUrl: string | null,
   environment: NodeJS.ProcessEnv,
   log: string,
-  recut: readonly string[],
+  devArguments: readonly string[],
 ): CalqueServer {
   const fd = openSync(log, "a");
   const child = spawn(
@@ -65,7 +65,7 @@ export function startCalque(
       "--metrics-port",
       String(metricsPort),
       ...(publicBaseUrl === null ? [] : ["--public-base-url", publicBaseUrl]),
-      ...recut,
+      ...devArguments,
       "--acknowledge-disposable-source",
     ],
     { cwd: root, env: environment, stdio: ["ignore", fd, fd], detached: true },

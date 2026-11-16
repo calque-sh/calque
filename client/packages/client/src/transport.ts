@@ -93,6 +93,8 @@ interface BootstrapRequest {
   readonly signal?: AbortSignal | undefined;
   /** What a renewal presents; absent for a plan that installs an artifact. */
   readonly resident?: ResidentState | undefined;
+  /** The decoded SHA-256 of the stored copy the page holds, if any. */
+  readonly held?: string | undefined;
 }
 
 /**
@@ -118,8 +120,11 @@ export function requestBootstrapPlan(
           deviceId: request.deviceId,
         },
         request.clientInstanceId,
-        request.signal,
-        request.resident,
+        {
+          signal: request.signal,
+          resident: request.resident,
+          held: request.held,
+        },
       ),
     );
   } catch (error) {

@@ -175,6 +175,10 @@ pub struct ServeCommand {
     /// them. A browser behind what it holds reads the log; 0 holds nothing.
     #[arg(long, value_name = "BYTES", default_value_t = calque_engine::DEFAULT_CHANGE_TAIL_BYTES, value_parser = parse_change_tail_bytes)]
     pub change_tail_bytes: u64,
+    /// Lets no browser keep its working set between visits: plans carry no
+    /// key to encrypt a stored copy under, so every visit downloads it.
+    #[arg(long)]
+    pub no_stored_rows: bool,
     #[command(flatten)]
     pub recut: RecutOptions,
     #[command(flatten)]
@@ -292,6 +296,10 @@ pub struct DevCommand {
     /// them. A browser behind what it holds reads the log; 0 holds nothing.
     #[arg(long, value_name = "BYTES", default_value_t = calque_engine::DEFAULT_CHANGE_TAIL_BYTES, value_parser = parse_change_tail_bytes)]
     pub change_tail_bytes: u64,
+    /// Lets no browser keep its working set between visits: plans carry no
+    /// key to encrypt a stored copy under, so every visit downloads it.
+    #[arg(long)]
+    pub no_stored_rows: bool,
     #[command(flatten)]
     pub recut: RecutOptions,
     /// Partitions the scope by this column, as `calque init --tenant-column`
@@ -324,6 +332,12 @@ pub struct RecutOptions {
     /// the last re-cut, to the next re-cut.
     #[arg(long = "recut-min-interval", value_name = "SECONDS", default_value_t = calque_engine::DEFAULT_RECUT_MIN_INTERVAL.as_secs())]
     pub recut_min_interval_seconds: u64,
+    /// Keep an older cut, and the changes after it, while those changes hold
+    /// at most this many bytes per byte of the newest decoded artifact, so a
+    /// page that stored that cut catches up from it instead of downloading
+    /// the newest. 0 keeps only the newest cut.
+    #[arg(long, value_name = "RATIO", default_value_t = calque_engine::DEFAULT_RECUT_KEEP_RATIO, value_parser = parse_recut_tail_ratio)]
+    pub recut_keep_ratio: f64,
 }
 
 impl RecutOptions {
@@ -331,6 +345,7 @@ impl RecutOptions {
         calque_engine::RecutPolicy {
             tail_ratio: self.recut_tail_ratio,
             min_interval: std::time::Duration::from_secs(self.recut_min_interval_seconds),
+            keep_ratio: self.recut_keep_ratio,
         }
     }
 }
@@ -340,6 +355,7 @@ impl Default for RecutOptions {
         Self {
             recut_tail_ratio: calque_engine::DEFAULT_RECUT_TAIL_RATIO,
             recut_min_interval_seconds: calque_engine::DEFAULT_RECUT_MIN_INTERVAL.as_secs(),
+            recut_keep_ratio: calque_engine::DEFAULT_RECUT_KEEP_RATIO,
         }
     }
 }
@@ -686,6 +702,8 @@ mod tests {
             default.bind_address,
             IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
         );
+        assert!(!default.no_stored_rows);
+        assert!(serve(&["--no-stored-rows"]).no_stored_rows);
         assert_eq!(default.expected_host, None);
         assert_eq!(default.port, 8787);
 

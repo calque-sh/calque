@@ -22,6 +22,7 @@ export function publicColumnarClient<Collections extends CollectionShapes>(
     retryMutation: (mutationId: string) => session.retryMutation(mutationId),
     refresh: (signal?: AbortSignal) => session.refresh(signal),
     reset: () => session.reset(),
+    clearStoredRows: () => session.clearStoredRows(),
     close: () => session.close(),
     db: session.db,
   };

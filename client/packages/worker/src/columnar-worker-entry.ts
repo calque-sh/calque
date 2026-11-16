@@ -31,6 +31,7 @@ import type {
 } from "./columnar-worker-protocol.js";
 import { awaitedLater } from "./async.js";
 import { RuntimeError } from "./runtime-error.js";
+import type { StoredRowsChunk } from "./stored-rows-protocol.js";
 
 interface WorkerScope {
   onmessage:
@@ -86,6 +87,8 @@ interface Receiving {
   /** Why the artifact cannot open, once something has refused it. */
   failure: { readonly error: unknown } | undefined;
   readonly ports: readonly MessagePort[];
+  /** Where each accepted chunk goes on to be stored, if anywhere. */
+  readonly store: MessagePort | undefined;
   /** How many chunks the receiver has accepted. */
   accepted: number;
   /** How many chunks the page sent, once `artifact-end` has said. */
@@ -115,6 +118,7 @@ function startReceiving(request: Extract<WorkerRequest, { type: "open" }>) {
     receiver,
     failure,
     ports,
+    store: request.store instanceof MessagePort ? request.store : undefined,
     accepted: 0,
     chunks: undefined,
     settled,
@@ -151,6 +155,11 @@ function accept(current: Receiving, chunk: WorkerArtifactChunk): void {
     return;
   }
   current.accepted += 1;
+  // The receiver copied the chunk, so its buffer goes to the store worker.
+  current.store?.postMessage(
+    { index: chunk.index, bytes: chunk.bytes } satisfies StoredRowsChunk,
+    [chunk.bytes],
+  );
   scope.postMessage({ type: "artifact-credit", index: chunk.index });
   if (current.accepted === current.chunks) current.settled.resolve();
 }
@@ -175,6 +184,7 @@ async function received(): Promise<DirectColumnarWorkspace> {
   await current.settled.promise;
   receiving = null;
   for (const port of current.ports) port.close();
+  current.store?.close();
   if (current.failure) throw current.failure.error;
   if (!current.receiver) throw new Error("no artifact is arriving");
   return current.receiver.open();

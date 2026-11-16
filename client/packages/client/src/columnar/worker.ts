@@ -10,6 +10,9 @@ export type ColumnarHasherWorker = ColumnarEngineWorker;
 /** A decoder worker the direct-columnar session spawns; a DOM `Worker` fits. */
 export type ColumnarDecoderWorker = ColumnarEngineWorker;
 
+/** A store worker the direct-columnar session spawns; a DOM `Worker` fits. */
+export type ColumnarStoreWorker = ColumnarEngineWorker;
+
 /** The platform's `Worker`, read once; a runtime without one is refused. */
 function workerConstructor(): typeof globalThis.Worker {
   const WorkerConstructor = globalThis.Worker;
@@ -69,5 +72,24 @@ function instantiateColumnarBrowserDecoder(
   return new Worker(
     new URL("../columnar-browser-decoder-entry.js", import.meta.url),
     { type: "module", name: "calque-decoder" },
+  );
+}
+
+/**
+ * The store worker that keeps the artifact of a load for the next visit; the
+ * session spawns it on a load whose plan carries a stored-rows key and whose
+ * page has no copy of the artifact.
+ */
+export function createColumnarBrowserStore(): ColumnarStoreWorker {
+  return instantiateColumnarBrowserStore(workerConstructor());
+}
+
+// Spelled verbatim for the bundler, as `instantiateColumnarBrowserWorker` is.
+function instantiateColumnarBrowserStore(
+  Worker: typeof globalThis.Worker,
+): ColumnarStoreWorker {
+  return new Worker(
+    new URL("../columnar-browser-store-entry.js", import.meta.url),
+    { type: "module", name: "calque-store" },
   );
 }

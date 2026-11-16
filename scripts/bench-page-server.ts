@@ -33,6 +33,8 @@ interface PageControl {
    * is the edge's when the run has one. Null with no connection.
    */
   readonly backendEndpoint: string | null;
+  /** The page server's `immutableAssets`: a run of returning visits. */
+  readonly immutableAssets: boolean;
 }
 
 export function writePageControl(path: string, control: PageControl): void {
@@ -46,6 +48,7 @@ type RenderBootstrap = (
   start: Connection & BootstrapElement,
   options: {
     readonly acceptEncoding: string | undefined;
+    readonly cookie?: string | undefined;
     readonly fetch?: typeof fetch;
   },
 ) => Promise<string>;
@@ -126,18 +129,18 @@ export async function servePageCommand(
   const server = servePage(parsePort(port, "port"), {
     root: build,
     current: () => {
-      const { connection, renderedPlan, backendEndpoint } = JSON.parse(
-        readFileSync(control, "utf8"),
-      ) as PageControl;
+      const { connection, renderedPlan, backendEndpoint, immutableAssets } =
+        JSON.parse(readFileSync(control, "utf8")) as PageControl;
       if (connection === null || !renderedPlan || backendEndpoint === null)
-        return { connection, head: null };
+        return { connection, head: null, immutableAssets };
       return {
         connection,
-        head: (acceptEncoding) =>
+        head: (acceptEncoding, cookie) =>
           renderBootstrap(
             { ...connection, ...parameters, endpoint: backendEndpoint },
-            { acceptEncoding },
+            { acceptEncoding, cookie },
           ),
+        immutableAssets,
       };
     },
   });

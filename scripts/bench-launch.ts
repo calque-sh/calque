@@ -1,6 +1,11 @@
 /** The pinned browser's process and window, and the bounded readings every session starts with. */
 import { existsSync, readFileSync } from "node:fs";
-import { type Browser, type CDPSession, chromium } from "playwright";
+import {
+  type Browser,
+  type BrowserContext,
+  type CDPSession,
+  chromium,
+} from "playwright";
 import {
   BROWSER_EXIT_LOOKBACK_MS,
   browserExitCause,
@@ -53,6 +58,42 @@ export async function launchBrowser(
     throw error;
   }
   return browser;
+}
+
+/**
+ * `launchBrowser` on the profile in `userDataDirectory`, which keeps its HTTP
+ * cache, cookies and origin storage when the browser closes, with the one
+ * context such a browser has.
+ */
+export async function launchPersistentBrowser(
+  target: Pick<LaunchTarget, "executablePath" | "args">,
+  userDataDirectory: string,
+  viewport: { readonly width: number; readonly height: number },
+  stopListens: boolean,
+): Promise<{ readonly browser: Browser; readonly context: BrowserContext }> {
+  const context = await chromium.launchPersistentContext(userDataDirectory, {
+    executablePath: target.executablePath,
+    args: [...(target.args ?? [])],
+    headless: true,
+    handleSIGINT: !stopListens,
+    viewport,
+    deviceScaleFactor: 1,
+  });
+  const browser = context.browser();
+  if (browser === null) {
+    await context.close().catch(() => undefined);
+    throw new Error("Playwright gave the persistent context no browser");
+  }
+  browser.on("disconnected", () => {
+    if (!closingBrowsers.has(browser)) browserLost("browser-disconnected");
+  });
+  try {
+    requireBrowserVersion(browser.version());
+  } catch (error) {
+    await closeBrowser(browser);
+    throw error;
+  }
+  return { browser, context };
 }
 
 export async function closeBrowser(browser: Browser): Promise<void> {

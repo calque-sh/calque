@@ -9,6 +9,8 @@ import { isBoundedIdentifier } from "./limits.js";
 
 const HASH_ID = /^sha256:[0-9a-f]{64}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+/** 32 bytes in unpadded base64url, as `spec/bootstrap-plan.schema.json` has it. */
+const STORED_ROWS_KEY = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 /**
  * The bytes each digest in `runtime.chunks` covers, the last covering what is
@@ -28,6 +30,12 @@ export interface BootstrapPlan {
   readonly residentCursor?: string;
   readonly activationCursor: string;
   readonly nextResidentStateProof: string;
+  /**
+   * The AES-256-GCM key, unpadded base64url, the page seals the artifact it
+   * keeps between visits under. Absent when the deployment lets no page keep
+   * one.
+   */
+  readonly storedRowsKey?: string;
   readonly artifacts: readonly PlanArtifact[];
   readonly changeStream: PlanChangeStream;
   readonly memory: PlanMemory;
@@ -197,6 +205,9 @@ export function parseBootstrapPlan(value: unknown): BootstrapPlan {
     plan.nextResidentStateProof,
     "nextResidentStateProof",
   );
+  const storedRowsKey = optionalString(plan.storedRowsKey, "storedRowsKey");
+  if (storedRowsKey !== undefined && !STORED_ROWS_KEY.test(storedRowsKey))
+    fail("storedRowsKey", "must be 32 bytes in unpadded base64url");
   const artifactsValue = array(plan.artifacts, "artifacts");
   const artifacts = artifactsValue.map(parseArtifact);
   validateArtifactCoverage(artifacts, residentTables, requiredTables);
@@ -270,6 +281,7 @@ export function parseBootstrapPlan(value: unknown): BootstrapPlan {
     ...(residentCursor ? { residentCursor } : {}),
     activationCursor,
     nextResidentStateProof,
+    ...(storedRowsKey ? { storedRowsKey } : {}),
     artifacts,
     changeStream,
     memory,

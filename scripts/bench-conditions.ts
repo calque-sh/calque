@@ -79,6 +79,29 @@ export interface BenchOptions {
    * `calque dev`'s cuts, in place of its default.
    */
   readonly recutMinIntervalSeconds?: number;
+  /**
+   * `--recut-keep-ratio <ratio>`: the log after an older cut, in bytes per
+   * decoded byte of the newest artifact, up to which `calque dev` keeps that
+   * cut, in place of its default.
+   */
+  readonly recutKeepRatio?: number;
+  /**
+   * Whether `calque dev` gives each plan the key a page stores its rows
+   * under; `--no-stored-rows` passes its flag of that name.
+   */
+  readonly storedRows: boolean;
+  /**
+   * `--returning`: every warm-up, judged and traced sample is a returning
+   * visit, measured on a browser launched again on the profile one
+   * unmeasured visit filled.
+   */
+  readonly returning: boolean;
+  /**
+   * `--between-visits <transactions>`, under `--returning`: the write
+   * transactions committed between each sample's two visits
+   * (`betweenVisitsSql`), an even number.
+   */
+  readonly betweenVisits?: number;
 }
 
 /** A shaped rate in both directions, and latency added before each response. */
@@ -147,6 +170,18 @@ export function unjudgedReasons(options: BenchOptions): string[] {
     ...(options.recutMinIntervalSeconds === undefined
       ? []
       : [`re-cut at most every ${String(options.recutMinIntervalSeconds)} s`]),
+    ...(options.recutKeepRatio === undefined
+      ? []
+      : [
+          `older cuts kept to a log ratio of ${String(options.recutKeepRatio)}`,
+        ]),
+    ...(options.storedRows ? [] : ["no stored rows"]),
+    ...(options.returning ? ["returning visits"] : []),
+    ...(options.betweenVisits === undefined
+      ? []
+      : [
+          `${String(options.betweenVisits)} write transactions between the visits`,
+        ]),
   ];
 }
 
@@ -171,7 +206,7 @@ export function rendersPlan(options: Pick<BenchOptions, "network">): boolean {
 }
 
 const USAGE =
-  "usage: pnpm bench [-- --smoke] [--calque <path>] [--dataset <content-v1|v1>] [--network <off|Mbit/s/latency ms|shaped:Mbit/s/RTT ms>] [--diagnostic] [--hold-until-logged <text>] [--realtime-only] [--postgres-bin <dir>] [--no-edge] [--background-clients <n>] [--background-qos utility] [--load-rate <tx/s>] [--tail <transactions>] [--recut-tail-ratio <ratio>] [--recut-min-interval <seconds>]";
+  "usage: pnpm bench [-- --smoke] [--calque <path>] [--dataset <content-v1|v1>] [--network <off|Mbit/s/latency ms|shaped:Mbit/s/RTT ms>] [--diagnostic] [--hold-until-logged <text>] [--realtime-only] [--postgres-bin <dir>] [--no-edge] [--background-clients <n>] [--background-qos utility] [--load-rate <tx/s>] [--tail <transactions>] [--recut-tail-ratio <ratio>] [--recut-min-interval <seconds>] [--recut-keep-ratio <ratio>] [--no-stored-rows] [--returning] [--between-visits <transactions>]";
 
 export function parseBenchArguments(
   arguments_: readonly string[],
@@ -192,6 +227,10 @@ export function parseBenchArguments(
   let tail: number | null = null;
   let recutTailRatio: number | null = null;
   let recutMinIntervalSeconds: number | null = null;
+  let recutKeepRatio: number | null = null;
+  let storedRows = true;
+  let returning = false;
+  let betweenVisits: number | null = null;
   const value = (index: number) => {
     const next = rest[index + 1];
     if (next === undefined || next.startsWith("--")) throw new Error(USAGE);
@@ -250,6 +289,15 @@ export function parseBenchArguments(
     ) {
       recutMinIntervalSeconds = parseRecutMinInterval(value(index));
       index += 1;
+    } else if (argument === "--recut-keep-ratio" && recutKeepRatio === null) {
+      recutKeepRatio = parseRecutKeepRatio(value(index));
+      index += 1;
+    } else if (argument === "--no-stored-rows" && storedRows)
+      storedRows = false;
+    else if (argument === "--returning" && !returning) returning = true;
+    else if (argument === "--between-visits" && betweenVisits === null) {
+      betweenVisits = parseBetweenVisits(value(index));
+      index += 1;
     } else throw new Error(USAGE);
   }
   // The clients follow the realtime session, and would load every cold sample.
@@ -269,6 +317,14 @@ export function parseBenchArguments(
     throw new Error(
       "--tail is caught up by the cold samples, so it takes no --realtime-only",
     );
+  if (returning && realtimeOnly)
+    throw new Error(
+      "--returning changes the cold samples, so it takes no --realtime-only",
+    );
+  if (betweenVisits !== null && !returning)
+    throw new Error(
+      "--between-visits writes between a sample's two visits, so it needs --returning",
+    );
   return {
     smoke,
     calque,
@@ -285,6 +341,10 @@ export function parseBenchArguments(
     ...(tail === null ? {} : { tail }),
     ...(recutTailRatio === null ? {} : { recutTailRatio }),
     ...(recutMinIntervalSeconds === null ? {} : { recutMinIntervalSeconds }),
+    ...(recutKeepRatio === null ? {} : { recutKeepRatio }),
+    storedRows,
+    returning,
+    ...(betweenVisits === null ? {} : { betweenVisits }),
   };
 }
 
@@ -330,6 +390,29 @@ export function parseRecutTailRatio(text: string): number {
   return ratio;
 }
 
+/** `--recut-keep-ratio`'s value: a decimal from 0 to 1,000, as calque takes. */
+export function parseRecutKeepRatio(text: string): number {
+  const ratio = /^[0-9]+(\.[0-9]+)?$/u.test(text) ? Number(text) : Number.NaN;
+  if (!Number.isFinite(ratio) || ratio > 1_000)
+    throw new Error("--recut-keep-ratio takes a decimal from 0 to 1000");
+  return ratio;
+}
+
+/** `--between-visits`'s value: an even number of transactions, 2 to 100,000. */
+export function parseBetweenVisits(text: string): number {
+  const transactions = /^[0-9]+$/u.test(text) ? Number(text) : Number.NaN;
+  if (
+    !Number.isSafeInteger(transactions) ||
+    transactions < 2 ||
+    transactions > 100_000 ||
+    transactions % 2 !== 0
+  )
+    throw new Error(
+      "--between-visits takes an even number of transactions from 2 to 100000",
+    );
+  return transactions;
+}
+
 /** `--recut-min-interval`'s value: whole seconds, 0 to 86,400. */
 export function parseRecutMinInterval(text: string): number {
   const seconds = /^[0-9]+$/u.test(text) ? Number(text) : Number.NaN;
@@ -338,17 +421,27 @@ export function parseRecutMinInterval(text: string): number {
   return seconds;
 }
 
-/** The re-cut arguments a run passes to `calque dev`. */
-export function recutArguments(
-  options: Pick<BenchOptions, "recutTailRatio" | "recutMinIntervalSeconds">,
+/** The arguments a run passes to `calque dev` beyond its own. */
+export function devArguments(
+  options: Pick<
+    BenchOptions,
+    | "recutTailRatio"
+    | "recutMinIntervalSeconds"
+    | "recutKeepRatio"
+    | "storedRows"
+  >,
 ): string[] {
   return [
+    ...(options.storedRows ? [] : ["--no-stored-rows"]),
     ...(options.recutTailRatio === undefined
       ? []
       : ["--recut-tail-ratio", String(options.recutTailRatio)]),
     ...(options.recutMinIntervalSeconds === undefined
       ? []
       : ["--recut-min-interval", String(options.recutMinIntervalSeconds)]),
+    ...(options.recutKeepRatio === undefined
+      ? []
+      : ["--recut-keep-ratio", String(options.recutKeepRatio)]),
   ];
 }
 

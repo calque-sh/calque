@@ -6,11 +6,13 @@ import { ColumnarSession } from "./columnar/session.js";
 import {
   createColumnarBrowserDecoder,
   createColumnarBrowserHasher,
+  createColumnarBrowserStore,
   createColumnarBrowserWorker,
   type ColumnarDecoderWorker,
   type ColumnarEngineWorker,
   type ColumnarHasherWorker,
 } from "./columnar/worker.js";
+import { browserRowStore, type RowStore } from "./columnar/stored-rows.js";
 import type { CollectionFacades, CollectionShapes } from "./facade/types.js";
 import type { ClientSchema } from "./schema.js";
 import {
@@ -70,6 +72,14 @@ export interface SyncClientOptions<
    * them.
    */
   readonly grantVerificationKey?: GrantVerificationKey;
+  /**
+   * Whether the client keeps the working set in this browser, encrypted, so
+   * the next visit reads it from disk instead of downloading it. Defaults to
+   * `true`. A server started with `--no-stored-rows` keeps it from every
+   * client. With `false` the client keeps and reads nothing, and
+   * `clearStoredRows()` still erases what an earlier page kept.
+   */
+  readonly storeRows?: boolean;
 }
 
 /**
@@ -247,6 +257,13 @@ export interface SyncClient<
    */
   readonly reset: () => Promise<void>;
   /**
+   * Erases the working set this browser keeps for the next visit, and keeps
+   * nothing of a load in flight. Call it at sign-out where users share a
+   * browser. The client goes on with the rows it holds in memory. Resolves
+   * once no stored row can be read.
+   */
+  readonly clearStoredRows: () => Promise<void>;
+  /**
    * Stops the client for good: live queries publish a `CLOSED` error, later
    * queries and mutations fail with it, and `status` ends at `closed`. A
    * second call does nothing.
@@ -279,13 +296,14 @@ export function createSyncClient<Collections extends CollectionShapes = never>(
       createColumnarBrowserWorker,
       createColumnarBrowserHasher,
       createColumnarBrowserDecoder,
+      browserRowStore(createColumnarBrowserStore),
     ),
   );
 }
 
 /**
- * Creates a client over caller-supplied engine, hasher and decoder workers,
- * for tests and harnesses that run fakes or run under Node.
+ * Creates a client over caller-supplied engine, hasher and decoder workers
+ * and row store, for tests and harnesses that run fakes or run under Node.
  */
 export function createInternalColumnarClient<
   Collections extends CollectionShapes = never,
@@ -294,6 +312,7 @@ export function createInternalColumnarClient<
   workerFactory: () => ColumnarEngineWorker,
   hasherFactory: () => ColumnarHasherWorker = createColumnarBrowserHasher,
   decoderFactory: () => ColumnarDecoderWorker = createColumnarBrowserDecoder,
+  store: RowStore = browserRowStore(createColumnarBrowserStore),
 ): SyncClient<Collections> {
   return publicColumnarClient<Collections>(
     new ColumnarSession(
@@ -301,6 +320,7 @@ export function createInternalColumnarClient<
       workerFactory,
       hasherFactory,
       decoderFactory,
+      store,
     ),
   );
 }

@@ -2,7 +2,7 @@
 import type { CalqueServer } from "./bench-calque.ts";
 import type { Run } from "./bench-context.ts";
 import { execFileAsync, hrtimeMs } from "./bench-host.ts";
-import { tailSql } from "./bench-oracle.ts";
+import { betweenVisitsSql, tailSql } from "./bench-oracle.ts";
 import { runSql } from "./bench-postgres.ts";
 import { log } from "./bench-record.ts";
 import { parseCpuTime, parseMetric } from "./bench-results.ts";
@@ -31,6 +31,23 @@ export async function writeTail(
   run: Pick<Run, "sourceEnvironment">,
   transactions: number,
 ): Promise<TailRecord> {
+  return await commitAppended(
+    metricsEndpoint,
+    run,
+    transactions,
+    tailSql(transactions),
+    "tail",
+  );
+}
+
+/** Commits `sql`'s `transactions` and waits until calque has appended each. */
+async function commitAppended(
+  metricsEndpoint: string,
+  run: Pick<Run, "sourceEnvironment">,
+  transactions: number,
+  sql: string,
+  label: string,
+): Promise<TailRecord> {
   const appended = async (): Promise<number> => {
     const response = await fetch(`${metricsEndpoint}/metrics`, {
       signal: AbortSignal.timeout(10_000),
@@ -48,16 +65,16 @@ export async function writeTail(
     return value;
   };
   const before = await appended();
-  log(`tail: committing ${String(transactions)} transactions`);
+  log(`${label}: committing ${String(transactions)} transactions`);
   const started = hrtimeMs();
-  runSql(tailSql(transactions), run.sourceEnvironment);
+  runSql(sql, run.sourceEnvironment);
   const committed = hrtimeMs();
   const deadline = committed + TAIL_APPEND_TIMEOUT_MS;
   for (;;) {
     if ((await appended()) >= before + transactions) break;
     if (hrtimeMs() > deadline)
       throw new Error(
-        `calque did not append the tail's ${String(transactions)} transactions within ${String(TAIL_APPEND_TIMEOUT_MS / 60_000)} min`,
+        `calque did not append the ${label}'s ${String(transactions)} transactions within ${String(TAIL_APPEND_TIMEOUT_MS / 60_000)} min`,
       );
     await delay(250);
   }
@@ -67,7 +84,55 @@ export async function writeTail(
     appendMs: hrtimeMs() - committed,
   };
   log(
-    `tail: ${String(transactions)} transactions committed in ${record.commitMs.toFixed(0)} ms and appended ${record.appendMs.toFixed(0)} ms later`,
+    `${label}: ${String(transactions)} transactions committed in ${record.commitMs.toFixed(0)} ms and appended ${record.appendMs.toFixed(0)} ms later`,
+  );
+  return record;
+}
+
+/** What `--between-visits` wrote between a sample's visits, and calque then. */
+export interface BetweenVisitsRecord extends TailRecord {
+  /** calque's re-cuts from the first commit until its log was quiet. */
+  readonly recuts: number;
+  /** From the last append to the quiet log. */
+  readonly settleMs: number;
+  /** The entries and bytes past the newest cut once quiet. */
+  readonly tailEntries: number;
+  readonly tailBytes: number;
+  readonly thresholdBytes: number;
+  /** The entries calque's canonical log retains once quiet. */
+  readonly retainedEntries: number;
+  /** calque's state directory once quiet. */
+  readonly stateBytes: number;
+}
+
+/**
+ * Commits `betweenVisitsSql(transactions)` and waits until calque has
+ * appended each, re-cut at least once, and is quiet again (`settleRecuts`),
+ * so the sample's next visit is planned against the cuts calque then keeps.
+ */
+export async function writeBetweenVisits(
+  server: CalqueServer,
+  run: Pick<Run, "sourceEnvironment" | "stateDirectory">,
+  transactions: number,
+): Promise<BetweenVisitsRecord> {
+  const recutsBefore = (await readRecut(server.metricsEndpoint)).recuts;
+  const written = await commitAppended(
+    server.metricsEndpoint,
+    run,
+    transactions,
+    betweenVisitsSql(transactions),
+    "between visits",
+  );
+  const settled = await settleRecuts(server, recutsBefore, 1);
+  const { stdout } = await execFileAsync("du", ["-sk", run.stateDirectory]);
+  const record = {
+    ...written,
+    ...settled,
+    retainedEntries: (await readRecut(server.metricsEndpoint)).retainedEntries,
+    stateBytes: Number(stdout.trim().split(/\s+/u)[0]) * 1024,
+  };
+  log(
+    `between visits: re-cut ${String(record.recuts)} times; ${String(record.retainedEntries)} entries retained, ${String(record.tailEntries)} past the newest cut`,
   );
   return record;
 }
@@ -79,6 +144,7 @@ interface RecutReading {
   readonly tailEntries: number;
   readonly tailBytes: number;
   readonly thresholdBytes: number;
+  readonly retainedEntries: number;
 }
 
 export async function readRecut(
@@ -101,6 +167,7 @@ export async function readRecut(
     tailEntries: read("calque_canonical_log_tail_entries"),
     tailBytes: read("calque_canonical_log_tail_bytes"),
     thresholdBytes: read("calque_artifact_recut_threshold_bytes"),
+    retainedEntries: read("calque_canonical_log_retained_entries"),
   };
 }
 
@@ -240,20 +307,22 @@ export function recutWindows(
 }
 
 /**
- * Waits until calque's log is quiet after a tail: no re-cut in progress, the
- * tail past the newest cut under its threshold or re-cutting off, and two
- * readings `RECUT_QUIET_MS` apart that agree, so a maintenance pass has
- * measured the whole tail.
+ * Waits until calque's log is quiet after a tail: at least `atLeast` re-cuts
+ * since `recutsBefore`, no re-cut in progress, the tail past the newest cut
+ * under its threshold or re-cutting off, and two readings `RECUT_QUIET_MS`
+ * apart that agree, so a maintenance pass has measured the whole tail.
  */
 export async function settleRecuts(
   server: CalqueServer,
   recutsBefore: number,
+  atLeast = 0,
 ): Promise<Omit<RecutRecord, "windows">> {
   const started = hrtimeMs();
   let quietReading: RecutReading | null = null;
   for (;;) {
     const reading = await readRecut(server.metricsEndpoint);
     const quiet =
+      reading.recuts - recutsBefore >= atLeast &&
       reading.inProgress === 0 &&
       (reading.thresholdBytes === 0 ||
         reading.tailBytes < reading.thresholdBytes);

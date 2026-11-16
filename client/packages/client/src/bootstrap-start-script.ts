@@ -43,6 +43,18 @@ const device = () => {
     return crypto.randomUUID();
   }
 };
+const held = () => {
+  try {
+    for (const pair of document.cookie.split(";")) {
+      const [name, value] = pair.trim().split("=", 2);
+      const match =
+        name === "calque-stored-rows" &&
+        /^[0-9a-f]{32}\\.([0-9a-f]{64})$/u.exec(value);
+      if (match) return [match[1]];
+    }
+  } catch {}
+  return [];
+};
 const supported = () => {
   let moduleWorkers = false;
   try {
@@ -187,7 +199,7 @@ const start = () => {
       body: JSON.stringify({
         protocolVersion: parameters.protocolVersion,
         requiredTables: parameters.requiredTables,
-        cachedArtifactHints: [],
+        cachedArtifactHints: held(),
         acceptedEncodings: parameters.acceptedEncodings,
         memoryBudgetBytes: parameters.memoryBudgetBytes,
         clientHeapReserveBytes: parameters.clientHeapReserveBytes,
@@ -205,4 +217,4 @@ start();`;
 
 /** `BOOTSTRAP_START_SCRIPT`'s hash, as a CSP `script-src` source. */
 export const BOOTSTRAP_START_SCRIPT_SHA256 =
-  "sha256-d6/MX2OAEZzCd0dA4QuwhFCzqL8UwpwFQoZKpQNOmk4=";
+  "sha256-THi52J5kiSaA1Awv1rdUjvwKEsgokgWlVkVQjQb02p0=";

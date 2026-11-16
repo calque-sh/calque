@@ -29,6 +29,9 @@
     "./columnar-decoder-entry": {
       "import": "./dist/columnar-decoder-entry.js"
     },
+    "./columnar-store-entry": {
+      "import": "./dist/columnar-store-entry.js"
+    },
     "./columnar-decoder-worker": {
       "types": "./dist/columnar-decoder-worker.d.ts",
       "import": "./dist/columnar-decoder-worker.js"
@@ -53,7 +56,7 @@
     "typecheck": "../../../node_modules/.bin/tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@bufbuild/protobuf": "2.12.1",
+    "@bufbuild/protobuf": "2.17.0",
     "@calque/core": "workspace:*",
     "@calque/protocol": "workspace:*"
   },

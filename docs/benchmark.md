@@ -133,17 +133,55 @@ verdict.
 | `--tail <transactions>` | Commit that many transactions after the artifact is cut and before the reference pass; see below. |
 | `--recut-tail-ratio <ratio>` | Start calque with that `--recut-tail-ratio`; 0 turns re-cutting off. |
 | `--recut-min-interval <seconds>` | Start calque with that `--recut-min-interval`. |
+| `--recut-keep-ratio <ratio>` | Start calque with that `--recut-keep-ratio`; 0 keeps only the newest cut. |
+| `--no-stored-rows` | Start calque with `--no-stored-rows`, so its plans carry no key and no page keeps its rows between visits. |
+| `--returning` | Make every warm-up, judged and traced sample a returning visit; see below. |
+| `--between-visits <transactions>` | With `--returning`: commit that many write transactions, an even number, between each sample's two visits; see below. |
 | `--hold-until-logged <text>` | Hold the reference pass and every sample after it until calque logs a line containing `text`, or for 300 s, in place of the wait for the artifact's publication. The run goes on whether or not the line came, and the summary's `hold` records how long it held. |
 | `--postgres-bin <dir>` | Run PostgreSQL 18 from the binaries in `dir`, in a temporary cluster with the container's superuser, database, flags and `docker/postgres-init`, for a host whose Docker does not answer. |
 
 A run under `--diagnostic`, `--network shaped:…`, `--realtime-only`,
 `--postgres-bin`, `--no-edge`, `--background-clients`, `--background-qos`,
-`--load-rate`, `--tail`, `--recut-tail-ratio` or `--recut-min-interval` is
-never judged: its `passes` is false whatever its rows say, its summary is
+`--load-rate`, `--tail`, `--recut-tail-ratio`, `--recut-min-interval`,
+`--recut-keep-ratio`, `--no-stored-rows`, `--returning` or `--between-visits`
+is never judged: its `passes` is false whatever its rows say, its summary is
 labeled directional with the reasons, and its run id carries a suffix for
 each (`-diagnostic`, `-shaped`, `-realtime`, `-native-postgres`, `-no-edge`,
 `-background-<n>`, `-utility`, `-load-<tx/s>`, `-tail-<transactions>`,
-`-recut-ratio-<ratio>`, `-recut-interval-<seconds>`).
+`-recut-ratio-<ratio>`, `-recut-interval-<seconds>`, `-keep-ratio-<ratio>`,
+`-no-stored-rows`, `-returning`, `-between-<transactions>`).
+
+## Returning visits
+
+A page keeps its working set between visits unless calque runs with
+`--no-stored-rows`. Each cold sample still loads in a fresh context with an
+empty HTTP cache; after its stable paint is judged, a page that is storing
+its artifact gets up to 10 s to mark `calque:store:written` before its
+readings are taken. Under `--returning`, each sample first takes an
+unmeasured visit in a new profile directory, under the same network
+emulation, that reaches the stable paint and, where the page stores rows,
+its store's outcome. The browser closes, and the sample is the visit of a
+browser launched again on that directory. The page server then serves the
+build's hashed `assets/` with `Cache-Control: public, max-age=31536000,
+immutable`, as a deployment does, and passes the page request's `Cookie`
+header to `renderBootstrap`. Every sample's record keeps `storedRows`:
+whether the rendered plan carried a key, the store's marks, the time from the
+stable paint to `calque:store:written`, the artifact requests in its ledger,
+and whether its resource timing shows every script under `assets/` taken from
+Chrome's HTTP cache (a worker's script answers outside the page's ledger); a
+returning sample's record also keeps its `firstVisit`. The summary's
+`storedRows` names the judged cold samples for each.
+
+`--between-visits <transactions>` commits that many write transactions after
+a returning sample's first browser closes and before the second launches.
+Each of the first half prepends one character to the titles and bodies the
+load's transaction of the same number would rewrite, and each of the second
+half removes it, so the source ends where it began and the reference pass
+still holds. The sample then waits until calque has appended every transaction,
+re-cut at least once, and stopped re-cutting as `--tail` waits, asks for a
+plan again so its object is judged against the newest cut, and keeps
+`betweenVisits` in its record: the writes, the re-cuts, the tail past the
+newest cut, the entries calque's log retains, and the state directory's size.
 
 ## Replaying a long tail
 

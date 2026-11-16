@@ -1284,19 +1284,30 @@ slowdown above comes from re-cuts. A deployment whose live updates matter
 more than its cold loads passes `--recut-tail-ratio 0`.
 
 A bootstrap planned after the new artifact is published downloads it and
-catches up from its cut. A plan already granted keeps its artifact and its
-catch-up start. Until the new cut's brotli representation is published,
+catches up from its cut, unless its request names, by decoded SHA-256, an
+older cut the process still keeps by the ratio below: a returning page that
+stored that cut reads it from disk and catches up from it. A cut that only a
+granted plan's pin keeps published is not planned again. A plan already
+granted keeps its artifact and its catch-up start. Until the new cut's brotli representation is published,
 bootstraps are planned with its zstd one. A re-cut places a barrier in the
 log as a preparation does, so every connected page receives one batch with no
 rows in it.
 
-The same pass trims the log, whatever the ratio. It keeps every entry after
-the oldest of these: the newest artifact's cut, the catch-up start of each
+The same pass keeps an older cut of the source-wide scope, and the log
+after it, while the entries after that cut hold at most
+`--recut-keep-ratio` bytes per decoded byte of the newest artifact, 0.25 by
+default, and while the log still holds every one of them. With the defaults
+that keeps up to eight older cuts, each with every representation it was
+published with. `--recut-keep-ratio 0` keeps only the newest cut.
+
+The pass trims the log, whatever the ratios. It keeps every entry after
+the oldest of these: the oldest cut it keeps, the catch-up start of each
 plan the process still holds, and the last entry the change tail has read.
-Under a partitioned scope each tenant's cut stands in for the newest
-artifact's ([Tenants](#tenants)). With re-cutting off, the newest cut is the preparation's or the last
+Under a partitioned scope each tenant's newest cut stands in for the cuts
+kept, and no older one is kept ([Tenants](#tenants)). With re-cutting off, the newest cut is the preparation's or the last
 revocation's, so the log keeps every entry since then. Every other published
-artifact that no plan pins is retired, and its objects are deleted. The pins
+artifact that the pass does not keep and no plan pins is retired, and its
+objects are deleted. The pins
 and log leases of plans the process has dropped are released, except while a
 bootstrap is being planned. The log is trimmed 1,024 entries per
 transaction, each holding back appends for as long as it runs, and after

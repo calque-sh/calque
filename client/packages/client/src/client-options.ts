@@ -94,6 +94,8 @@ export interface SealedSyncClientOptions {
   readonly deviceIdChosen: boolean;
   readonly fetch: typeof globalThis.fetch;
   readonly grantVerificationKey?: RevocationBarrierVerificationKey;
+  /** Whether the client keeps the working set for the next visit. */
+  readonly storeRows: boolean;
   /** How often, and after what first wait, an undecided write is resent. */
   readonly mutationResends: {
     readonly count: number;
@@ -109,6 +111,7 @@ const PUBLIC_KEYS = Object.freeze([
   "deviceId",
   "fetch",
   "grantVerificationKey",
+  "storeRows",
 ] as const);
 
 const PUBLIC_REQUIRED_KEYS = Object.freeze([
@@ -272,6 +275,9 @@ function sealCapturedOptions(
   const grantVerificationKey = sealGrantVerificationKey(
     captured.grantVerificationKey,
   );
+  const storeRows = captured.storeRows ?? true;
+  if (typeof storeRows !== "boolean")
+    throw new TypeError("SyncClientOptions storeRows must be a boolean");
   const sealed = {
     endpointUrl,
     auth,
@@ -283,6 +289,7 @@ function sealCapturedOptions(
     deviceIdChosen: captured.deviceId !== undefined,
     fetch: fetcher as typeof globalThis.fetch,
     ...(grantVerificationKey ? { grantVerificationKey } : {}),
+    storeRows,
     mutationResends: Object.freeze({ ...mutationResends }),
   } satisfies SealedSyncClientOptions;
   return Object.freeze(sealed);

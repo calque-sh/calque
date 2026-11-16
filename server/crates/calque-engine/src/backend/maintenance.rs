@@ -2,6 +2,14 @@
 //! re-cutting, and trimming the log behind them.
 
 use super::*;
+use sync_types::ArtifactId;
+
+/// A published artifact of an older cut: retired by its id, planned by its
+/// decoded SHA-256.
+pub(super) struct OlderCut {
+    artifact_id: ArtifactId,
+    decoded_sha256: String,
+}
 
 /// Whether a re-encode made under `generation` may still be published: that
 /// generation is still served, and its artifact is ready. A fence moves the
@@ -39,6 +47,7 @@ pub(super) struct MaintenanceState {
     /// A re-cut was started and its encodes have not been seen to finish.
     pub(super) recutting: bool,
     pub(super) tail: TailMeter,
+    pub(super) spans: SpanMeter,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -258,8 +267,9 @@ impl LocalBackend {
 
     /// Starts the thread that, every `MAINTENANCE_INTERVAL`, measures the
     /// canonical log against the newest cut of the served scope: it re-cuts
-    /// the scope once the tail is due, retires the older cuts' artifacts no
-    /// plan pins, and trims the log behind the oldest cut still needed.
+    /// the scope once the tail is due, retires the older cuts' artifacts that
+    /// the keep ratio does not keep and no plan pins, and trims the log behind
+    /// the oldest cut still needed.
     pub fn spawn_recut(&self) {
         let Some(recutter) = self.inner.recut.as_ref() else {
             return;
@@ -338,37 +348,62 @@ impl LocalBackend {
         let query = published_query_for(&prepared)?;
         let now = now_unix_micros()?;
         let now_ms = now / 1_000;
-        let newest = {
-            let mut catalog = self.inner.catalog.blocking_lock();
+        let (newest, newest_digests, older) = {
+            let catalog = self.inner.catalog.blocking_lock();
             let published = catalog.published(&query)?;
             let Some(newest) = newest_cut(&published, &self.inner.activated) else {
                 return Ok(());
             };
-            // A store or catalog that keeps failing here must not stop the
-            // trim below, or the log would grow for as long as it fails.
-            if let Err(error) =
-                self.retire_older_cuts(&mut catalog, runtime, &published, &newest, now_ms)
-            {
-                self.report_maintenance_error(&error);
-            }
-            newest
+            let newest_digests: BTreeSet<String> = published
+                .iter()
+                .map(ValidatedArtifactManifest::manifest)
+                .filter(|manifest| manifest.pit.snapshot_cursor == newest.cursor)
+                .map(|manifest| manifest.decoded.sha256.clone())
+                .collect();
+            let older = self.older_cuts(&published, &newest);
+            (newest, newest_digests, older)
         };
 
-        let tail = self.inner.tail.as_deref();
-        let floor = retention_floor(newest.sequence, tail.and_then(ChangeTail::head));
-        let bounds = self.inner.log.blocking_lock().bounds()?;
-        let retained = self.trim_log(bounds.minimum_retained.sequence, floor)?;
-        let head = bounds.head.sequence;
-        let tail_bytes = state
-            .tail
-            .measure(newest.sequence, head, |after, through| {
-                self.inner
-                    .log
-                    .blocking_lock()
-                    .entry_bytes_between(after, through)
-            })?;
-        let tail_entries = head.saturating_sub(newest.sequence);
         let policy = recutter.config.policy;
+        let bounds = self.inner.log.blocking_lock().bounds()?;
+        let head = bounds.head.sequence;
+        let bytes_between = |after, through| {
+            self.inner
+                .log
+                .blocking_lock()
+                .entry_bytes_between(after, through)
+        };
+        let tail_bytes = state.tail.measure(newest.sequence, head, bytes_between)?;
+        state.spans.ending_at(newest.sequence);
+        let sorted = sort_older_cuts(
+            &policy,
+            &newest,
+            tail_bytes,
+            bounds.minimum_retained.sequence,
+            older,
+            |sequence| {
+                state
+                    .spans
+                    .between(sequence, newest.sequence, bytes_between)
+            },
+        )?;
+        let mut plannable = newest_digests;
+        plannable.extend(sorted.kept.into_iter().map(|cut| cut.decoded_sha256));
+        self.set_plannable_cuts(plannable);
+        let retired: Vec<ArtifactId> = sorted
+            .retired
+            .into_iter()
+            .map(|cut| cut.artifact_id)
+            .collect();
+        // A store or catalog that keeps failing here must not stop the trim
+        // below, or the log would grow for as long as it fails.
+        if let Err(error) = self.retire_cuts(runtime, &retired, now_ms) {
+            self.report_maintenance_error(&error);
+        }
+        let tail = self.inner.tail.as_deref();
+        let floor = retention_floor(sorted.kept_from, tail.and_then(ChangeTail::head));
+        let retained = self.trim_log(bounds.minimum_retained.sequence, floor)?;
+        let tail_entries = head.saturating_sub(newest.sequence);
         self.inner.metrics.record_canonical_log_retention(
             tail_entries,
             tail_bytes,
@@ -493,23 +528,77 @@ impl LocalBackend {
         })
     }
 
-    /// Retires every published cut but the newest that no plan pins, and
-    /// deletes the retired cuts' objects.
-    pub(super) fn retire_older_cuts(
+    /// Every published artifact of a cut older than `newest`, with the
+    /// sequence of its cut, or none for a cursor this source cannot read.
+    pub(super) fn older_cuts(
         &self,
-        catalog: &mut SqliteArtifactCatalog,
-        runtime: &tokio::runtime::Runtime,
         published: &[ValidatedArtifactManifest],
         newest: &NewestCut,
+    ) -> Vec<(OlderCut, Option<u64>)> {
+        published
+            .iter()
+            .map(ValidatedArtifactManifest::manifest)
+            .filter(|manifest| manifest.pit.snapshot_cursor != newest.cursor)
+            .map(|manifest| {
+                let sequence = self
+                    .inner
+                    .activated
+                    .cursor_codec()
+                    .decode_for_epoch(
+                        &manifest.pit.snapshot_cursor,
+                        self.inner.activated.source_epoch(),
+                    )
+                    .ok()
+                    .map(|position| position.sequence);
+                let cut = OlderCut {
+                    artifact_id: manifest.artifact_id.clone(),
+                    decoded_sha256: manifest.decoded.sha256.clone(),
+                };
+                (cut, sequence)
+            })
+            .collect()
+    }
+
+    fn set_plannable_cuts(&self, digests: BTreeSet<String>) {
+        *self
+            .inner
+            .plannable_cuts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = digests;
+    }
+
+    /// The hints of `hints` that name a cut a page may be planned (see
+    /// `plannable_cuts`). Another names a cut the planner would plan only
+    /// because a plan still pins it.
+    pub(super) fn plannable_hints(&self, hints: BTreeSet<String>) -> BTreeSet<String> {
+        let plannable = self
+            .inner
+            .plannable_cuts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hints
+            .into_iter()
+            .filter(|hint| plannable.contains(hint))
+            .collect()
+    }
+
+    /// Retires each of `artifacts` that no plan pins, and deletes the retired
+    /// cuts' objects. A re-encode may have retired or deleted one since the
+    /// pass read the catalog.
+    pub(super) fn retire_cuts(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        artifacts: &[ArtifactId],
         now_ms: i64,
     ) -> Result<(), MaintenanceError> {
-        for manifest in published {
-            let manifest = manifest.manifest();
-            if manifest.pit.snapshot_cursor == newest.cursor {
-                continue;
-            }
-            match catalog.retire(&manifest.artifact_id, now_ms, "a newer cut replaces it") {
-                Ok(_) | Err(artifact_catalog::CatalogError::ArtifactPinnedByPlan { .. }) => {}
+        let mut catalog = self.inner.catalog.blocking_lock();
+        for artifact in artifacts {
+            match catalog.retire(artifact, now_ms, "a newer cut replaces it") {
+                Ok(_)
+                | Err(
+                    artifact_catalog::CatalogError::ArtifactPinnedByPlan { .. }
+                    | artifact_catalog::CatalogError::UnknownArtifact(_),
+                ) => {}
                 Err(error) => return Err(error.into()),
             }
         }

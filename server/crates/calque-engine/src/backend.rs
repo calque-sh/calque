@@ -62,7 +62,8 @@ use crate::{
     mutations::{LocalMutationError, LocalMutationSupport},
     plans::{request_table_starts, PlanClaims, PlanTerms, PlanTokens, VerifiedPlan, VerifiedPlans},
     recut::{
-        newest_cut, retention_floor, trim, NewestCut, RecutConfig, TailMeter, MAINTENANCE_INTERVAL,
+        newest_cut, retention_floor, sort_older_cuts, trim, NewestCut, RecutConfig, SpanMeter,
+        TailMeter, MAINTENANCE_INTERVAL,
     },
     reencode::{
         reencode_and_publish_brotli, EncodingSpan, ReencodeConfig, ReencodeError, ReencodeOutcomes,
@@ -246,6 +247,12 @@ struct LocalBackendInner {
     memory: LocalMemoryPolicy,
     /// The decoder this composition plans for; see `bootstrap`.
     decoder_profile: String,
+    stored_rows: bool,
+    /// The decoded SHA-256 of each cut a page that holds it may be planned:
+    /// the newest cut and each older one the keep ratio keeps, as the last
+    /// maintenance pass found them. A cut only a plan's pin keeps is not one,
+    /// so no page pins it again, and none is before the first pass.
+    plannable_cuts: StdRwLock<BTreeSet<String>>,
     metrics: OperationsMetrics,
     /// Set once `LocalMutationBackend` mounts. Until then the change stream
     /// resolves no acknowledgements and a poll carrying pending ids fails
@@ -295,6 +302,9 @@ pub struct LocalBackendConfig {
     /// log. `DEFAULT_CHANGE_TAIL_BYTES` unless configured.
     pub change_tail_bytes: u64,
     pub max_change_batch_bytes: u64,
+    /// Whether plans carry the key a page encrypts the working set it keeps
+    /// between visits under. Without one, no page keeps it.
+    pub stored_rows: bool,
     pub memory: LocalMemoryPolicy,
     pub metrics: OperationsMetrics,
     /// How the application may retire the generation `prepared` was compiled
@@ -438,6 +448,8 @@ impl LocalBackend {
                 max_change_batch_bytes: config.max_change_batch_bytes,
                 memory: config.memory,
                 decoder_profile: crate::columnar::direct_columnar_decoder_profile(),
+                stored_rows: config.stored_rows,
+                plannable_cuts: StdRwLock::new(BTreeSet::new()),
                 metrics: config.metrics,
                 mutations: OnceLock::new(),
             }),

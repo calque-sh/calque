@@ -58,6 +58,8 @@ const MAX_PLANNING_TIME: StdDuration = StdDuration::from_secs(30);
 const MIN_PROOF_SECRET_BYTES: usize = 32;
 const RESIDENT_PROOF_VERSION: u8 = 1;
 const RESIDENT_PROOF_DOMAIN: &[u8] = b"calque.bootstrap.resident-state.v1\0";
+const STORED_ROWS_KEY_INFO: &[u8] = b"calque.stored-rows-key.v1\0";
+const STORED_ROWS_KEY_BYTES: usize = 32;
 
 static PLAN_SCHEMA: OnceLock<Result<jsonschema::Validator, String>> = OnceLock::new();
 
@@ -217,6 +219,24 @@ impl ResidentStateProofCodec {
         Ok(state)
     }
 
+    /// The key a page seals its stored copy of an artifact of `cache_key`
+    /// under: HKDF-SHA256 over the proof secret, with the cache key in its
+    /// info. Two plans share it exactly when they would share the artifact.
+    fn stored_rows_key(
+        &self,
+        cache_key: &ArtifactCacheKey,
+    ) -> Result<StoredRowsKey, ResidentProofError> {
+        let context = serde_json::to_vec(cache_key)?;
+        let info = [STORED_ROWS_KEY_INFO, context.as_slice()];
+        let mut key = [0_u8; STORED_ROWS_KEY_BYTES];
+        ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &[])
+            .extract(&self.secret)
+            .expand(&info, StoredRowsKeyLength)
+            .and_then(|okm| okm.fill(&mut key))
+            .expect("HKDF-SHA256 expands 32 bytes");
+        Ok(StoredRowsKey(URL_SAFE_NO_PAD.encode(key)))
+    }
+
     fn sign(&self, payload: &[u8]) -> Vec<u8> {
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret)
             .expect("HMAC accepts every non-empty key length");
@@ -232,6 +252,32 @@ impl std::fmt::Debug for ResidentStateProofCodec {
             .debug_struct("ResidentStateProofCodec")
             .field("secret", &"[REDACTED]")
             .finish()
+    }
+}
+
+struct StoredRowsKeyLength;
+
+impl ring::hkdf::KeyType for StoredRowsKeyLength {
+    fn len(&self) -> usize {
+        STORED_ROWS_KEY_BYTES
+    }
+}
+
+/// The AES-256-GCM key, unpadded base64url, that a page seals the artifact it
+/// keeps between visits under. It is never written to the browser's disk.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StoredRowsKey(String);
+
+impl StoredRowsKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for StoredRowsKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StoredRowsKey([REDACTED])")
     }
 }
 
@@ -304,7 +350,13 @@ pub struct BootstrapRequest {
     /// Required with `resident_tables`.
     pub resident_cursor: Option<OpaqueCursor>,
     pub authorization: AuthorizedBootstrapScope,
-    pub cached_artifact_hints: BTreeSet<ArtifactId>,
+    /// The decoded SHA-256 of each artifact the client holds a copy of. A
+    /// published cut with one of them is planned before the newest, inside
+    /// the log's retained window, and costs no download.
+    pub cached_artifact_hints: BTreeSet<String>,
+    /// Whether the plan carries the key its page seals the artifact it keeps
+    /// between visits under. Without one the page keeps nothing.
+    pub stored_rows: bool,
     pub accepted_encodings: Vec<RepresentationEncoding>,
     /// The artifact decoder this client actually has, matched against
     /// [`DecodedArtifactFormat::decoder_profile`]. An artifact built for any
@@ -362,6 +414,8 @@ pub struct BootstrapPlan {
     pub resident_cursor: Option<OpaqueCursor>,
     pub activation_cursor: OpaqueCursor,
     pub next_resident_state_proof: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_rows_key: Option<StoredRowsKey>,
     pub artifacts: Vec<PlanArtifactInstall>,
     pub change_stream: PlanChangeStream,
     pub memory: PlanMemory,
@@ -554,7 +608,7 @@ struct Candidate {
 struct CandidateContext<'a> {
     missing: &'a BTreeSet<TableId>,
     accepted_encodings: &'a [RepresentationEncoding],
-    cache_hints: &'a BTreeSet<ArtifactId>,
+    cache_hints: &'a BTreeSet<String>,
     source: &'a ActivatedSource,
     minimum_retained: u64,
     head: u64,
@@ -936,6 +990,10 @@ impl BootstrapPlanner {
         }
         let next_resident_state_proof =
             resident_proofs.encode(&cache_key, &next_resident_tables, &activation_cursor)?;
+        let stored_rows_key = request
+            .stored_rows
+            .then(|| resident_proofs.stored_rows_key(&cache_key))
+            .transpose()?;
         let plan = BootstrapPlan {
             protocol_version: 1,
             plan_id,
@@ -958,6 +1016,7 @@ impl BootstrapPlanner {
             resident_cursor,
             activation_cursor: activation_cursor.clone(),
             next_resident_state_proof,
+            stored_rows_key,
             artifacts: installs,
             change_stream: PlanChangeStream {
                 endpoint: request.change_endpoint.url().as_str().to_owned(),
@@ -1116,7 +1175,7 @@ fn compile_candidates(
         };
         let cache_hint = context
             .cache_hints
-            .contains(&manifest.manifest().artifact_id);
+            .contains(&manifest.manifest().decoded.sha256);
         candidates.push(Candidate {
             manifest,
             representation,
@@ -1126,15 +1185,16 @@ fn compile_candidates(
             cache_hint,
         });
     }
-    // Only the newest cut of each table set is planned, whatever an older
-    // one would save in bytes or a cache hit: its tail is the shortest.
+    // The newest cut of each table set has the shortest tail, so an older
+    // one is planned only when the client holds it and so downloads nothing.
     let mut newest: BTreeMap<BTreeSet<TableId>, u64> = BTreeMap::new();
     for candidate in &candidates {
         let sequence = newest.entry(candidate.tables.clone()).or_default();
         *sequence = (*sequence).max(candidate.snapshot_position.sequence);
     }
     candidates.retain(|candidate| {
-        newest.get(&candidate.tables) == Some(&candidate.snapshot_position.sequence)
+        candidate.cache_hint
+            || newest.get(&candidate.tables) == Some(&candidate.snapshot_position.sequence)
     });
     Ok(candidates)
 }
@@ -2305,7 +2365,8 @@ mod tests {
                 OffsetDateTime::now_utc() + time::Duration::hours(1),
             )
             .unwrap(),
-            cached_artifact_hints: BTreeSet::from([ArtifactId::new("artifact-1").unwrap()]),
+            cached_artifact_hints: BTreeSet::new(),
+            stored_rows: true,
             accepted_encodings: vec![RepresentationEncoding::Identity],
             decoder_profile: decoder_profile.to_owned(),
             memory: ClientMemoryBudget {
@@ -2525,7 +2586,6 @@ mod tests {
         let mut planned = [(RepresentationEncoding::Identity, 0); N];
         for (planned, accepted) in planned.iter_mut().zip(clients) {
             let mut request = request(&source, &scope, &table, None);
-            request.cached_artifact_hints.clear();
             request.accepted_encodings = accepted.to_vec();
             let plan = BootstrapPlanner::plan(
                 &mut catalog,
@@ -2721,6 +2781,8 @@ mod tests {
         let short_plan_expiry = OffsetDateTime::parse(&short_plan.expires_at, &Rfc3339).unwrap();
         assert_eq!(short_plan_expiry, verified_grant_expiry);
 
+        let mut held = request(&source, &scope, &table, None);
+        held.cached_artifact_hints = BTreeSet::from([digest(artifact_bytes)]);
         let plan = BootstrapPlanner::plan(
             &mut catalog,
             &store,
@@ -2728,7 +2790,7 @@ mod tests {
             &source,
             &mut log,
             &resident_proofs,
-            request(&source, &scope, &table, None),
+            held,
         )
         .await
         .unwrap();
@@ -2794,6 +2856,120 @@ mod tests {
         let json = serde_json::to_value(&plan).unwrap();
         assert!(!json.to_string().contains("user-1"));
         assert!(json.get("diagnostics").is_none());
+    }
+
+    /// A page's stored copy is readable by exactly the plans that would be
+    /// served the same artifact: every field of the cache key, and the
+    /// deployment's secret, moves the key.
+    #[test]
+    fn the_stored_rows_key_moves_with_every_field_of_the_cache_key_and_the_secret() {
+        let (source, _, scope) = activated_source_with_scope();
+        let proofs = ResidentStateProofCodec::new([8_u8; 32]).unwrap();
+        let base = authorized_cache_key(&source, &scope, DECODER_PROFILE);
+        let key = proofs.stored_rows_key(&base).unwrap();
+        assert_eq!(proofs.stored_rows_key(&base).unwrap(), key);
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(key.as_str()).unwrap().len(),
+            STORED_ROWS_KEY_BYTES
+        );
+        type Change = fn(&mut ArtifactCacheKey);
+        let variants: [(&str, Change); 11] = [
+            ("source epoch", |key| {
+                key.source_epoch = sync_types::SourceEpoch::new("another-epoch").unwrap();
+            }),
+            ("publication generation", |key| {
+                key.publication_generation += 1
+            }),
+            ("schema generation", |key| key.schema_generation += 1),
+            ("authorization generation", |key| {
+                key.authorization_generation += 1
+            }),
+            ("authorization policy hash", |key| {
+                key.authorization_policy_hash.push('0');
+            }),
+            ("authorization scope hash", |key| {
+                key.authorization_scope_hash.push('0');
+            }),
+            ("shard profile hash", |key| key.shard_profile_hash.push('0')),
+            ("index profile hash", |key| key.index_profile_hash.push('0')),
+            ("decoder profile", |key| key.decoder_profile.push('0')),
+            ("type codec generation", |key| {
+                key.type_codec_generation += 1
+            }),
+            ("collation generation", |key| key.collation_generation += 1),
+        ];
+        for (field, change) in variants {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert_ne!(
+                proofs.stored_rows_key(&changed).unwrap(),
+                key,
+                "the {field} does not move the key"
+            );
+        }
+        let other_deployment = ResidentStateProofCodec::new([9_u8; 32]).unwrap();
+        assert_ne!(other_deployment.stored_rows_key(&base).unwrap(), key);
+        assert_eq!(format!("{key:?}"), "StoredRowsKey([REDACTED])");
+    }
+
+    /// The plan carries the key only when its deployment lets pages keep
+    /// rows, and its debug form never shows it.
+    #[tokio::test]
+    async fn a_plan_carries_the_stored_rows_key_only_when_its_deployment_issues_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let (source, table, scope) = activated_source_with_scope();
+        let mut log = canonical_log(&directory.path().join("log"), &source);
+        let cut = source.cursor_codec().encode(&CursorPosition {
+            source_epoch: source.source_epoch().clone(),
+            sequence: 0,
+        });
+        let artifact_bytes = b"artifact a page may keep";
+        let manifest = manifest_for_scope(&source, &table, cut, artifact_bytes, &scope);
+        let mut catalog =
+            SqliteArtifactCatalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let store = LocalFilesystemBlobStore::open(directory.path().join("objects"), 1024).unwrap();
+        publish(&mut catalog, &store, &manifest, artifact_bytes).await;
+        let resolver = SameOriginProxyResolver::new("https://sync.test/base/").unwrap();
+        let proofs = ResidentStateProofCodec::new([8_u8; 32]).unwrap();
+        let expected = proofs
+            .stored_rows_key(&authorized_cache_key(&source, &scope, DECODER_PROFILE))
+            .unwrap();
+        let validator = plan_validator().unwrap();
+
+        let issued = BootstrapPlanner::plan(
+            &mut catalog,
+            &store,
+            &resolver,
+            &source,
+            &mut log,
+            &proofs,
+            request(&source, &scope, &table, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(issued.stored_rows_key.as_ref(), Some(&expected));
+        let json = serde_json::to_value(&issued).unwrap();
+        assert_eq!(json["storedRowsKey"], expected.as_str());
+        assert!(validator.is_valid(&json));
+        assert!(!format!("{issued:?}").contains(expected.as_str()));
+
+        let mut withheld_request = request(&source, &scope, &table, None);
+        withheld_request.stored_rows = false;
+        let withheld = BootstrapPlanner::plan(
+            &mut catalog,
+            &store,
+            &resolver,
+            &source,
+            &mut log,
+            &proofs,
+            withheld_request,
+        )
+        .await
+        .unwrap();
+        assert_eq!(withheld.stored_rows_key, None);
+        let json = serde_json::to_value(&withheld).unwrap();
+        assert!(json.get("storedRowsKey").is_none());
+        assert!(validator.is_valid(&json));
     }
 
     /// A plan activates where its catch-up starts only when the caller knows
@@ -2867,31 +3043,164 @@ mod tests {
         }
     }
 
-    /// A newer cut of the same tables is planned over an older, smaller one.
+    /// Two cuts of the same tables, the older one under the id a re-encode
+    /// gives it, in a catalog and store kept in `_directory`.
+    struct TwoCuts {
+        _directory: tempfile::TempDir,
+        source: ActivatedSource,
+        table: TableId,
+        scope: AuthorizedScope,
+        log: FileCanonicalLog,
+        catalog: SqliteArtifactCatalog,
+        store: LocalFilesystemBlobStore,
+    }
+
+    const OLD_CUT: &[u8] = b"older cut";
+    const NEW_CUT: &[u8] = b"newer cut, one transaction later";
+
+    impl TwoCuts {
+        async fn published() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let (source, table, scope) = activated_source_with_scope();
+            let log = canonical_log(&directory.path().join("log"), &source);
+            let mut catalog =
+                SqliteArtifactCatalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+            let store =
+                LocalFilesystemBlobStore::open(directory.path().join("objects"), 1024).unwrap();
+            let cut = |sequence, bytes, id| {
+                let cursor = source.cursor_codec().encode(&CursorPosition {
+                    source_epoch: source.source_epoch().clone(),
+                    sequence,
+                });
+                with_artifact_id(
+                    &manifest_for_scope(&source, &table, cursor, bytes, &scope),
+                    id,
+                )
+            };
+            let old = cut(0, OLD_CUT, "artifact-1.zstd-19");
+            let new = cut(1, NEW_CUT, "artifact-2");
+            publish(&mut catalog, &store, &old, OLD_CUT).await;
+            publish(&mut catalog, &store, &new, NEW_CUT).await;
+            Self {
+                _directory: directory,
+                source,
+                table,
+                scope,
+                log,
+                catalog,
+                store,
+            }
+        }
+
+        fn cursor(&self, sequence: u64) -> OpaqueCursor {
+            self.source.cursor_codec().encode(&CursorPosition {
+                source_epoch: self.source.source_epoch().clone(),
+                sequence,
+            })
+        }
+
+        async fn plan(&mut self, hints: &[&[u8]]) -> BootstrapPlan {
+            let mut request = request(&self.source, &self.scope, &self.table, None);
+            request.cached_artifact_hints = hints.iter().map(|bytes| digest(bytes)).collect();
+            BootstrapPlanner::plan(
+                &mut self.catalog,
+                &self.store,
+                &SameOriginProxyResolver::new("https://sync.test/base/").unwrap(),
+                &self.source,
+                &mut self.log,
+                &ResidentStateProofCodec::new([8_u8; 32]).unwrap(),
+                request,
+            )
+            .await
+            .unwrap()
+        }
+
+        fn catch_up_from(&self, plan: &BootstrapPlan) -> u64 {
+            self.source
+                .cursor_codec()
+                .decode(&plan.change_stream.from_cursor_exclusive)
+                .unwrap()
+                .sequence
+        }
+    }
+
+    /// A request that holds no cut is planned the newest of the same tables,
+    /// over an older, smaller one.
     #[tokio::test]
-    async fn the_newest_cut_is_planned_over_a_cached_older_one() {
+    async fn the_newest_cut_is_planned_for_a_page_that_holds_none() {
+        let mut cuts = TwoCuts::published().await;
+
+        let plan = cuts.plan(&[]).await;
+
+        assert_eq!(plan.diagnostics.catalog_candidate_rows, 2);
+        assert_eq!(plan.diagnostics.eligible_candidates, 1);
+        assert_eq!(plan.diagnostics.selected_cache_hints, 0);
+        assert_eq!(plan.artifacts.len(), 1);
+        assert_eq!(plan.artifacts[0].artifact_id.as_str(), "artifact-2");
+        assert_eq!(plan.artifacts[0].snapshot_cursor, cuts.cursor(1));
+        assert_eq!(cuts.catch_up_from(&plan), 1);
+    }
+
+    /// The older cut a page names by its decoded SHA-256 is planned, under
+    /// whatever id a re-encode published it, and its catch-up starts at it.
+    #[tokio::test]
+    async fn a_held_older_cut_is_planned_and_caught_up_from() {
+        let mut cuts = TwoCuts::published().await;
+
+        let plan = cuts.plan(&[OLD_CUT]).await;
+
+        assert_eq!(plan.diagnostics.eligible_candidates, 2);
+        assert_eq!(plan.diagnostics.selected_cache_hints, 1);
+        assert_eq!(plan.artifacts.len(), 1);
+        assert_eq!(plan.artifacts[0].artifact_id.as_str(), "artifact-1.zstd-19");
+        assert_eq!(plan.artifacts[0].decoded_sha256, digest(OLD_CUT));
+        assert_eq!(plan.artifacts[0].snapshot_cursor, cuts.cursor(0));
+        assert_eq!(cuts.catch_up_from(&plan), 0);
+        assert_eq!(plan.activation_cursor, cuts.cursor(1));
+    }
+
+    /// A held cut whose entries after it the log no longer keeps is not
+    /// planned: the page downloads the newest.
+    #[tokio::test]
+    async fn a_held_cut_the_log_no_longer_follows_is_not_planned() {
+        let mut cuts = TwoCuts::published().await;
+        let head = cuts.log.head().sequence;
+        cuts.log.retain_from(head + 1).unwrap();
+
+        let plan = cuts.plan(&[OLD_CUT]).await;
+
+        assert_eq!(plan.diagnostics.eligible_candidates, 1);
+        assert_eq!(plan.diagnostics.selected_cache_hints, 0);
+        assert_eq!(plan.artifacts[0].artifact_id.as_str(), "artifact-2");
+        assert_eq!(cuts.catch_up_from(&plan), 1);
+    }
+
+    /// A page that names a cut published for another scope is planned its
+    /// own scope's newest cut: the hint chooses only among the cuts the
+    /// request's authorized cache key admits.
+    #[tokio::test]
+    async fn a_held_cut_of_another_scope_is_not_planned() {
         let directory = tempfile::tempdir().unwrap();
-        let (source, table, scope) = activated_source_with_scope();
+        let (source, table, own, other) = activated_source_with_two_column_sets();
         let mut log = canonical_log(&directory.path().join("log"), &source);
+        let mut catalog =
+            SqliteArtifactCatalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let store = LocalFilesystemBlobStore::open(directory.path().join("objects"), 1024).unwrap();
         let cursor = |sequence| {
             source.cursor_codec().encode(&CursorPosition {
                 source_epoch: source.source_epoch().clone(),
                 sequence,
             })
         };
-        let old_bytes = b"older cut";
-        let new_bytes = b"newer cut, one transaction later";
-        let old = manifest_for_scope(&source, &table, cursor(0), old_bytes, &scope);
-        let new = with_artifact_id(
-            &manifest_for_scope(&source, &table, cursor(1), new_bytes, &scope),
-            "artifact-2",
+        let held = with_artifact_id(
+            &manifest_for_scope(&source, &table, cursor(0), OLD_CUT, &other),
+            "artifact-other",
         );
-        assert_eq!(old.manifest().artifact_id.as_str(), "artifact-1");
-        let mut catalog =
-            SqliteArtifactCatalog::open(directory.path().join("catalog.sqlite3")).unwrap();
-        let store = LocalFilesystemBlobStore::open(directory.path().join("objects"), 1024).unwrap();
-        publish(&mut catalog, &store, &old, old_bytes).await;
-        publish(&mut catalog, &store, &new, new_bytes).await;
+        let newest = manifest_for_scope(&source, &table, cursor(1), NEW_CUT, &own);
+        publish(&mut catalog, &store, &held, OLD_CUT).await;
+        publish(&mut catalog, &store, &newest, NEW_CUT).await;
+        let mut request = request(&source, &own, &table, None);
+        request.cached_artifact_hints = BTreeSet::from([digest(OLD_CUT)]);
 
         let plan = BootstrapPlanner::plan(
             &mut catalog,
@@ -2900,25 +3209,16 @@ mod tests {
             &source,
             &mut log,
             &ResidentStateProofCodec::new([8_u8; 32]).unwrap(),
-            request(&source, &scope, &table, None),
+            request,
         )
         .await
         .unwrap();
 
-        assert_eq!(plan.diagnostics.catalog_candidate_rows, 2);
-        assert_eq!(plan.diagnostics.eligible_candidates, 1);
+        assert_eq!(plan.diagnostics.catalog_candidate_rows, 1);
         assert_eq!(plan.diagnostics.selected_cache_hints, 0);
         assert_eq!(plan.artifacts.len(), 1);
-        assert_eq!(plan.artifacts[0].artifact_id.as_str(), "artifact-2");
+        assert_eq!(plan.artifacts[0].decoded_sha256, digest(NEW_CUT));
         assert_eq!(plan.artifacts[0].snapshot_cursor, cursor(1));
-        assert_eq!(
-            source
-                .cursor_codec()
-                .decode(&plan.change_stream.from_cursor_exclusive)
-                .unwrap()
-                .sequence,
-            1
-        );
     }
 
     #[tokio::test]

@@ -54,7 +54,10 @@ pub use recovery::{
     create_recovery_backup, restore_recovery_backup, verify_restored_recovery_backup,
     ExistingSourceRows, RecoveryError, RecoveryObjects, RecoveryOracle, RecoveryReport,
 };
-pub use recut::{RecutConfig, RecutPolicy, DEFAULT_RECUT_MIN_INTERVAL, DEFAULT_RECUT_TAIL_RATIO};
+pub use recut::{
+    RecutConfig, RecutPolicy, DEFAULT_RECUT_KEEP_RATIO, DEFAULT_RECUT_MIN_INTERVAL,
+    DEFAULT_RECUT_TAIL_RATIO,
+};
 pub use reencode::ReencodeConfig;
 pub use revocation::{
     AuthorizationFenceError, AuthorizationFenceStore, GenerationArtifactPublisher,

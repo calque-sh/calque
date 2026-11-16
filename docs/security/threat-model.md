@@ -121,6 +121,24 @@ purpose. Bearer values, sensitive scope values, credentials, and row payloads
 are prohibited in ordinary logs, metrics, traces, errors, referrers, analytics,
 source maps, image layers, and public evidence.
 
+A page keeps its activated working set in the origin private file system,
+each chunk sealed with AES-256-GCM under a key the server derives from its
+resident-state proof secret and the artifact's cache key, which every
+authorization input enters. The key arrives in each plan and is never written
+to disk, so the copy opens only for a holder of a current plan for the same
+rows. A revocation barrier, a locked session and `clearStoredRows()` erase it,
+and a store in flight at an erasure writes no record. `calque serve
+--no-stored-rows` issues no key, and no page keeps rows. The page's
+`calque-stored-rows` cookie names the copy's key id, a truncated SHA-256 of
+the key under its own label, and the decoded SHA-256 of the artifact it holds,
+which every plan for the scope shows, so the page's origin learns which copy
+the browser holds and nothing that opens it; erasure expires the cookie. Each
+plan request names that digest, and the server plans the cut it names only
+among the cuts it would plan for the request's authorized cache key, and only
+while the keep ratio keeps it and the log still holds every change after it,
+so a page that names a cut it does not hold downloads it and reads nothing it
+could not read anyway.
+
 The project cannot promise physical erasure from browser-managed freed memory,
 swap, crash reporting, extensions, screenshots, exports, DevTools, or hostile
 copies. Operator-controlled privileged stores follow the documented access,

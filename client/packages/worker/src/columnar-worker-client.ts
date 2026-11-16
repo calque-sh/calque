@@ -38,6 +38,19 @@ export {
   hasherCount,
 } from "./columnar-hashers.js";
 export { ArtifactBodyError, ArtifactDecoder } from "./columnar-decoder.js";
+export {
+  StoredRowsError,
+  StoredRowsWriter,
+  eraseStoredRows,
+  importStoredRowsKey,
+  openStoredCopy,
+  storedRowsAvailable,
+  type StoreWorker,
+  type StoredArtifact,
+  type StoredCopy,
+  type StoredRowsKey,
+} from "./stored-rows.js";
+export type { StoreOutcome } from "./stored-rows-protocol.js";
 export { DECODER_INPUT_WINDOW_BYTES } from "./columnar-decoder-protocol.js";
 export { awaitedLater, delay, stopReading } from "./async.js";
 // `ColumnarLiveSession` has its own entry point,
@@ -209,7 +222,8 @@ export class EngineWorkerClient {
    * Opens a workspace whose artifact arrives after this call, chunk by chunk
    * from `chunks`' hashers. The worker takes a chunk only once its digest
    * matches `trusted.chunks`, credits `chunks` for each, and opens nothing
-   * until every chunk has matched.
+   * until every chunk has matched. With `store`, a `StoredRowsWriter`'s
+   * port, each chunk it accepts goes on to that writer's store worker.
    */
   receive(
     trusted: TrustedArtifact,
@@ -219,6 +233,7 @@ export class EngineWorkerClient {
     signal?: AbortSignal,
     changeStream?: ColumnarChangeContract,
     enumLabels?: readonly ColumnarEnumLabels[],
+    store?: MessagePort,
   ): ReceivingWorkspace {
     this.#chunks = chunks;
     const opened = this.#open(
@@ -229,6 +244,7 @@ export class EngineWorkerClient {
       signal,
       changeStream,
       enumLabels,
+      store,
     );
     return {
       end: (count) => {
@@ -249,6 +265,7 @@ export class EngineWorkerClient {
     signal: AbortSignal | undefined,
     changeStream: ColumnarChangeContract | undefined,
     enumLabels: readonly ColumnarEnumLabels[] | undefined,
+    store: MessagePort | undefined,
   ): Promise<OpenedWorkspace> {
     const response = await this.#request(
       {
@@ -261,8 +278,9 @@ export class EngineWorkerClient {
         ...(enumLabels === undefined || enumLabels.length === 0
           ? {}
           : { enumLabels }),
+        ...(store === undefined ? {} : { store }),
       },
-      hashers,
+      store === undefined ? hashers : [...hashers, store],
       signal,
       true,
     ).finally(() => {

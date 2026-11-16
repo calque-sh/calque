@@ -394,7 +394,10 @@ lists every gap, with the code that falls short.
   change's median commit to paint rose by about 4.5 ms in each of two
   experiments
   ([operations](docs/design/operations.md#re-cutting-the-artifact-and-trimming-the-change-log)).
-  `--recut-tail-ratio 0` turns it off.
+  `--recut-tail-ratio 0` turns it off. An older artifact is kept while the
+  transactions after it stay under a quarter of the newest one's decoded
+  size (`--recut-keep-ratio`), so a returning page that stored it catches up
+  from it instead of downloading the newest.
 - Live queries are re-read together, so when one change moves several of
   them, a quick one is painted only once the slowest is ready.
 - Under sustained writes, a long query that has restarted three times runs to

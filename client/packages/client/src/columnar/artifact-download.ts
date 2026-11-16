@@ -4,6 +4,7 @@ import {
   type ArtifactHashers,
   awaitedLater,
   type ReceivingWorkspace,
+  type StoredCopy,
 } from "@calque/worker/columnar";
 
 import { SyncError } from "../error.js";
@@ -122,6 +123,34 @@ export async function sendDecodedArtifact(
 /** The encodings whose body the decoder worker turns into the artifact. */
 export type DecodedEncoding =
   "brotli-large-window" | "packed-brotli-large-window";
+
+/**
+ * Sends the hashers the artifact a page kept, chunk by chunk as `copy` opens
+ * them, reading the next chunk while the hashers take the last, and ends once
+ * every one of `chunks` is handed over. A chunk that does not open rejects
+ * with `StoredRowsError`, and `handed` holds the chunks already sent, so the
+ * download that takes over skips them.
+ */
+export async function sendStoredArtifact(
+  copy: StoredCopy,
+  chunks: number,
+  hashers: ArtifactHashers,
+  receiving: ReceivingWorkspace,
+  handed: HandedChunks,
+): Promise<void> {
+  let next = awaitedLater(copy.chunk(0));
+  for (let index = 0; index < chunks; index += 1) {
+    const bytes = await next;
+    if (index + 1 < chunks) next = awaitedLater(copy.chunk(index + 1));
+    const sent = hashers.send(index, bytes);
+    handed.count = index + 1;
+    if (index + 1 < chunks) await sent;
+    else handed.last = awaitedLater(sent);
+  }
+  mark("store:read");
+  await handed.last;
+  receiving.end(chunks);
+}
 
 /**
  * Reports a body the decoder refused as `INVALID_RESPONSE`, like a body of the

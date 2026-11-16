@@ -17,7 +17,7 @@ import {
   settleCold,
   withRetryMarks,
 } from "./bench-cold.ts";
-import { recutArguments, unjudgedReasons } from "./bench-conditions.ts";
+import { devArguments, unjudgedReasons } from "./bench-conditions.ts";
 import {
   createContentGenerator,
   defaultContentFixtureSeams,
@@ -70,6 +70,7 @@ import {
   wireByPurpose,
 } from "./bench-results.ts";
 import { RETAKES, takeSamples } from "./bench-samples.ts";
+import { storedRowsSummary } from "./bench-stored-rows.ts";
 import {
   readRecut,
   type RecutRecord,
@@ -190,7 +191,7 @@ async function measure(run: Run) {
       run.calquePublicBaseUrl,
       run.serviceEnvironment,
       logPath,
-      recutArguments(run.options),
+      devArguments(run.options),
     );
     run.server = server;
     run.servers.add(server.handle);
@@ -365,7 +366,14 @@ async function measure(run: Run) {
   log(edgeProtocolLine(edgeProtocol));
   const artifactObject = judgeArtifactObject(
     expectedObject(run),
-    cold.map((sample) => ({ name: sample.name, requests: sample.requests })),
+    cold.map((sample) => ({
+      name: sample.name,
+      requests: sample.requests,
+      storeHit: sample.storedRows.hit,
+      ...(sample.expectedObjectUrl === null
+        ? {}
+        : { expectedUrl: sample.expectedObjectUrl }),
+    })),
   );
   log(artifactObjectLine(artifactObject));
   const shapingFailure =
@@ -547,6 +555,9 @@ async function measure(run: Run) {
     edgeProtocol,
     // `one: null`, with its reason, where the run expects no artifact object.
     artifactObject,
+    // Which judged cold samples' pages had a key, read their stored copy,
+    // stored one, downloaded an artifact and took their scripts from cache.
+    storedRows: storedRowsSummary(cold),
     screenshotCalibration: referenceOf(run).screenshotCalibration,
     thresholds: rows,
     passes:

@@ -19,6 +19,7 @@
   "residentTables": [],
   "activationCursor": "cursor-v1:source_42/epoch_7/9182990",
   "nextResidentStateProof": "resident-state-proof-v1.example",
+  "storedRowsKey": "c3RvcmVkLXJvd3Mta2V5LWV4YW1wbGUtMzItYnl0ZXM",
   "artifacts": [
     {
       "artifactId": "artifact_01JZCOLUMNAR",

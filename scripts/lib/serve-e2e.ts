@@ -318,11 +318,22 @@ export interface ServedPage {
   /**
    * The HTML the application's backend renders into the page's head for
    * each request, after the connection, given the request's
-   * `Accept-Encoding`, or null for none. It runs on the document's critical
-   * path: no byte of the page is sent until it settles.
+   * `Accept-Encoding` and `Cookie`, or null for none. It runs on the
+   * document's critical path: no byte of the page is sent until it settles.
    */
   readonly head:
-    ((acceptEncoding: string | undefined) => Promise<string>) | null;
+    | ((
+        acceptEncoding: string | undefined,
+        cookie: string | undefined,
+      ) => Promise<string>)
+    | null;
+  /**
+   * Whether the build's `assets/`, whose names carry a hash of their
+   * content, go with `Cache-Control: public, max-age=31536000, immutable`, as
+   * a deployment serves them, so a returning browser takes them from its
+   * cache. Without it they go with no caching header.
+   */
+  readonly immutableAssets?: boolean;
 }
 
 /** A build, and what to render into its page, read as each request arrives. */
@@ -402,7 +413,13 @@ export function servePage(
     const coding = staticCoding(request.headers["accept-encoding"]);
     const { connection, head } = served;
     if (relative !== "/index.html" || connection === null) {
-      send(response, stored, coding, false);
+      send(
+        response,
+        stored,
+        coding,
+        false,
+        served.immutableAssets === true && relative.startsWith("/assets/"),
+      );
       return;
     }
     if (head === null) {
@@ -416,7 +433,7 @@ export function servePage(
       return;
     }
     const html = renderConnection(stored.identity.toString("utf8"), connection);
-    head(request.headers["accept-encoding"]).then(
+    head(request.headers["accept-encoding"], request.headers.cookie).then(
       (fragment) =>
         send(
           response,
@@ -452,6 +469,7 @@ function send(
   file: StaticFile,
   coding: "br" | "gzip" | null,
   noStore: boolean,
+  immutable = false,
 ): void {
   const compressed = coding === null ? null : file[coding];
   const body = compressed ?? file.identity;
@@ -463,6 +481,9 @@ function send(
       ? {}
       : { "content-encoding": coding }),
     ...(noStore ? { "cache-control": "no-store" } : {}),
+    ...(immutable
+      ? { "cache-control": "public, max-age=31536000, immutable" }
+      : {}),
   });
   response.end(body);
 }

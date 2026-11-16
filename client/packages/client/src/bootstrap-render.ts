@@ -18,6 +18,11 @@ import {
   type RenderedPlan,
   requestedParameters,
 } from "./bootstrap-start.js";
+import {
+  hintedCopy,
+  type StoredRowsHint,
+  storedRowsKeyId,
+} from "./stored-rows-hint.js";
 
 /** The largest plan the session reads, as `readBootstrapPlan` bounds it. */
 const MAX_PLAN_BYTES = 2 * 1024 * 1024;
@@ -30,6 +35,14 @@ export interface RenderBootstrapOptions {
    * rendered.
    */
   readonly acceptEncoding: string | undefined;
+  /**
+   * The `Cookie` header of the browser's request for the page. A page that
+   * keeps its rows between visits sets a cookie naming its stored copy. The
+   * request names that copy, so the server plans it while it keeps it, and
+   * when the plan's artifact is that copy the head carries no preload: the
+   * page reads the artifact from disk instead of downloading it.
+   */
+  readonly cookie?: string | undefined;
   /** The `fetch` to post with; the runtime's own when absent. */
   readonly fetch?: typeof fetch;
   /** Ends the request, for a page that will not wait longer for its plan. */
@@ -39,8 +52,9 @@ export interface RenderBootstrapOptions {
 /**
  * Posts the bootstrap request for `start` and returns the HTML for the page's
  * `<head>`: a `<link rel="preload" as="fetch" crossorigin="anonymous">` for
- * each artifact the plan names, and the `calque-plan` element the page's
- * starter reads in place of posting a request. It returns the empty string,
+ * each artifact the plan names, unless `cookie` says the page holds the plan's
+ * stored copy, and the `calque-plan` element the page's starter reads in
+ * place of posting a request. It returns the empty string,
  * and the starter posts its own request, when `acceptEncoding` is undefined
  * or the request fails or answers with anything but a plan whose artifacts
  * are all zstd, `brotli-large-window` or `packed-brotli-large-window`.
@@ -65,10 +79,11 @@ export async function renderBootstrap(
     ),
     clientInstanceId: globalThis.crypto.randomUUID(),
   };
+  const held = hintedCopy(options.cookie);
   const init = bootstrapInit(
     { ...request, bearerToken: start.bearerToken },
     request.clientInstanceId,
-    options.signal,
+    { signal: options.signal, held: held?.decodedSha256 },
   );
   let plan: string;
   try {
@@ -91,8 +106,9 @@ export async function renderBootstrap(
   const urls = artifactUrls(plan);
   if (urls === undefined) return "";
   const element: RenderedPlan = { ...request, plan };
+  const preloaded = (await holdsStoredCopy(plan, held)) ? [] : urls;
   return (
-    urls
+    preloaded
       .map(
         (url) =>
           `<link rel="preload" as="fetch" crossorigin="anonymous" href="${attribute(url)}">`,
@@ -145,6 +161,32 @@ function artifactUrls(text: string): string[] | undefined {
     urls.push(url);
   }
   return urls;
+}
+
+/**
+ * Whether the page holds `text`'s artifact: its one artifact has the decoded
+ * SHA-256 `held` names, sealed under the plan's key.
+ */
+async function holdsStoredCopy(
+  text: string,
+  held: StoredRowsHint | undefined,
+): Promise<boolean> {
+  if (held === undefined) return false;
+  const plan = JSON.parse(text) as {
+    storedRowsKey?: unknown;
+    artifacts?: readonly { decodedSha256?: unknown }[];
+  };
+  if (
+    typeof plan.storedRowsKey !== "string" ||
+    plan.artifacts?.length !== 1 ||
+    plan.artifacts[0]?.decodedSha256 !== held.decodedSha256
+  )
+    return false;
+  try {
+    return (await storedRowsKeyId(plan.storedRowsKey)) === held.keyId;
+  } catch {
+    return false;
+  }
 }
 
 /** JSON that a script element holds as it is: no `<` can end it early. */

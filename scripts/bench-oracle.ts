@@ -359,6 +359,11 @@ COMMIT;
 `;
 }
 
+/** The rows the load's transaction `n` touches of a table, as an SQL array. */
+function rotatingSql(count: number, modulus: number, type: string): string {
+  return `ARRAY[${Array.from({ length: count }, (_, offset) => `((n * ${String(count)} + ${String(offset)}) % ${String(modulus)})::${type}`).join(", ")}]`;
+}
+
 /**
  * `--tail`'s writes: the load's first `transactions` transactions, each
  * committed on its own, from one loop in the server so they commit as fast as
@@ -369,8 +374,6 @@ COMMIT;
 export function tailSql(transactions: number): string {
   if (!Number.isSafeInteger(transactions) || transactions < 1)
     throw new Error("a tail must hold at least one transaction");
-  const rotatingSql = (count: number, modulus: number, type: string): string =>
-    `ARRAY[${Array.from({ length: count }, (_, offset) => `((n * ${String(count)} + ${String(offset)}) % ${String(modulus)})::${type}`).join(", ")}]`;
   const counts = BENCH_ROW_COUNTS;
   return `SET synchronous_commit = off;
 DO $tail$
@@ -383,6 +386,50 @@ BEGIN
   END LOOP;
 END
 $tail$;
+`;
+}
+
+/**
+ * `--between-visits`: `transactions` write transactions, an even number.
+ * Each of the first half prepends one character to the title of each issue
+ * and the body of each comment that the load's transaction n would touch,
+ * and each of the second half removes it from the same rows, so the source
+ * holds the same rows afterwards and the reference pass still holds.
+ */
+export function betweenVisitsSql(transactions: number): string {
+  if (
+    !Number.isSafeInteger(transactions) ||
+    transactions < 2 ||
+    transactions % 2 !== 0
+  )
+    throw new Error("the writes between visits are an even number, from 2");
+  const counts = BENCH_ROW_COUNTS;
+  const issues = rotatingSql(
+    LOAD_ISSUES_PER_TRANSACTION,
+    counts.issues,
+    "bigint",
+  );
+  const comments = rotatingSql(
+    LOAD_COMMENTS_PER_TRANSACTION,
+    counts.comments,
+    "bigint",
+  );
+  const last = String(transactions / 2 - 1);
+  return `SET synchronous_commit = off;
+DO $between$
+BEGIN
+  FOR n IN 0..${last} LOOP
+    UPDATE incidents.issues SET title = '~' || title WHERE bench_index = ANY (${issues}) AND NOT is_sentinel;
+    UPDATE incidents.comments SET body = '~' || body WHERE bench_index = ANY (${comments}) AND NOT is_sentinel;
+    COMMIT;
+  END LOOP;
+  FOR n IN 0..${last} LOOP
+    UPDATE incidents.issues SET title = substr(title, 2) WHERE bench_index = ANY (${issues}) AND NOT is_sentinel;
+    UPDATE incidents.comments SET body = substr(body, 2) WHERE bench_index = ANY (${comments}) AND NOT is_sentinel;
+    COMMIT;
+  END LOOP;
+END
+$between$;
 `;
 }
 

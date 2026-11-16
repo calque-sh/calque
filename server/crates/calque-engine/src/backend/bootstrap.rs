@@ -514,7 +514,8 @@ impl LocalBackend {
             resident_tables: request.resident_tables,
             resident_cursor: request.resident_cursor,
             authorization,
-            cached_artifact_hints: request.cached_artifact_hints,
+            cached_artifact_hints: self.plannable_hints(request.cached_artifact_hints),
+            stored_rows: self.inner.stored_rows,
             accepted_encodings: request.accepted_encodings,
             // The client ships one artifact decoder and does not negotiate,
             // so the composition names the profile once, when it decides

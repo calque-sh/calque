@@ -73,6 +73,11 @@
       "minLength": 1,
       "maxLength": 1048576
     },
+    "storedRowsKey": {
+      "description": "The AES-256-GCM key, unpadded base64url, the page seals the artifact it keeps between visits under. Absent when the deployment lets no page keep one.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+    },
     "artifacts": {
       "type": "array",
       "items": { "$ref": "#/$defs/artifactInstall" }

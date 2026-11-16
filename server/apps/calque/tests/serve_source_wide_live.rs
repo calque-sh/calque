@@ -1135,6 +1135,12 @@ fn serve_starts_reaches_readyz_serves_a_bootstrap_and_shuts_down_cleanly() {
         "{}",
         String::from_utf8_lossy(&response.body)
     );
+    let stored_rows_key = response.json()["storedRowsKey"].as_str().map(str::len);
+    assert_eq!(
+        stored_rows_key,
+        Some(43),
+        "a serve not told otherwise lets the page keep its rows"
+    );
 
     // The grant that just planned a read carries no command capability, so
     // the mounted write route answers it with the 404 an unmounted route
@@ -1189,6 +1195,36 @@ fn serve_starts_reaches_readyz_serves_a_bootstrap_and_shuts_down_cleanly() {
     }
     // Readiness is gone with the process, and the port is free again.
     assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+    fixture.drop_source();
+}
+
+/// `--no-stored-rows` leaves the key a page seals its stored copy under out
+/// of every plan, so no page keeps rows.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn serve_with_no_stored_rows_plans_without_the_stored_rows_key() {
+    let _exclusive = exclusive();
+    let fixture = Fixture::new("no_stored_rows");
+    fixture.seed(4);
+    let serving = serve_with(&fixture, fixture.default_commands(), &["--no-stored-rows"]);
+
+    let response = bootstrap(
+        serving.port,
+        &fixture.grant(1, 600),
+        &format!("public.{}", fixture.table()),
+        "zstd, br, identity",
+    );
+    assert_eq!(
+        response.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let plan = response.json();
+    assert!(plan["artifacts"][0].is_object(), "{plan}");
+    assert!(plan.get("storedRowsKey").is_none(), "{plan}");
+
+    assert!(serving.shutdown(), "serve must exit cleanly on SIGTERM");
     fixture.drop_source();
 }
 

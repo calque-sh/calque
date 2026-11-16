@@ -691,8 +691,11 @@ export function edgeProtocolLine(witness: EdgeProtocolWitness): string {
  * expects its pages to load, and for no other artifact. calque publishes a
  * cut's representations one after another, so a run whose hold ends before
  * the last of them loads one object in its early samples and another in its
- * late ones. `one` is null, with the reason, where the run expects no object
- * or took no judged cold sample.
+ * late ones. Under `--between-visits` calque re-cuts before each sample's
+ * measured visit, so each sample expects the object planned after its own
+ * writes (`expectedUrl`). A sample whose page read its stored copy asked for
+ * none, and is not read. `one` is null, with the reason, where the run expects no object,
+ * took no judged cold sample, or took only samples that read a stored copy.
  */
 interface ArtifactObjectWitness {
   readonly one: boolean | null;
@@ -718,11 +721,14 @@ export function judgeArtifactObject(
     readonly objectUrl: string;
     readonly artifactRoute: string;
   } | null,
-  samples: readonly {
+  judged: readonly {
     readonly name: string;
     readonly requests: readonly { readonly url: string }[];
+    readonly storeHit?: boolean;
+    readonly expectedUrl?: string;
   }[],
 ): ArtifactObjectWitness {
+  const samples = judged.filter((sample) => sample.storeHit !== true);
   if (expected === null || samples.length === 0)
     return {
       one: null,
@@ -732,10 +738,13 @@ export function judgeArtifactObject(
       reason:
         expected === null
           ? "the run expects no artifact object"
-          : "no judged cold sample",
+          : judged.length === 0
+            ? "no judged cold sample"
+            : "every judged cold sample read its stored copy",
     };
   const objects = new Map<string, string[]>();
   const without: string[] = [];
+  let each = true;
   for (const sample of samples) {
     const urls = new Set(
       sample.requests
@@ -743,14 +752,13 @@ export function judgeArtifactObject(
         .filter((url) => url.startsWith(expected.artifactRoute)),
     );
     if (urls.size === 0) without.push(sample.name);
+    if (urls.size !== 1 || !urls.has(sample.expectedUrl ?? expected.objectUrl))
+      each = false;
     for (const url of urls)
       objects.set(url, [...(objects.get(url) ?? []), sample.name]);
   }
   return {
-    one:
-      without.length === 0 &&
-      objects.size === 1 &&
-      objects.has(expected.objectUrl),
+    one: without.length === 0 && each,
     expected: expected.objectUrl,
     objects: [...objects].map(([url, names]) => ({ url, samples: names })),
     without,

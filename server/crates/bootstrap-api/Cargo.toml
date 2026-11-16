@@ -17,6 +17,7 @@ blob-store = { path = "../blob-store" }
 canonical-log = { path = "../canonical-log" }
 hmac = "0.12.1"
 jsonschema = { version = "0.47.0", default-features = false }
+ring = "0.17.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.9"

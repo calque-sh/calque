@@ -110,6 +110,10 @@ each browser origin, which is HTTPS or loopback. It reads `--config`,
 file's `sources[].databaseUrlEnv` names, and keeps its state in `--state-dir`,
 `.calque-serve` by default. On a wildcard `--bind-address` it also needs
 `--expected-host <host[:port]>`, the exact `Host` header browsers send.
+Every plan `calque dev` and `calque serve` issue carries the key a page
+encrypts the copy of its working set with, the copy it keeps for its next
+visit; `--no-stored-rows` leaves the key out, so no page keeps its rows in the
+browser.
 [Self-host](self-host.md) runs it behind HTTPS, and
 [operations](design/operations.md) lists every setting.
 

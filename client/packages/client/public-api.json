@@ -7,7 +7,7 @@
     "./bootstrap-render",
     "./vite"
   ],
-  "reachableDeclarationGraphSha256": "4d7b986807ab9d1e6ed3f4be5810fdfdf11ee4f714a57dd6113fe4527136b80d",
+  "reachableDeclarationGraphSha256": "8ca07e136c75ba89bf81b1a0bbfc5bd2f7299aeb9742bf29d3fd101a22cd2448",
   "rootValues": [
     "MutationSubmissionError",
     "SyncError",
@@ -67,6 +67,7 @@
     "SyncStatus"
   ],
   "syncClientMembers": [
+    "clearStoredRows",
     "close",
     "db",
     "mutationStatus",
@@ -81,6 +82,7 @@
   ],
   "syncClientReadonlyDataMembers": ["db", "status"],
   "syncClientReadonlyFunctionMembers": [
+    "clearStoredRows",
     "close",
     "mutationStatus",
     "refresh",
@@ -98,7 +100,8 @@
     "fetch",
     "grantVerificationKey",
     "memoryBudgetBytes",
-    "schema"
+    "schema",
+    "storeRows"
   ],
   "syncAuthMembers": ["bearerToken"],
   "syncClientAuthReturnTypes": ["SyncAuth", "Promise<SyncAuth>"],
@@ -226,14 +229,14 @@
     "BootstrapStart",
     "RenderedConnection"
   ],
-  "bootstrapStartDeclarationGraphSha256": "17148ec365c08aac3b5e18f9589397c3bcf25ff1e2492a5e1f5b45a8280d177a",
+  "bootstrapStartDeclarationGraphSha256": "a89805bfec89be1b942136c26e743e3334ab8553a05b1d3a652b0c3fb7804b52",
   "bootstrapRenderValues": ["renderBootstrap"],
   "bootstrapRenderTypes": [
     "BootstrapRequest",
     "RenderBootstrapOptions",
     "RenderedConnection"
   ],
-  "bootstrapRenderDeclarationGraphSha256": "0f15784fe75b2bc4159a6f8654250a383cdd9368151aa834726e696daeea4fc2",
+  "bootstrapRenderDeclarationGraphSha256": "57b889c190fb3feb4913e4372c5273c06c84aa2715e8914526550a4323ba564b",
   "vitePluginValues": ["calque"],
   "vitePluginTypes": ["CalquePluginOptions"],
   "vitePluginDeclarationGraphSha256": "9cdc3ad0a1cfd2de78fb74e66756bf47037ec6729cf33b7c3482333d0d9d0adc",

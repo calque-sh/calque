@@ -7,6 +7,7 @@ import {
   type QuerySpecification,
   type QueryWindow,
   type QueryWindowResult,
+  type TrustedArtifactChunks,
 } from "@calque/core";
 import { mutation } from "@calque/protocol";
 import {
@@ -16,8 +17,11 @@ import {
   delay,
   EngineWorkerClient,
   hasherCount,
+  StoredRowsError,
   type FrameCompletion,
   type ColumnarMountState,
+  type StoredArtifact,
+  type StoredCopy,
 } from "@calque/worker/columnar";
 import type { ColumnarLivePublication } from "@calque/worker/columnar-live";
 
@@ -77,7 +81,7 @@ import {
   sealAuthSnapshot,
   submitMutationBatch,
 } from "../transport.js";
-import type { BootstrapPlan } from "../plan.js";
+import type { BootstrapPlan, PlanArtifact } from "../plan.js";
 import {
   recordPublication,
   teardownActivation,
@@ -90,6 +94,7 @@ import {
   artifactBodyRefusal,
   sendArtifact,
   sendDecodedArtifact,
+  sendStoredArtifact,
   type HandedChunks,
 } from "./artifact-download.js";
 import { BOOTSTRAP_RETRY_DELAYS_MS, PlanOutlived } from "./bootstrap-retry.js";
@@ -137,6 +142,7 @@ import {
   REVOKED_ABANDON_MESSAGE,
   type AuthorizationRecovery,
 } from "./session-recovery.js";
+import type { RowStore, RowWriter } from "./stored-rows.js";
 import { mark } from "./user-timing.js";
 import type {
   ColumnarDecoderWorker,
@@ -165,6 +171,9 @@ export class ColumnarSession {
   readonly #workerFactory: () => ColumnarEngineWorker;
   readonly #hasherFactory: () => ColumnarHasherWorker;
   readonly #decoderFactory: () => ColumnarDecoderWorker;
+  readonly #store: RowStore;
+  /** The writers of loads that have not kept or dropped their copy yet. */
+  readonly #storing = new Set<RowWriter>();
   readonly #collections: readonly GeneratedClientCollectionDescriptor[];
   readonly #columns = new Map<
     string,
@@ -262,6 +271,7 @@ export class ColumnarSession {
     workerFactory: () => ColumnarEngineWorker,
     hasherFactory: () => ColumnarHasherWorker,
     decoderFactory: () => ColumnarDecoderWorker,
+    store: RowStore,
   ) {
     if (options.schema.collections.length === 0)
       throw new TypeError("the schema carries no generated collections");
@@ -270,6 +280,7 @@ export class ColumnarSession {
     this.#workerFactory = workerFactory;
     this.#hasherFactory = hasherFactory;
     this.#decoderFactory = decoderFactory;
+    this.#store = store;
     this.#collections = options.schema.collections;
     for (const collection of this.#collections)
       this.#columns.set(
@@ -499,6 +510,21 @@ export class ColumnarSession {
     this.#epoch.abort(cancelled("sync"));
     this.#epoch = new AbortController();
     return this.#epoch.signal;
+  }
+
+  /**
+   * Erases the working set this browser keeps, and keeps nothing of a load
+   * in flight. The mount in memory stays.
+   */
+  async clearStoredRows(): Promise<void> {
+    for (const writer of this.#storing) writer.abandon();
+    this.#storing.clear();
+    await this.#store.erase();
+  }
+
+  /** `clearStoredRows`, for a session that lost its authorization. */
+  #eraseStoredRows(): void {
+    this.clearStoredRows().catch(() => undefined);
   }
 
   async close(): Promise<void> {
@@ -1411,6 +1437,7 @@ export class ColumnarSession {
     const expired = error.code === "AUTHORIZATION_EXPIRED";
     if (!revoked && !expired && error.code !== "RESNAPSHOT_REQUIRED")
       return error;
+    if (revoked) this.#eraseStoredRows();
     const now = Date.now();
     if (
       this.#rebuildWindowEndsAt === undefined ||
@@ -1478,6 +1505,7 @@ export class ColumnarSession {
    */
   #lock(reason: AuthorizationRecovery, cause: SyncError): void {
     const activation = this.#activation;
+    this.#eraseStoredRows();
     this.#recovering = undefined;
     this.#nextEpoch();
     this.#activation = undefined;
@@ -1704,6 +1732,7 @@ export class ColumnarSession {
           clientHeapReserveBytes: this.#options.clientHeapReserveBytes,
           clientInstanceId: this.#clientInstanceId,
           deviceId: this.#deviceId,
+          held: this.#held(),
         });
       } catch (error) {
         if (error instanceof ArtifactPreparingError) {
@@ -1806,6 +1835,102 @@ export class ColumnarSession {
     return started.response;
   }
 
+  /**
+   * The stored copy this load reads, or the writer that keeps the artifact
+   * it downloads. Neither for a plan without a key, a client that keeps no
+   * rows, a browser that cannot, or a store that failed: the load then
+   * downloads the artifact as it would without one. The hint names the copy
+   * read, or none.
+   */
+  async #storage(
+    encoded: string | undefined,
+    artifact: PlanArtifact,
+    chunks: TrustedArtifactChunks | undefined,
+  ): Promise<{ readonly copy?: StoredCopy; readonly writer?: RowWriter }> {
+    const storage = await this.#lookUp(encoded, artifact, chunks);
+    this.#store.hint(
+      storage.copy && storage.keyId !== undefined
+        ? { keyId: storage.keyId, decodedSha256: artifact.decodedSha256 }
+        : undefined,
+    );
+    return storage;
+  }
+
+  /**
+   * The decoded SHA-256 of the copy the page's cookie names, which the plan
+   * request sends so that the server plans that cut while it keeps it; none
+   * for a session that would not read it.
+   */
+  #held(): string | undefined {
+    if (!this.#options.storeRows || !this.#store.available()) return undefined;
+    return this.#store.heldCopy()?.decodedSha256;
+  }
+
+  async #lookUp(
+    encoded: string | undefined,
+    artifact: PlanArtifact,
+    chunks: TrustedArtifactChunks | undefined,
+  ): Promise<{
+    readonly copy?: StoredCopy;
+    readonly writer?: RowWriter;
+    readonly keyId?: string;
+  }> {
+    if (
+      !this.#options.storeRows ||
+      encoded === undefined ||
+      chunks === undefined ||
+      !this.#store.available()
+    )
+      return {};
+    const stored: StoredArtifact = {
+      artifactId: artifact.artifactId,
+      decodedSha256: artifact.decodedSha256,
+      decodedBytes: artifact.decodedBytes,
+      chunkBytes: chunks.bytes,
+      chunkSha256: chunks.sha256,
+    };
+    try {
+      const key = await this.#store.importKey(encoded);
+      try {
+        const copy = await this.#store.open(key, stored);
+        if (copy) {
+          mark("store:hit");
+          return { copy, keyId: key.keyId };
+        }
+      } catch (error) {
+        if (!(error instanceof StoredRowsError)) throw error;
+        mark("store:failed");
+        await this.#store.erase();
+      }
+      mark("store:miss");
+      const writer = this.#store.writer(key, stored);
+      this.#storing.add(writer);
+      return { writer };
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Commits what `writer` stored of the artifact whose decoded SHA-256 is
+   * `decodedSha256`, now that its load has activated, unless
+   * `clearStoredRows` dropped it meanwhile.
+   */
+  #keep(writer: RowWriter, decodedSha256: string): void {
+    if (!this.#storing.has(writer)) return;
+    writer.commit().then(
+      (outcome) => {
+        // A copy erased since it landed is named by no hint.
+        if (this.#storing.delete(writer) && outcome.type === "committed")
+          this.#store.hint({ keyId: writer.keyId, decodedSha256 });
+        mark(
+          outcome.type === "committed" ? "store:written" : "store:abandoned",
+        );
+      },
+      () => this.#storing.delete(writer),
+    );
+  }
+
   async #mount(
     epoch: AbortSignal,
     auth: ReturnType<typeof sealAuthSnapshot>,
@@ -1858,6 +1983,11 @@ export class ColumnarSession {
     const engine = new EngineWorkerClient(this.#workerFactory() as Worker);
     mark("worker:spawned");
     const liveModule = awaitedLater(import("@calque/worker/columnar-live"));
+    const { copy, writer } = await this.#storage(
+      plan.storedRowsKey,
+      artifact,
+      trusted.chunks,
+    );
     // A hasher failing or the worker refusing a chunk ends the download,
     // every hasher and the engine worker, and the load reports that, not the
     // cancelled read.
@@ -1874,6 +2004,7 @@ export class ColumnarSession {
       download.signal,
       contract,
       enumLabels,
+      writer?.port,
     );
     // The decoder worker of the response being read, when the plan selected
     // `brotli-large-window` or `packed-brotli-large-window`. No other plan
@@ -1894,10 +2025,35 @@ export class ColumnarSession {
     };
     epoch.addEventListener("abort", abandon, { once: true });
     try {
+      // The epoch may have ended while the store was looked up, before the
+      // listener above could hear it.
+      epoch.throwIfAborted();
       const chunkBytes = trusted.chunks?.bytes;
       if (chunkBytes === undefined)
         throw new Error("the plan names no chunk digests");
       const handed: HandedChunks = { count: 0, last: undefined };
+      // A stored copy that fails to read is erased, and the download below
+      // takes over from the first chunk it did not hand over.
+      let read = false;
+      if (copy) {
+        try {
+          await sendStoredArtifact(
+            copy,
+            trusted.chunks?.sha256.length ?? 0,
+            hashers,
+            receiving,
+            handed,
+          );
+          read = true;
+        } catch (error) {
+          copy.release();
+          if (refusal || !(error instanceof StoredRowsError)) throw error;
+          mark("store:failed");
+          await this.#store.erase().catch(() => undefined);
+        } finally {
+          copy.release();
+        }
+      }
       const { encoding, encodedBytes } = artifact.selectedRepresentation;
       const decoded =
         encoding === "brotli-large-window" ||
@@ -1908,7 +2064,7 @@ export class ColumnarSession {
       // bootstrap's schedule, and the chunks it already delivered are kept.
       // A 401 or a 404 asks for a new plan. Any other answer from the server,
       // and a refusal, stays final.
-      for (let attempt = 0; ; attempt += 1) {
+      for (let attempt = 0; !read; attempt += 1) {
         // A refusal that arrives while the load waits out a delay ends the
         // wait, and the load ends here instead of asking again.
         if (refusal) throw refusal.error;
@@ -2097,14 +2253,29 @@ export class ColumnarSession {
       } finally {
         epoch.removeEventListener("abort", stopLive);
       }
+      if (writer) this.#keep(writer, artifact.decodedSha256);
       return activation;
     } catch (error) {
+      if (writer) {
+        writer.abandon();
+        this.#storing.delete(writer);
+      }
+      // Rows the stored copy handed over that the worker refused, or that
+      // opened away from the artifact's cut, are not kept for the next load.
+      if (
+        copy &&
+        (refusal ||
+          (error instanceof SyncError && error.code === "INTEGRITY_FAILED"))
+      )
+        await this.#store.erase().catch(() => undefined);
       // `live` rejects only once the change stream stopped or failed, so the
       // engine is all that is left to release.
       engine.close();
       throw refusal ? refusal.error : error;
     } finally {
       epoch.removeEventListener("abort", abandon);
+      // A copy holds the store's lock shared, which an erasure waits for.
+      copy?.release();
     }
   }
 }

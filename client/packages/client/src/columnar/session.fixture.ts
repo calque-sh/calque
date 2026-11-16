@@ -11,6 +11,13 @@ import {
   validateChangeRequest,
   validateMutationBatchRequest,
 } from "@calque/protocol";
+import {
+  StoredRowsError,
+  type StoreOutcome,
+  type StoredArtifact,
+  type StoredCopy,
+  type StoredRowsKey,
+} from "@calque/worker/columnar";
 import { onTestFinished, vi } from "vitest";
 
 import {
@@ -24,6 +31,8 @@ import { createGeneratedClientSchema } from "../client-options.js";
 import type { CollectionShape } from "../facade/types.js";
 import type { GeneratedClientSchemaDescriptor } from "../generated-schema.js";
 import type { LiveQuerySnapshot } from "../resource.js";
+import type { StoredRowsHint } from "../stored-rows-hint.js";
+import type { RowStore, RowWriter } from "./stored-rows.js";
 import type { ColumnarEngineWorker, ColumnarHasherWorker } from "./worker.js";
 
 export interface EventRow {
@@ -123,6 +132,8 @@ export class FakeWorker extends EventTarget {
   #receiving: WorkerRequest | undefined;
   /** The ports the current `open` takes its chunks from. */
   #hasherPorts: MessagePort[] = [];
+  /** The store port the current `open` passes accepted chunks on to. */
+  #store: MessagePort | undefined;
   #accepted = 0;
   /** The chunk count the page's end named, once it has sent one. */
   #ended: number | undefined;
@@ -188,6 +199,7 @@ export class FakeWorker extends EventTarget {
       this.#accepted = 0;
       this.#ended = undefined;
       this.#hasherPorts = cloned.hashers as MessagePort[];
+      this.#store = cloned.store as MessagePort | undefined;
       for (const port of this.#hasherPorts)
         port.onmessage = (
           event: MessageEvent<{ index: number; bytes: ArrayBuffer }>,
@@ -227,6 +239,8 @@ export class FakeWorker extends EventTarget {
       return;
     }
     this.received[index] = new Uint8Array(bytes);
+    const kept = bytes.slice(0);
+    this.#store?.postMessage({ index, bytes: kept }, [kept]);
     this.#accepted += 1;
     if (this.holdCredits) this.#uncredited.push(index);
     else this.respond({ type: "artifact-credit", index });
@@ -256,6 +270,8 @@ export class FakeWorker extends EventTarget {
 
   #closeHasherPorts(): void {
     for (const port of this.#hasherPorts.splice(0)) port.close();
+    this.#store?.close();
+    this.#store = undefined;
   }
 
   #holds(request: WorkerRequest): boolean {
@@ -1097,6 +1113,7 @@ export function makeClient(
   mutationFetch?: typeof fetch,
   wrapFetch: (inner: typeof fetch) => typeof fetch = (inner) => inner,
   extraOptions: Record<string, unknown> = {},
+  store: FakeRowStore = new FakeRowStore(false),
 ) {
   const worker = new FakeWorker();
   const fetcher = vi.fn(
@@ -1117,6 +1134,8 @@ export function makeClient(
     },
     workerFactory,
     hashers.create,
+    undefined,
+    store,
   );
   return {
     client,
@@ -1247,6 +1266,8 @@ export function makeRebuildableClient(
      * test that needs the network to cut one throws from here.
      */
     readonly artifact?: (index: number) => void;
+    /** Where the client keeps its rows, and the key every plan carries. */
+    readonly store?: FakeRowStore;
   } = {},
 ) {
   const workers: FakeWorker[] = [];
@@ -1295,10 +1316,16 @@ export function makeRebuildableClient(
       const refused = overrides.bootstrap?.(index);
       if (refused) return refused;
       const epoch = at(index);
-      return new Response(JSON.stringify(planAt(epoch.cursor)), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({
+          ...planAt(epoch.cursor),
+          ...(overrides.store ? { storedRowsKey: STORED_ROWS_KEY } : {}),
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
     }
     if (url.endsWith("/change")) return poll.fetcher(input, init);
     // A rebuild test that needs a write in flight needs somewhere to submit
@@ -1333,6 +1360,8 @@ export function makeRebuildableClient(
     },
     workerFactory,
     fakeHashers().create,
+    undefined,
+    overrides.store ?? new FakeRowStore(false),
   );
   return {
     client,
@@ -1439,4 +1468,145 @@ export function renderTwoCollections(
       stopIssues();
     },
   };
+}
+
+/** A plan's `storedRowsKey`: 32 bytes in unpadded base64url. */
+export const STORED_ROWS_KEY = "c3RvcmVkLXJvd3Mta2V5LWZpeHR1cmUtMzItYnl0ZXM";
+
+/** A load's writer as `FakeRowStore` hands it out. */
+export class FakeRowWriter implements RowWriter {
+  readonly port: MessagePort;
+  readonly #kept: MessagePort;
+  /** The chunks the engine passed on, by index. */
+  readonly chunks: ArrayBuffer[] = [];
+  committed = false;
+  abandoned = false;
+  readonly #store: FakeRowStore;
+
+  constructor(
+    store: FakeRowStore,
+    readonly keyId: string,
+    readonly artifact: StoredArtifact,
+  ) {
+    this.#store = store;
+    const channel = new MessageChannel();
+    this.port = channel.port1;
+    this.#kept = channel.port2;
+    this.#kept.onmessage = (
+      event: MessageEvent<{ index: number; bytes: ArrayBuffer }>,
+    ) => {
+      this.chunks[event.data.index] = event.data.bytes;
+    };
+  }
+
+  commit(): Promise<StoreOutcome> {
+    this.committed = true;
+    this.#kept.close();
+    if (this.abandoned)
+      return Promise.resolve({ type: "abandoned", reason: "abandoned" });
+    this.#store.stored = {
+      keyId: this.keyId,
+      artifact: this.artifact,
+      chunks: this.chunks,
+    };
+    return Promise.resolve({ type: "committed" });
+  }
+
+  abandon(): void {
+    this.abandoned = true;
+    this.#kept.close();
+  }
+}
+
+/**
+ * Where a test's client keeps its rows: in memory, with the copy's read and
+ * the store's failures in the test's hands. A store constructed unavailable
+ * is the Node default, a browser that cannot keep rows.
+ */
+export class FakeRowStore implements RowStore {
+  stored:
+    | {
+        readonly keyId: string;
+        readonly artifact: StoredArtifact;
+        readonly chunks: readonly ArrayBuffer[];
+      }
+    | undefined;
+  readonly writers: FakeRowWriter[] = [];
+  erasures = 0;
+  opens = 0;
+  /** Copies read and not released yet. */
+  held = 0;
+  /** The next `open` rejects as a broken copy does. */
+  breakCopy = false;
+  /** Reading this chunk of the stored copy fails as a bad decryption does. */
+  breakChunk: number | undefined;
+  /** Each `open` waits for this before it answers. */
+  holdOpen: Promise<void> | undefined;
+  /** The copy the page's cookie names, as `hint` left it. */
+  hinted: StoredRowsHint | undefined;
+  hints = 0;
+
+  constructor(readonly isAvailable = true) {}
+
+  available(): boolean {
+    return this.isAvailable;
+  }
+
+  importKey(encoded: string): Promise<StoredRowsKey> {
+    return Promise.resolve({ key: {} as CryptoKey, keyId: encoded });
+  }
+
+  async open(
+    key: StoredRowsKey,
+    artifact: StoredArtifact,
+  ): Promise<StoredCopy | undefined> {
+    this.opens += 1;
+    await this.holdOpen;
+    if (this.breakCopy) {
+      this.breakCopy = false;
+      return Promise.reject(new StoredRowsError("the data file is missing"));
+    }
+    const stored = this.stored;
+    if (
+      !stored ||
+      stored.keyId !== key.keyId ||
+      stored.artifact.artifactId !== artifact.artifactId
+    )
+      return Promise.resolve(undefined);
+    this.held += 1;
+    let released = false;
+    return Promise.resolve({
+      chunk: (index) =>
+        index === this.breakChunk
+          ? Promise.reject(new StoredRowsError("a stored chunk does not open"))
+          : Promise.resolve((stored.chunks[index] as ArrayBuffer).slice(0)),
+      release: () => {
+        if (released) return;
+        released = true;
+        this.held -= 1;
+      },
+    });
+  }
+
+  writer(key: StoredRowsKey, artifact: StoredArtifact): RowWriter {
+    const writer = new FakeRowWriter(this, key.keyId, artifact);
+    this.writers.push(writer);
+    return writer;
+  }
+
+  erase(): Promise<void> {
+    this.erasures += 1;
+    this.stored = undefined;
+    this.hinted = undefined;
+    return Promise.resolve();
+  }
+
+  hint(copy: StoredRowsHint | undefined): void {
+    this.hints += 1;
+    this.hinted = copy;
+  }
+
+  heldCopy(): StoredRowsHint | undefined {
+    return this.hinted;
+  }
 }

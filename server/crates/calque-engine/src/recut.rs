@@ -5,10 +5,13 @@
 //! from. Once those entries hold `tail_ratio` bytes per decoded artifact byte,
 //! the backend cuts the scope again through the path a fenced generation's
 //! publication takes, and the planner hands every later plan the newer cut.
-//! Until a plan expires, its catalog pin keeps its cut and its retention
-//! lease every entry after it; the log keeps every entry after the newest cut.
+//! An older cut stays published, with every entry after it, while those
+//! entries hold at most `keep_ratio` bytes per decoded byte of the newest
+//! cut's artifact, so a page that stored it catches up from it. Until a plan
+//! expires, its catalog pin keeps its cut and its retention lease every entry
+//! after it.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -27,6 +30,10 @@ use crate::GenerationArtifactPublisher;
 pub const DEFAULT_RECUT_TAIL_RATIO: f64 = 0.03125;
 /// The least time from one re-cut's start to the next unless told otherwise.
 pub const DEFAULT_RECUT_MIN_INTERVAL: Duration = Duration::from_secs(60);
+/// The log since an older cut, in bytes per decoded byte of the newest cut's
+/// artifact, up to which `calque dev` and `calque serve` keep that cut unless
+/// told otherwise: eight re-cuts at the default tail ratio.
+pub const DEFAULT_RECUT_KEEP_RATIO: f64 = 0.25;
 
 /// Entries trimmed per retention transaction. A trim locks the head row every
 /// append locks, so one chunk is the longest it holds an append back.
@@ -43,6 +50,10 @@ pub struct RecutPolicy {
     /// The least time from the newest cut, or from the last re-cut's start,
     /// to the next re-cut.
     pub min_interval: Duration,
+    /// An older cut stays published while the log since it holds at most this
+    /// many bytes per decoded byte of the newest cut's artifact. Zero keeps
+    /// only the newest cut.
+    pub keep_ratio: f64,
 }
 
 impl Default for RecutPolicy {
@@ -50,6 +61,7 @@ impl Default for RecutPolicy {
         Self {
             tail_ratio: DEFAULT_RECUT_TAIL_RATIO,
             min_interval: DEFAULT_RECUT_MIN_INTERVAL,
+            keep_ratio: DEFAULT_RECUT_KEEP_RATIO,
         }
     }
 }
@@ -82,6 +94,13 @@ impl RecutPolicy {
         } else {
             0
         }
+    }
+
+    /// Whether an older cut whose log since it holds `since_bytes` stays
+    /// published beside a newest cut whose artifact decodes to
+    /// `artifact_bytes`.
+    pub(crate) fn keeps(&self, since_bytes: u64, artifact_bytes: u64) -> bool {
+        self.keep_ratio > 0.0 && since_bytes as f64 <= self.keep_ratio * artifact_bytes as f64
     }
 }
 
@@ -138,6 +157,87 @@ pub(crate) fn retention_floor(newest_cut: u64, tail_head: Option<u64>) -> u64 {
     tail_head
         .map_or(newest_cut, |tail| tail.min(newest_cut))
         .saturating_add(1)
+}
+
+/// What a maintenance pass does with the published cuts older than the
+/// newest.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OlderCuts<T> {
+    /// The sequence of the oldest cut kept, or of the newest cut when none is.
+    pub(crate) kept_from: u64,
+    pub(crate) kept: Vec<T>,
+    pub(crate) retired: Vec<T>,
+}
+
+/// Keeps each older cut, given as its sequence or none for a cursor this
+/// source cannot read, whose entries after it the log still holds from
+/// `minimum_retained` and hold no more than `policy` keeps: the bytes `span`
+/// reads between it and the newest cut, plus `tail_bytes` after the newest.
+/// Every other is retired.
+pub(crate) fn sort_older_cuts<T>(
+    policy: &RecutPolicy,
+    newest: &NewestCut,
+    tail_bytes: u64,
+    minimum_retained: u64,
+    older: Vec<(T, Option<u64>)>,
+    mut span: impl FnMut(u64) -> Result<u64, LogError>,
+) -> Result<OlderCuts<T>, LogError> {
+    let mut sorted = OlderCuts {
+        kept_from: newest.sequence,
+        kept: Vec::new(),
+        retired: Vec::new(),
+    };
+    for (cut, sequence) in older {
+        let kept = match sequence {
+            Some(sequence)
+                if policy.keep_ratio > 0.0
+                    && sequence < newest.sequence
+                    && sequence.saturating_add(1) >= minimum_retained =>
+            {
+                let since = span(sequence)?.saturating_add(tail_bytes);
+                policy
+                    .keeps(since, newest.decoded_bytes)
+                    .then_some(sequence)
+            }
+            _ => None,
+        };
+        match kept {
+            Some(sequence) => {
+                sorted.kept_from = sorted.kept_from.min(sequence);
+                sorted.kept.push(cut);
+            }
+            None => sorted.retired.push(cut),
+        }
+    }
+    Ok(sorted)
+}
+
+/// The bytes of the log between an older cut and the newest, which do not
+/// change while both are published, read once per pair.
+#[derive(Debug, Default)]
+pub(crate) struct SpanMeter {
+    measured: BTreeMap<(u64, u64), u64>,
+}
+
+impl SpanMeter {
+    pub(crate) fn between(
+        &mut self,
+        older: u64,
+        newest: u64,
+        bytes_between: impl FnOnce(u64, u64) -> Result<u64, LogError>,
+    ) -> Result<u64, LogError> {
+        if let Some(bytes) = self.measured.get(&(older, newest)) {
+            return Ok(*bytes);
+        }
+        let bytes = bytes_between(older, newest)?;
+        self.measured.insert((older, newest), bytes);
+        Ok(bytes)
+    }
+
+    /// Forgets every span that does not end at `newest`.
+    pub(crate) fn ending_at(&mut self, newest: u64) {
+        self.measured.retain(|(_, to), _| *to == newest);
+    }
 }
 
 /// Raises the log's retention floor from `retained` toward `floor`, one
@@ -198,6 +298,104 @@ impl TailMeter {
 mod tests {
     use super::*;
 
+    fn newest(sequence: u64, decoded_bytes: u64) -> NewestCut {
+        NewestCut {
+            cursor: OpaqueCursor::parse("newest").unwrap(),
+            sequence,
+            cut_at: None,
+            decoded_bytes,
+        }
+    }
+
+    fn keeping(keep_ratio: f64) -> RecutPolicy {
+        RecutPolicy {
+            keep_ratio,
+            ..RecutPolicy::default()
+        }
+    }
+
+    #[test]
+    fn an_older_cut_is_kept_while_the_log_since_it_holds_at_most_the_keep_ratio() {
+        let policy = keeping(0.25);
+        assert!(policy.keeps(250, 1_000));
+        assert!(!policy.keeps(251, 1_000));
+        assert!(!keeping(0.0).keeps(0, 1_000));
+        // The log since cut 10 is the 200 bytes up to the newest cut at 40
+        // and the 50 after it; since cut 5, 20 more.
+        let spans = BTreeMap::from([(10, 200), (5, 220)]);
+        let sorted = sort_older_cuts(
+            &policy,
+            &newest(40, 1_000),
+            50,
+            1,
+            vec![("a", Some(10)), ("b", Some(5))],
+            |sequence| Ok(spans[&sequence]),
+        )
+        .unwrap();
+        assert_eq!(
+            sorted,
+            OlderCuts {
+                kept_from: 10,
+                kept: vec!["a"],
+                retired: vec!["b"]
+            }
+        );
+    }
+
+    #[test]
+    fn a_cut_the_log_no_longer_follows_or_cannot_place_is_retired() {
+        let sorted = sort_older_cuts(
+            &keeping(0.25),
+            &newest(40, 1_000),
+            0,
+            12,
+            vec![("trimmed", Some(10)), ("held", Some(11)), ("unread", None)],
+            |_| Ok(0),
+        )
+        .unwrap();
+        assert_eq!(
+            sorted,
+            OlderCuts {
+                kept_from: 11,
+                kept: vec!["held"],
+                retired: vec!["trimmed", "unread"]
+            }
+        );
+    }
+
+    #[test]
+    fn a_keep_ratio_of_zero_retires_every_older_cut_and_measures_nothing() {
+        let sorted = sort_older_cuts(
+            &keeping(0.0),
+            &newest(40, 1_000),
+            0,
+            1,
+            vec![("a", Some(39))],
+            |_| panic!("nothing is measured"),
+        )
+        .unwrap();
+        assert_eq!(
+            sorted,
+            OlderCuts {
+                kept_from: 40,
+                kept: vec![],
+                retired: vec!["a"]
+            }
+        );
+    }
+
+    #[test]
+    fn a_span_is_read_once_until_the_newest_cut_moves() {
+        let mut spans = SpanMeter::default();
+        assert_eq!(spans.between(10, 40, |_, _| Ok(7)).unwrap(), 7);
+        assert_eq!(
+            spans.between(10, 40, |_, _| panic!("read again")).unwrap(),
+            7
+        );
+        spans.ending_at(50);
+        assert_eq!(spans.between(10, 40, |_, _| Ok(9)).unwrap(), 9);
+    }
+
     #[test]
     fn the_floor_keeps_the_entry_after_the_newest_cut() {
         assert_eq!(retention_floor(40, None), 41);
@@ -216,6 +414,7 @@ mod tests {
         let policy = RecutPolicy {
             tail_ratio: 0.25,
             min_interval: Duration::ZERO,
+            keep_ratio: 0.0,
         };
         assert!(!policy.due(249, 1_000));
         assert!(policy.due(250, 1_000));
@@ -233,6 +432,7 @@ mod tests {
         let policy = RecutPolicy::default();
         assert_eq!(policy.tail_ratio, 1.0 / 32.0);
         assert_eq!(policy.min_interval, Duration::from_secs(60));
+        assert_eq!(policy.keep_ratio, 0.25);
         assert!(!policy.due(31, 1_024));
         assert!(policy.due(32, 1_024));
         assert_eq!(policy.threshold_bytes(1_024), 32);
@@ -243,6 +443,7 @@ mod tests {
         let policy = RecutPolicy {
             tail_ratio: 0.25,
             min_interval: Duration::from_secs(60),
+            keep_ratio: 0.0,
         };
         let minute = 60_000_000;
         assert!(policy.rested(None, minute, None));

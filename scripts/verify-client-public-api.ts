@@ -109,7 +109,7 @@ interface ClientGeneratedRuntime {
 // The digest of the built `@calque/react` declaration graph. It covers the
 // declarations' doc comments as well as their shapes.
 const CURRENT_REACT_DECLARATION_GRAPH_SHA256 =
-  "b7f7e0dec8134a194d06f64a3081266fdaae487ac08a3b70af8d013d1fb26cc5";
+  "4614b452214fc21dcc27743c36d2fed56b49df390ff0469d0652a64a329b3f1d";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const clientRoot = join(root, "client/packages/client");
@@ -212,6 +212,7 @@ assertExactInterfacePropertyTypes(clientDeclaration, "SyncClientOptions", {
   // The authority's Ed25519 key comes from configuration, never from the plan.
   // A named type lets the pin hold it to two strings with no callback.
   grantVerificationKey: { optional: true, type: "GrantVerificationKey" },
+  storeRows: { optional: true, type: "boolean" },
 });
 assertExact(
   "GrantVerificationKey members",
@@ -582,7 +583,11 @@ for (const [module, imports] of [
   ["dist/bootstrap-start.js", []],
   ["dist/bootstrap-start-script.js", []],
   ["dist/bootstrap-render-entry.js", ["./bootstrap-render.js"]],
-  ["dist/bootstrap-render.js", ["./bootstrap-start.js"]],
+  [
+    "dist/bootstrap-render.js",
+    ["./bootstrap-start.js", "./stored-rows-hint.js"],
+  ],
+  ["dist/stored-rows-hint.js", ["./bootstrap-start.js"]],
   [
     "dist/vite.js",
     [

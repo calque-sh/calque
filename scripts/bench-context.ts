@@ -113,6 +113,7 @@ export function showPage(run: Run): void {
     connection: run.connection,
     renderedPlan: rendersPlan(run.options),
     backendEndpoint: `${run.server.endpoint}/`,
+    immutableAssets: run.options.returning,
   });
 }
 

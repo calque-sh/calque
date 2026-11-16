@@ -536,6 +536,9 @@ struct Plan {
     activation_cursor: String,
     /// The cursor the plan's artifact was cut at, where its catch-up starts.
     snapshot_cursor: String,
+    /// What a page that stored the plan's artifact names it by.
+    decoded_sha256: String,
+    decoded_bytes: u64,
     table_id: String,
     id_column: u32,
     title_column: u32,
@@ -587,6 +590,11 @@ impl Plan {
                 .as_str()
                 .unwrap()
                 .to_owned(),
+            decoded_sha256: value["artifacts"][0]["decodedSha256"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            decoded_bytes: value["artifacts"][0]["decodedBytes"].as_u64().unwrap(),
             table_id: table["tableId"].as_str().unwrap().to_owned(),
             id_column: column("id"),
             title_column: column("title"),
@@ -596,10 +604,21 @@ impl Plan {
 }
 
 fn bootstrap_response(port: u16, grant: &str, relation: &str) -> HttpResponse {
+    bootstrap_response_holding(port, grant, relation, &[])
+}
+
+/// The response to a page that holds the artifacts whose decoded SHA-256s
+/// `held` names.
+fn bootstrap_response_holding(
+    port: u16,
+    grant: &str,
+    relation: &str,
+    held: &[&str],
+) -> HttpResponse {
     let document = serde_json::json!({
         "protocolVersion": 1,
         "requiredTables": [relation],
-        "cachedArtifactHints": [],
+        "cachedArtifactHints": held,
         "acceptedEncodings": ["zstd", "identity"],
         "memoryBudgetBytes": 1_073_741_824_u64,
         "clientHeapReserveBytes": 67_108_864_u64,
@@ -622,7 +641,11 @@ fn bootstrap_response(port: u16, grant: &str, relation: &str) -> HttpResponse {
 }
 
 fn bootstrap(port: u16, grant: &str, relation: &str) -> Plan {
-    let response = bootstrap_response(port, grant, relation);
+    bootstrap_holding(port, grant, relation, &[])
+}
+
+fn bootstrap_holding(port: u16, grant: &str, relation: &str, held: &[&str]) -> Plan {
+    let response = bootstrap_response_holding(port, grant, relation, held);
     assert_eq!(response.status, 200, "{}", response.text());
     Plan::parse(&response.json())
 }
@@ -1029,6 +1052,45 @@ fn drain(port: u16, plan: &Plan, from: &str) -> String {
 }
 
 /// Every title `plan` is delivered from `from` through the durable head.
+/// Every title a page installing `plan` reads: the catch-up from the
+/// artifact's cut through the activation cursor, as the client asks for it,
+/// then the live polls from there to the head.
+fn titles_after_install(port: u16, plan: &Plan) -> Vec<String> {
+    let deadline = Instant::now() + DELIVERY_TIMEOUT;
+    let mut cursor = plan.snapshot_cursor.clone();
+    let mut titles = Vec::new();
+    while cursor != plan.activation_cursor {
+        let request = change::ChangeRequest {
+            through_cursor_inclusive: Some(change::Cursor {
+                token: plan.activation_cursor.as_bytes().to_vec(),
+            }),
+            tables: vec![change::TableSubscription {
+                table_id: plan.table_id.clone(),
+                shard_snapshot_cursor: Some(change::Cursor {
+                    token: plan.snapshot_cursor.as_bytes().to_vec(),
+                }),
+            }],
+            ..live_request(plan, &cursor, Duration::ZERO)
+        };
+        let response = http(
+            port,
+            "POST",
+            "/v1/changes",
+            &[("content-type", CHANGE_CONTENT_TYPE.to_owned())],
+            Some(request.encode_to_vec().as_slice()),
+        );
+        let batch = read_batch(plan, &response);
+        titles.extend(batch.titles);
+        cursor = batch.through;
+        assert!(
+            Instant::now() < deadline,
+            "the plan never reached its fence"
+        );
+    }
+    titles.extend(titles_through_head(port, plan, &plan.activation_cursor));
+    titles
+}
+
 fn titles_through_head(port: u16, plan: &Plan, from: &str) -> Vec<String> {
     let deadline = Instant::now() + DELIVERY_TIMEOUT;
     let mut cursor = from.to_owned();
@@ -2625,6 +2687,186 @@ fn a_re_cut_hands_later_plans_a_newer_cut_and_keeps_live_plans_whole() {
         titles_through_head(port, &before, &before.snapshot_cursor),
         tail
     );
+
+    assert!(serving.shutdown(), "serve must exit cleanly on SIGTERM");
+    fixture.drop_source();
+}
+
+/// A page that holds an older cut is planned it, and catches up from it,
+/// while the changes since it hold at most the keep ratio of the newest
+/// artifact. Once they hold more and no plan pins it, the cut is retired, the
+/// log is trimmed past it, and the page is planned the newest cut.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn a_page_catches_up_from_the_older_cut_it_holds_until_the_keep_ratio_retires_it() {
+    let _exclusive = exclusive();
+    let fixture = Fixture::new("keepcut");
+    fixture.seed();
+    let relation = fixture.relation();
+    let metrics_port = reserved_port();
+    let metrics_address = format!("127.0.0.1:{metrics_port}");
+    let serving = serve_with(
+        &fixture,
+        1,
+        &[
+            "--recut-tail-ratio",
+            "0.000001",
+            "--recut-min-interval",
+            "0",
+            "--recut-keep-ratio",
+            "1",
+            "--metrics-bind-address",
+            &metrics_address,
+        ],
+    );
+    let port = serving.port;
+    // No plan outlives the wait below, so neither a pin nor a retention
+    // lease keeps a cut once the changes since it pass the ratio.
+    let lifetime = Duration::from_secs(5);
+    let grant = || fixture.grant_for(1, lifetime.as_secs());
+    let mut control = Client::connect(&database_url(), NoTls).unwrap();
+    let mut log_bytes_after = |sequence: i64| -> u64 {
+        let bytes: i64 = control
+            .query_one(
+                "SELECT coalesce(sum(octet_length(entry_bytes)), 0)::bigint
+                   FROM calque_control.canonical_log_record
+                  WHERE source_id = $1 AND sequence > $2",
+                &[&fixture.source_id(), &sequence],
+            )
+            .unwrap()
+            .get(0);
+        u64::try_from(bytes).unwrap()
+    };
+
+    let stored = bootstrap(port, &grant(), &relation);
+    fixture.insert_together(10, &["kept 10".to_owned()]);
+    wait_for_sample(metrics_port, "calque_artifact_recuts_total", |recuts| {
+        recuts >= 1.0
+    });
+    wait_for_sample(
+        metrics_port,
+        "calque_canonical_log_tail_entries",
+        |entries| entries == 0.0,
+    );
+    // The stored plan's pin and retention lease end with it, and the passes
+    // after that keep the cut only by the ratio.
+    std::thread::sleep(lifetime + Duration::from_secs(3));
+    // The log holds at least the changes since the stored cut, and they are
+    // within the ratio.
+    assert!(
+        log_bytes_after(0) <= stored.decoded_bytes,
+        "the fixture's first change must stay under its artifact"
+    );
+    assert!(sample(metrics_port, "calque_canonical_log_retained_entries") >= 1.0);
+
+    let held = bootstrap_holding(port, &grant(), &relation, &[&stored.decoded_sha256]);
+    assert_eq!(
+        held.snapshot_cursor, stored.snapshot_cursor,
+        "the page is planned the cut it holds"
+    );
+    assert_eq!(held.decoded_sha256, stored.decoded_sha256);
+    assert_ne!(held.activation_cursor, held.snapshot_cursor);
+    assert_eq!(titles_after_install(port, &held), ["kept 10"]);
+    for path in &held.object_paths {
+        assert_eq!(http(port, "GET", path, &[], None).status, 200, "{path}");
+    }
+    let fresh = bootstrap(port, &grant(), &relation);
+    assert_ne!(
+        fresh.snapshot_cursor, stored.snapshot_cursor,
+        "a page that holds nothing is planned the newest cut"
+    );
+
+    let before: i64 = Client::connect(&database_url(), NoTls)
+        .unwrap()
+        .query_one(
+            "SELECT coalesce(max(sequence), 0) FROM calque_control.canonical_log_record
+              WHERE source_id = $1",
+            &[&fixture.source_id()],
+        )
+        .unwrap()
+        .get(0);
+    let past = (20..120)
+        .map(|row| format!("past the ratio {row}"))
+        .collect::<Vec<_>>();
+    fixture.insert_together(20, &past);
+    wait_for_sample(metrics_port, "calque_artifact_recuts_total", |recuts| {
+        recuts >= 2.0
+    });
+    assert!(
+        log_bytes_after(before) > stored.decoded_bytes,
+        "the fixture's second change must pass its artifact"
+    );
+    std::thread::sleep(lifetime);
+    wait_for_sample(
+        metrics_port,
+        "calque_canonical_log_retained_entries",
+        |entries| entries == 0.0,
+    );
+
+    let replanned = bootstrap_holding(port, &grant(), &relation, &[&stored.decoded_sha256]);
+    assert_ne!(
+        replanned.snapshot_cursor, stored.snapshot_cursor,
+        "a cut past the keep ratio is not planned"
+    );
+    assert_ne!(replanned.decoded_sha256, stored.decoded_sha256);
+
+    assert!(serving.shutdown(), "serve must exit cleanly on SIGTERM");
+    fixture.drop_source();
+}
+
+/// A cut the keep ratio does not keep is not planned to a page that holds
+/// it, even while an earlier plan still pins it, so no page pins it again and
+/// the log behind it is not held past that plan.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn a_cut_only_a_live_plan_pins_is_not_planned_to_a_page_that_holds_it() {
+    let _exclusive = exclusive();
+    let fixture = Fixture::new("pinnedcut");
+    fixture.seed();
+    let relation = fixture.relation();
+    let metrics_port = reserved_port();
+    let metrics_address = format!("127.0.0.1:{metrics_port}");
+    let serving = serve_with(
+        &fixture,
+        1,
+        &[
+            "--recut-tail-ratio",
+            "0.000001",
+            "--recut-min-interval",
+            "0",
+            "--recut-keep-ratio",
+            "0",
+            "--metrics-bind-address",
+            &metrics_address,
+        ],
+    );
+    let port = serving.port;
+    let grant = || fixture.grant_for(1, 600);
+
+    let stored = bootstrap(port, &grant(), &relation);
+    fixture.insert_together(10, &["after the stored cut".to_owned()]);
+    wait_for_sample(metrics_port, "calque_artifact_recuts_total", |recuts| {
+        recuts >= 1.0
+    });
+    wait_for_sample(
+        metrics_port,
+        "calque_canonical_log_tail_entries",
+        |entries| entries == 0.0,
+    );
+    for path in &stored.object_paths {
+        assert_eq!(
+            http(port, "GET", path, &[], None).status,
+            200,
+            "the stored plan still pins its cut: {path}"
+        );
+    }
+
+    let held = bootstrap_holding(port, &grant(), &relation, &[&stored.decoded_sha256]);
+    assert_ne!(
+        held.snapshot_cursor, stored.snapshot_cursor,
+        "a cut only a plan pins is not planned"
+    );
+    assert_ne!(held.decoded_sha256, stored.decoded_sha256);
 
     assert!(serving.shutdown(), "serve must exit cleanly on SIGTERM");
     fixture.drop_source();

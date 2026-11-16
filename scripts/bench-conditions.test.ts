@@ -23,6 +23,7 @@ import {
   probeSessionSql,
   SEED_ORDER,
   tailSql,
+  betweenVisitsSql,
 } from "./bench-oracle.ts";
 import {
   CONTENT_COLUMNS,
@@ -458,6 +459,51 @@ test("the tail's n-th transaction rewrites the rows the load's n-th does, and co
     assert.deepEqual(tailRows, loadRows, `transaction ${String(n)}`);
   }
   assert.throws(() => tailSql(0), /at least one transaction/u);
+});
+
+test("the writes between visits mark the load's rows in the first half and unmark the same rows in the second", () => {
+  const sql = betweenVisitsSql(6);
+  const loops = [
+    ...sql.matchAll(/FOR n IN 0\.\.(\d+) LOOP\n([^]*?)\n {2}END LOOP;/gu),
+  ];
+  assert.deepEqual(
+    loops.map((loop) => loop[1]),
+    ["2", "2"],
+  );
+  const [marking = "", unmarking = ""] = loops.map((loop) => loop[2] ?? "");
+  assert.deepEqual(
+    [...marking.matchAll(/ SET (\w+) = (.+?) WHERE/gu)].map((match) => [
+      match[1],
+      match[2],
+    ]),
+    [
+      ["title", "'~' || title"],
+      ["body", "'~' || body"],
+    ],
+  );
+  assert.deepEqual(
+    [...unmarking.matchAll(/ SET (\w+) = (.+?) WHERE/gu)].map((match) => [
+      match[1],
+      match[2],
+    ]),
+    [
+      ["title", "substr(title, 2)"],
+      ["body", "substr(body, 2)"],
+    ],
+  );
+  const rows = (loop: string) =>
+    [...loop.matchAll(/WHERE (.+?);/gu)].map((match) => match[1]);
+  assert.deepEqual(rows(unmarking), rows(marking));
+  assert.deepEqual(
+    rows(marking),
+    [...tailSql(1).matchAll(/WHERE (bench_index .+?);/gu)].map(
+      (match) => match[1],
+    ),
+  );
+  for (const loop of [marking, unmarking]) assert.match(loop, /COMMIT;$/u);
+  assert.ok(!/INSERT|DELETE/u.test(sql));
+  for (const odd of [0, 1, 3, -2, 2.5])
+    assert.throws(() => betweenVisitsSql(odd), /an even number/u, String(odd));
 });
 
 test("the load changes no key, so it runs on either dataset", () => {

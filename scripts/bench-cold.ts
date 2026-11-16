@@ -1,9 +1,20 @@
 /// <reference lib="dom" />
 /** The reference pass and the cold samples. */
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CDPSession } from "playwright";
-import { brotliSample, type BrotliSample } from "./bench-brotli.ts";
+import {
+  brotliSample,
+  type BrotliSample,
+  plannedArtifact,
+} from "./bench-brotli.ts";
 import { startScreencast } from "./bench-browser.ts";
 import {
   framesRecord,
@@ -11,6 +22,7 @@ import {
   type RequestRecord,
 } from "./bench-capture.ts";
 import {
+  expectedObject,
   referenceOf,
   type ReferencePass,
   type Run,
@@ -32,6 +44,7 @@ import {
   withDeadline,
 } from "./bench-launch.ts";
 import { chartText, pageOracle } from "./bench-oracle.ts";
+import { requestPlan } from "./bench-page-server.ts";
 import { type QueryOutcome, queryPage } from "./bench-query.ts";
 import {
   artifactRetryMarks,
@@ -71,6 +84,13 @@ import {
   type Session,
   tNavMs,
 } from "./bench-session.ts";
+import {
+  awaitStoreOutcome,
+  readPlanKey,
+  storedRowsRecord,
+  type StoredRowsRecord,
+} from "./bench-stored-rows.ts";
+import { type BetweenVisitsRecord, writeBetweenVisits } from "./bench-tail.ts";
 import { delay } from "./demo-process.ts";
 
 const TRACE_CATEGORIES = ["devtools.timeline", "v8", "toplevel"];
@@ -427,12 +447,102 @@ export interface ColdResult extends TakenSample {
    * absent where the run's pages load none (`servedBrotli`).
    */
   readonly brotli?: BrotliSample;
+  readonly storedRows: StoredRowsRecord;
+  /** The object the run planned when the sample was taken (`expectedObject`). */
+  readonly expectedObjectUrl: string | null;
 }
 
+/**
+ * The unmeasured visit that fills a returning sample's profile: what ended it
+ * short of its stable paint, if anything did, and what its page stored.
+ */
+interface FirstVisit {
+  readonly failure: string | null;
+  readonly storedRows: StoredRowsRecord | null;
+}
+
+/**
+ * A cold load in a fresh context, or, under `--returning`, a returning one:
+ * an unmeasured visit fills a new profile directory, its browser closes,
+ * `--between-visits` writes and waits for calque's re-cut, and the sample
+ * measures a browser launched again on that directory.
+ */
 export async function coldSample(
   run: Run,
   kind: ColdKind,
   n: number,
+): Promise<ColdResult> {
+  if (!run.options.returning) return await measuredSample(run, kind, n, null);
+  const profile = mkdtempSync(join(tmpdir(), "calque-bench-profile-"));
+  try {
+    const firstVisit = await unmeasuredVisit(run, profile);
+    const betweenVisits =
+      run.options.betweenVisits === undefined
+        ? null
+        : await writeBetween(run, run.options.betweenVisits);
+    return await measuredSample(run, kind, n, {
+      profile,
+      firstVisit,
+      betweenVisits,
+    });
+  } finally {
+    rmSync(profile, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The writes between a sample's visits. calque then plans a newer cut to a
+ * page that names none, so the run's planned object moves to it.
+ */
+async function writeBetween(
+  run: Run,
+  transactions: number,
+): Promise<BetweenVisitsRecord> {
+  if (!run.server || !run.connection)
+    throw new Error("--between-visits needs the serving calque");
+  const record = await writeBetweenVisits(run.server, run, transactions);
+  run.calqueArtifact = plannedArtifact(
+    await requestPlan(run.connection, `${run.server.endpoint}/`),
+  );
+  return record;
+}
+
+async function unmeasuredVisit(run: Run, profile: string): Promise<FirstVisit> {
+  showPage(run);
+  const session = await openSession(run, false, profile);
+  try {
+    await navigate(run, session);
+    const failure = await awaitStablePaint(session, referenceOf(run).full);
+    await session.capture.stop();
+    await session.rss.stop();
+    if (failure !== null) return { failure, storedRows: null };
+    await awaitStoreOutcome(session.page);
+    const facts = await readPageFacts(session.page);
+    return {
+      failure: reportedError(facts, session.pageErrors),
+      storedRows: storedRowsRecord({
+        marks: facts.marks,
+        coldMs: null,
+        requests: session.network.totals().byRequest,
+        resources: facts.resources,
+        pageOrigin: run.pageOrigin,
+        planKey: await readPlanKey(session.page),
+      }),
+    };
+  } finally {
+    await closeSession(session);
+  }
+}
+
+async function measuredSample(
+  run: Run,
+  kind: ColdKind,
+  n: number,
+  returning: {
+    readonly profile: string;
+    readonly firstVisit: FirstVisit;
+    readonly betweenVisits: BetweenVisitsRecord | null;
+  } | null,
 ): Promise<ColdResult> {
   const source = run.source;
   if (!source) throw new Error("a cold sample needs the source state");
@@ -441,7 +551,7 @@ export async function coldSample(
   const before = readEnvironment(run.postgres);
   const name = `${kind}-${String(n)}`;
   showPage(run);
-  const session = await openSession(run, true);
+  const session = await openSession(run, true, returning?.profile ?? null);
   const stalls = new RunnerStalls();
   try {
     if (kind === "traced")
@@ -475,6 +585,9 @@ export async function coldSample(
       failure === NO_PRESENT_FAILURE
         ? await deadlineReadings(run, session, frames.at(-1))
         : null;
+    // After the readings above and before any below, so the store's last
+    // writes move none of them and the marks below hold its outcome.
+    if (failure === null) await awaitStoreOutcome(session.page);
     const facts = await readPageFacts(session.page);
     const shown = await readShown(session.page);
     // A page that carries a bearer must never be cached.
@@ -493,7 +606,13 @@ export async function coldSample(
             navigationMs: navigation,
             signals,
           });
-    const stopped = failure ?? reportedError(facts, session.pageErrors);
+    const firstFailure = returning?.firstVisit.failure ?? null;
+    const stopped =
+      (firstFailure === null
+        ? null
+        : `the unmeasured visit: ${firstFailure}`) ??
+      failure ??
+      reportedError(facts, session.pageErrors);
     const oracle =
       stopped === null
         ? await pageOracle(
@@ -560,6 +679,14 @@ export async function coldSample(
           })
         : null;
     const retryMarks = artifactRetryMarks(facts.marks);
+    const storedRows = storedRowsRecord({
+      marks: facts.marks,
+      coldMs,
+      requests: network.byRequest,
+      resources: facts.resources,
+      pageOrigin: run.pageOrigin,
+      planKey: await readPlanKey(session.page),
+    });
     const record = {
       kind,
       n,
@@ -610,6 +737,9 @@ export async function coldSample(
       frames: framesRecord(frames, session.capture),
       environment: { before, after },
       query: query?.record ?? null,
+      storedRows,
+      firstVisit: returning?.firstVisit ?? null,
+      betweenVisits: returning?.betweenVisits ?? null,
       ...(brotliRead === null ? {} : { brotli: brotliRead }),
     };
     return {
@@ -633,6 +763,8 @@ export async function coldSample(
       requests: network.byRequest,
       trace,
       query,
+      storedRows,
+      expectedObjectUrl: expectedObject(run)?.objectUrl ?? null,
       ...(brotliRead === null ? {} : { brotli: brotliRead }),
     };
   } finally {

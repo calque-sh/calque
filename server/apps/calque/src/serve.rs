@@ -306,6 +306,7 @@ async fn serve_configured(
         max_inflight_requests: command.max_inflight_requests,
     });
     let change_tail_bytes = command.change_tail_bytes;
+    let no_stored_rows = command.no_stored_rows;
     let recut_policy = command.recut.policy();
     let reserved_listener = ReservedListener::bind(binding.socket_address(), "--port")?;
     let reserved_metrics_listener = metrics_binding
@@ -534,6 +535,7 @@ async fn serve_configured(
         max_open_streams,
         change_tail_bytes,
         max_change_batch_bytes: 8 * 1024 * 1024,
+        stored_rows: !no_stored_rows,
         memory: LocalMemoryPolicy {
             active_artifact_capacity_bytes: LOCAL_ACTIVE_ARTIFACT_CAPACITY_BYTES,
             staging_overlap_bytes: LOCAL_ACTIVE_ARTIFACT_CAPACITY_BYTES,

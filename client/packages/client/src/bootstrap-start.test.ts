@@ -15,6 +15,7 @@ import {
   type BootstrapParameters,
   type BootstrapRequest,
   type BootstrapStart,
+  bootstrapInit,
   bootstrapUrl,
   brotliDecoderRuns,
   DECODING_ARTIFACT_ENCODINGS,
@@ -457,6 +458,27 @@ describe("a bootstrap request the page starts", () => {
     expect(Object.getOwnPropertySymbols(globalThis)).not.toContain(slot);
   });
 
+  it("names the held copy only in a request that installs an artifact", () => {
+    const sent = parameters();
+    const hints = (init: RequestInit) =>
+      (JSON.parse(String(init.body)) as { cachedArtifactHints: unknown })
+        .cachedArtifactHints;
+    const digest = "5a".repeat(32);
+    expect(hints(bootstrapInit(sent, "instance"))).toEqual([]);
+    expect(hints(bootstrapInit(sent, "instance", { held: digest }))).toEqual([
+      digest,
+    ]);
+    // A renewal installs nothing.
+    expect(
+      hints(
+        bootstrapInit(sent, "instance", {
+          held: digest,
+          resident: { proof: "proof", tables: ["public.issues"], cursor: "c" },
+        }),
+      ),
+    ).toEqual([]);
+  });
+
   it("names the parameter in which a request differs from the session's, and none for an equal one", () => {
     const own = parameters();
     expect(differingBootstrapParameter(parameters(), own)).toBeUndefined();
@@ -896,11 +918,12 @@ describe("the starter a page inlines in its head", () => {
     vi.restoreAllMocks();
   });
 
-  /** A document holding these element texts by id. */
-  function page(elements: Readonly<Record<string, string>>) {
+  /** A document holding these element texts by id, and `cookie`. */
+  function page(elements: Readonly<Record<string, string>>, cookie?: string) {
     vi.stubGlobal("document", {
       getElementById: (id: string) =>
         id in elements ? { textContent: elements[id] } : null,
+      ...(cookie === undefined ? {} : { cookie }),
     });
   }
 
@@ -922,9 +945,9 @@ describe("the starter a page inlines in its head", () => {
    * What each path sent and left in the slot on a page rendered for `start`,
    * with `startBootstrap` reading the connection and the plan from the page.
    */
-  function bothPaths(start: BootstrapStart) {
+  function bothPaths(start: BootstrapStart, cookie?: string) {
     const elements = rendered(start);
-    page(elements);
+    page(elements, cookie);
     const own = stubFetch();
     startBootstrap(
       JSON.parse(elements["calque-bootstrap"] ?? "") as BootstrapRequest,
@@ -1023,6 +1046,42 @@ describe("the starter a page inlines in its head", () => {
     expect(body.deviceId).toBe(sent);
     if (sent === INSTANCE_ID)
       expect(storage.setItem).toHaveBeenCalledWith("calque-device-id", sent);
+  });
+
+  it.each([
+    ["the copy the cookie names", "theme=dark; calque-stored-rows=K.D", ["D"]],
+    [
+      "the first well-formed copy",
+      "calque-stored-rows=K; calque-stored-rows=K.D",
+      ["D"],
+    ],
+    ["no copy for a key id alone", "calque-stored-rows=K", []],
+    ["no copy for an upper-case digest", "calque-stored-rows=K.U", []],
+    ["no copy for another cookie", "calque-stored-rows-old=K.D", []],
+    ["no copy without a cookie", undefined, []],
+  ])("names %s, as startBootstrap does", (_case, template, hints) => {
+    const key = "0123456789abcdef0123456789abcdef";
+    const digest = "5a".repeat(32);
+    const cookie = template
+      ?.replaceAll("K", key)
+      .replaceAll("D", digest)
+      .replaceAll("U", digest.toUpperCase());
+    const { fromCall, fromScript } = bothPaths(
+      {
+        endpoint: "https://sync.test/root",
+        bearerToken: "token",
+        requiredTables: ["public.issues"],
+        memoryBudgetBytes: MEMORY_BUDGET_BYTES,
+      },
+      cookie,
+    );
+    expect(fromScript.sent).toEqual(fromCall.sent);
+    const body = JSON.parse(String(fromScript.sent[0]?.[1]?.body)) as {
+      cachedArtifactHints: unknown;
+    };
+    expect(body.cachedArtifactHints).toEqual(
+      hints.map((hint) => (hint === "D" ? digest : hint)),
+    );
   });
 
   it.each(ACCEPTED_ENDPOINTS)(

@@ -3,7 +3,9 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import {
+  createColumnarBrowserDecoder,
   createColumnarBrowserHasher,
+  createColumnarBrowserStore,
   createColumnarBrowserWorker,
 } from "./worker.js";
 
@@ -17,6 +19,16 @@ const workers = [
     create: createColumnarBrowserHasher,
     entry: "columnar-browser-hasher-entry.js",
     name: "calque-hasher",
+  },
+  {
+    create: createColumnarBrowserDecoder,
+    entry: "columnar-browser-decoder-entry.js",
+    name: "calque-decoder",
+  },
+  {
+    create: createColumnarBrowserStore,
+    entry: "columnar-browser-store-entry.js",
+    name: "calque-store",
   },
 ] as const;
 
