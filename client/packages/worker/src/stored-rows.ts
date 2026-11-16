@@ -484,6 +484,8 @@ export class StoredRowsWriter {
   readonly #outcome = Promise.withResolvers<StoreOutcome>();
   /** What the store worker answered, or `abandoned` if it could not. */
   readonly outcome = awaitedLater(this.#outcome.promise);
+  #begun = false;
+  #committing = false;
   #sent = false;
 
   constructor(
@@ -505,7 +507,12 @@ export class StoredRowsWriter {
     if (!worker) return;
     worker.addEventListener("message", (event) => {
       const data = (event as MessageEvent<unknown>).data as
-        Partial<StoreOutcome> | undefined;
+        { readonly type: "begun" } | Partial<StoreOutcome> | undefined;
+      if (data?.type === "begun") {
+        this.#begun = true;
+        if (this.#committing) this.#send("commit");
+        return;
+      }
       this.#settle(
         data?.type === "committed"
           ? { type: "committed" }
@@ -532,9 +539,14 @@ export class StoredRowsWriter {
     );
   }
 
-  /** The page activated the artifact: keep it. */
+  /**
+   * The page activated the artifact: keep it. Sent once the store worker has
+   * read the store's epochs, so that an erasure before then still reaches it
+   * as `abandon`, and one after it is caught at its commit.
+   */
   commit(): Promise<StoreOutcome> {
-    this.#send("commit");
+    this.#committing = true;
+    if (this.#begun) this.#send("commit");
     return this.outcome;
   }
 

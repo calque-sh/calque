@@ -2815,8 +2815,9 @@ fn a_page_catches_up_from_the_older_cut_it_holds_until_the_keep_ratio_retires_it
 }
 
 /// A cut the keep ratio does not keep is not planned to a page that holds
-/// it, even while an earlier plan still pins it, so no page pins it again and
-/// the log behind it is not held past that plan.
+/// it, from the re-cut that replaces it on, even while an earlier plan still
+/// pins it, so no page pins it again and the log behind it is not held past
+/// that plan.
 #[test]
 #[ignore = "requires TEST_DATABASE_URL"]
 fn a_cut_only_a_live_plan_pins_is_not_planned_to_a_page_that_holds_it() {
@@ -2848,6 +2849,13 @@ fn a_cut_only_a_live_plan_pins_is_not_planned_to_a_page_that_holds_it() {
     wait_for_sample(metrics_port, "calque_artifact_recuts_total", |recuts| {
         recuts >= 1.0
     });
+    // Usually before the next pass, while the last one still has the stored
+    // cut as the newest.
+    let replaced = bootstrap_holding(port, &grant(), &relation, &[&stored.decoded_sha256]);
+    assert_ne!(
+        replaced.snapshot_cursor, stored.snapshot_cursor,
+        "the cut a re-cut replaced is not planned at a keep ratio of 0"
+    );
     wait_for_sample(
         metrics_port,
         "calque_canonical_log_tail_entries",

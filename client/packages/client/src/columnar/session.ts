@@ -177,6 +177,8 @@ export class ColumnarSession {
   readonly #store: RowStore;
   /** The writers of loads that have not kept or dropped their copy yet. */
   readonly #storing = new Set<RowWriter>();
+  /** Counts `clearStoredRows` calls, so a lookup one overlapped keeps nothing. */
+  #clears = 0;
   readonly #collections: readonly GeneratedClientCollectionDescriptor[];
   readonly #columns = new Map<
     string,
@@ -520,6 +522,7 @@ export class ColumnarSession {
    * in flight. The mount in memory stays.
    */
   async clearStoredRows(): Promise<void> {
+    this.#clears += 1;
     for (const writer of this.#storing) writer.abandon();
     this.#storing.clear();
     await this.#store.erase();
@@ -1892,13 +1895,17 @@ export class ColumnarSession {
       chunkBytes: chunks.bytes,
       chunkSha256: chunks.sha256,
     };
+    const clears = this.#clears;
     try {
       const key = await this.#store.importKey(encoded);
       try {
         const copy = await this.#store.open(key, stored);
         if (copy) {
           mark("store:hit");
-          return { copy, keyId: key.keyId };
+          // A clear since the lookup began erases the copy a hint would name.
+          return clears === this.#clears
+            ? { copy, keyId: key.keyId }
+            : { copy };
         }
       } catch (error) {
         if (!(error instanceof StoredRowsError)) throw error;
@@ -1906,6 +1913,7 @@ export class ColumnarSession {
         await this.#store.erase();
       }
       mark("store:miss");
+      if (clears !== this.#clears) return {};
       const writer = this.#store.writer(key, stored);
       this.#storing.add(writer);
       return { writer };

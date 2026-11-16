@@ -508,13 +508,13 @@ impl LocalBackend {
                 .partition_value()
                 .and_then(|tenant| tenants.unchanged(tenant))
         });
-        let request = BootstrapRequest {
+        let mut request = BootstrapRequest {
             required_tables,
             resident_state_proof: request.resident_state_proof,
             resident_tables: request.resident_tables,
             resident_cursor: request.resident_cursor,
             authorization,
-            cached_artifact_hints: self.plannable_hints(request.cached_artifact_hints),
+            cached_artifact_hints: request.cached_artifact_hints,
             stored_rows: self.inner.stored_rows,
             accepted_encodings: request.accepted_encodings,
             // The client ships one artifact decoder and does not negotiate,
@@ -555,8 +555,12 @@ impl LocalBackend {
             )
             .map_err(|_| BootstrapHttpError::Unavailable)?;
             let mut catalog = planner_backend.inner.catalog.blocking_lock();
+            // A hint of a cut only a plan's pin keeps would pin it again.
+            request
+                .cached_artifact_hints
+                .retain(|hint| catalog.plannable_cuts.contains(hint));
             let result = runtime.block_on(BootstrapPlanner::plan(
-                &mut catalog,
+                &mut catalog.artifacts,
                 planner_backend.inner.store.as_ref(),
                 &planner_backend.inner.artifact_resolver,
                 &planner_backend.inner.activated,
@@ -575,7 +579,7 @@ impl LocalBackend {
         let expires_at =
             parse_expiry_micros(&plan.expires_at).map_err(|_| BootstrapHttpError::Unavailable)?;
         let mut catalog = self.inner.catalog.lock().await;
-        let artifact_grants = artifact_grants(&mut catalog, &plan, expires_at)
+        let artifact_grants = artifact_grants(&mut catalog.artifacts, &plan, expires_at)
             .map_err(|_| BootstrapHttpError::Unavailable)?;
         drop(catalog);
 

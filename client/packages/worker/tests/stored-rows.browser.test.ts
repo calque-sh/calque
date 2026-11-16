@@ -323,6 +323,42 @@ describe("the stored copy", () => {
     expect(await readBody(key, artifact)).toEqual(BODY);
   });
 
+  it("is not kept by a store worker that began after the page activated and erased", async () => {
+    const key = await newKey();
+    const artifact = await artifactOf(BODY);
+    // A store worker slow to start: the page's messages reach it once
+    // `started` settles, in the order the page sent them.
+    let start!: () => void;
+    const started = new Promise<void>((resolve) => {
+      start = resolve;
+    });
+    let delivered = started;
+    const slow = (): StoreWorker => {
+      const worker = storeWorker();
+      return {
+        addEventListener: (type, listener) => {
+          worker.addEventListener(type, listener);
+        },
+        terminate: () => worker.terminate(),
+        postMessage: (message, transfer) => {
+          delivered = delivered.then(() => {
+            worker.postMessage(message, transfer ?? []);
+          });
+        },
+      };
+    };
+    const writer = new StoredRowsWriter(slow, key, artifact);
+    sendChunks(writer, BODY);
+    const outcome = writer.commit();
+    // clearStoredRows: the load's writer is abandoned, then the store erased.
+    writer.abandon();
+    await eraseStoredRows();
+    start();
+
+    expect(await outcome).toMatchObject({ type: "abandoned" });
+    expect(await openStoredCopy(key, artifact)).toBeUndefined();
+  });
+
   it("is erased, with every file it wrote", async () => {
     const key = await newKey();
     const artifact = await artifactOf(BODY);

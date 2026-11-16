@@ -221,7 +221,7 @@ struct LocalBackendInner {
     /// table id each resolves to; see `resolve_required_tables`.
     relations: BTreeMap<String, TableId>,
     resident_proofs: ResidentStateProofCodec,
-    catalog: Mutex<SqliteArtifactCatalog>,
+    catalog: Mutex<Catalog>,
     store: Arc<dyn ManagedBlobStore>,
     /// The CDC runtime's provider: a plan's retention lease, the readiness
     /// probe and a fence's head read go through it.
@@ -248,16 +248,24 @@ struct LocalBackendInner {
     /// The decoder this composition plans for; see `bootstrap`.
     decoder_profile: String,
     stored_rows: bool,
-    /// The decoded SHA-256 of each cut a page that holds it may be planned:
-    /// the newest cut and each older one the keep ratio keeps, as the last
-    /// maintenance pass found them. A cut only a plan's pin keeps is not one,
-    /// so no page pins it again, and none is before the first pass.
-    plannable_cuts: StdRwLock<BTreeSet<String>>,
     metrics: OperationsMetrics,
     /// Set once `LocalMutationBackend` mounts. Until then the change stream
     /// resolves no acknowledgements and a poll carrying pending ids fails
     /// closed.
     mutations: OnceLock<Arc<LocalMutationSupport>>,
+}
+
+/// The artifact catalog and the cuts a hint may plan, which share its lock: a
+/// pass that stops a cut being plannable lands before or after a planning
+/// that pins it, never inside it.
+struct Catalog {
+    artifacts: SqliteArtifactCatalog,
+    /// The decoded SHA-256 of each cut a page that holds it may be planned:
+    /// the newest cut and each older one the keep ratio keeps, as the last
+    /// maintenance pass found them. A cut only a plan's pin keeps is not one,
+    /// so no page pins it again, and none is before the first pass or at a
+    /// keep ratio of 0.
+    plannable_cuts: BTreeSet<String>,
 }
 
 fn current_serving(serving: &StdRwLock<Arc<ServingAuthorization>>) -> Arc<ServingAuthorization> {
@@ -430,7 +438,10 @@ impl LocalBackend {
                 complete_tables,
                 relations,
                 resident_proofs: ResidentStateProofCodec::new(config.proof_secret.as_bytes())?,
-                catalog: Mutex::new(config.catalog),
+                catalog: Mutex::new(Catalog {
+                    artifacts: config.catalog,
+                    plannable_cuts: BTreeSet::new(),
+                }),
                 store: config.store,
                 log: config.log,
                 log_readers: config.log_readers,
@@ -449,7 +460,6 @@ impl LocalBackend {
                 memory: config.memory,
                 decoder_profile: crate::columnar::direct_columnar_decoder_profile(),
                 stored_rows: config.stored_rows,
-                plannable_cuts: StdRwLock::new(BTreeSet::new()),
                 metrics: config.metrics,
                 mutations: OnceLock::new(),
             }),
@@ -495,6 +505,7 @@ impl LocalBackend {
         }
         let catalog = self.inner.catalog.blocking_lock();
         catalog
+            .artifacts
             .probe_reachable()
             .map_err(|_| OperationErrorClass::ArtifactCatalog)
     }

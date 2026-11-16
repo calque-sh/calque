@@ -20,13 +20,14 @@ import {
 } from "./stored-rows.js";
 import type {
   StoreOutcome,
+  StoreReply,
   StoreRequest,
   StoredRowsChunk,
 } from "./stored-rows-protocol.js";
 
 interface StoreScope {
   onmessage: ((event: MessageEvent<StoreRequest>) => void) | null;
-  postMessage(message: StoreOutcome): void;
+  postMessage(message: StoreReply): void;
 }
 
 /** What a worker's sync access handle does that this worker uses. */
@@ -92,7 +93,14 @@ function begin(request: Extract<StoreRequest, { type: "begin" }>): void {
       },
     );
   })();
-  opened.catch(() => undefined);
+  opened.then(
+    () => {
+      if (!finished) scope.postMessage({ type: "begun" });
+    },
+    (error: unknown) => {
+      if (!finished) settle({ type: "abandoned", reason: reasonOf(error) });
+    },
+  );
   const state: Writing = {
     key: request.key,
     keyId: request.keyId,
@@ -229,6 +237,10 @@ async function abandon(state: Writing | undefined): Promise<void> {
   }
 }
 
+function reasonOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function settle(outcome: StoreOutcome): void {
   finished = true;
   writing?.port.close();
@@ -253,9 +265,6 @@ scope.onmessage = (event) => {
   finished = true;
   commit(state).then(settle, async (error: unknown) => {
     await abandon(state);
-    settle({
-      type: "abandoned",
-      reason: error instanceof Error ? error.message : String(error),
-    });
+    settle({ type: "abandoned", reason: reasonOf(error) });
   });
 };

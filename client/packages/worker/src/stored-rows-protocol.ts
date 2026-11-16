@@ -26,6 +26,12 @@ export interface StoreOutcome {
   readonly reason?: string;
 }
 
+/**
+ * What the store worker posts: `begun` once it has read the store's epochs,
+ * which the page waits for before it sends `commit`, then its outcome.
+ */
+export type StoreReply = { readonly type: "begun" } | StoreOutcome;
+
 /** A chunk the engine worker accepted, in the buffer it arrived in. */
 export interface StoredRowsChunk {
   readonly index: number;

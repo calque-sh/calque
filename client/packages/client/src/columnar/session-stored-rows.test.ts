@@ -94,6 +94,7 @@ describe("the rows a page keeps between visits", () => {
     expect(writer?.keyId).toBe(STORED_ROWS_KEY);
     const open = made.worker.requests.find(({ type }) => type === "open");
     expect(open?.store).toBeDefined();
+    await until(() => store.stored !== undefined, "the stored copy");
     expect(store.stored?.chunks.map((chunk) => new Uint8Array(chunk))).toEqual([
       new Uint8Array(ARTIFACT_BYTES),
     ]);
@@ -342,6 +343,58 @@ describe("the rows a page keeps between visits", () => {
     await made.client.close();
   });
 
+  it("are not kept by a load whose lookup clearStoredRows() overlapped", async () => {
+    let release!: () => void;
+    const store = new FakeRowStore();
+    store.holdOpen = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const made = makeClient(
+      keyedPlan(),
+      undefined,
+      undefined,
+      undefined,
+      {},
+      store,
+    );
+    await until(() => store.opens === 1, "the load's lookup");
+    await made.client.clearStoredRows();
+    release();
+    expect(await settled(made.client)).toEqual({ state: "ready" });
+
+    expect(store.stored).toBeUndefined();
+    expect(store.hinted).toBeUndefined();
+    expect(store.writers).toHaveLength(0);
+    await made.client.close();
+  });
+
+  it("are not named by the cookie when clearStoredRows() overlapped the read of them", async () => {
+    let release!: () => void;
+    const store = storeHolding(patternBytes(ARTIFACT_BYTES));
+    store.holdOpen = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const made = makeClient(
+      keyedPlan(),
+      undefined,
+      undefined,
+      undefined,
+      {},
+      store,
+    );
+    await until(() => store.opens === 1, "the load's lookup");
+    const held = store.stored;
+    await made.client.clearStoredRows();
+    // The copy open in this page is read before an erasure deletes it.
+    store.stored = held;
+    release();
+    expect(await settled(made.client)).toEqual({ state: "ready" });
+
+    expect(artifactRequests(made.fetcher)).toBe(0);
+    expect(store.hinted).toBeUndefined();
+    await made.client.close();
+  });
+
   it("are erased by a revocation barrier", async () => {
     const store = new FakeRowStore();
     const harness = makeRebuildableClient(
@@ -400,7 +453,7 @@ describe("the rows a page keeps between visits", () => {
     );
     const { client, poll } = harness;
     expect(await settled(client)).toEqual({ state: "ready" });
-    expect(store.stored).toBeDefined();
+    await until(() => store.stored !== undefined, "the stored copy");
 
     await until(() => poll.open > 0, "the change stream to poll");
     poll.answer();

@@ -1298,7 +1298,8 @@ after it, while the entries after that cut hold at most
 `--recut-keep-ratio` bytes per decoded byte of the newest artifact, 0.25 by
 default, and while the log still holds every one of them. With the defaults
 that keeps up to eight older cuts, each with every representation it was
-published with. `--recut-keep-ratio 0` keeps only the newest cut.
+published with. `--recut-keep-ratio 0` keeps only the newest cut, and a
+request's hint plans nothing.
 
 The pass trims the log, whatever the ratios. It keeps every entry after
 the oldest of these: the oldest cut it keeps, the catch-up start of each

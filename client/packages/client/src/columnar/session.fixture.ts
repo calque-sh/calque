@@ -1482,6 +1482,8 @@ export class FakeRowWriter implements RowWriter {
   committed = false;
   abandoned = false;
   readonly #store: FakeRowStore;
+  #received = 0;
+  #settle: (() => void) | undefined;
 
   constructor(
     store: FakeRowStore,
@@ -1496,25 +1498,38 @@ export class FakeRowWriter implements RowWriter {
       event: MessageEvent<{ index: number; bytes: ArrayBuffer }>,
     ) => {
       this.chunks[event.data.index] = event.data.bytes;
+      this.#received += 1;
+      if (this.#received === this.artifact.chunkSha256.length) this.#settle?.();
     };
   }
 
+  /** Records the copy once every chunk has arrived, as the store worker does. */
   commit(): Promise<StoreOutcome> {
     this.committed = true;
-    this.#kept.close();
-    if (this.abandoned)
-      return Promise.resolve({ type: "abandoned", reason: "abandoned" });
-    this.#store.stored = {
-      keyId: this.keyId,
-      artifact: this.artifact,
-      chunks: this.chunks,
-    };
-    return Promise.resolve({ type: "committed" });
+    return new Promise((resolve) => {
+      this.#settle = () => {
+        this.#settle = undefined;
+        this.#kept.close();
+        if (this.abandoned) {
+          resolve({ type: "abandoned", reason: "abandoned" });
+          return;
+        }
+        this.#store.stored = {
+          keyId: this.keyId,
+          artifact: this.artifact,
+          chunks: this.chunks,
+        };
+        resolve({ type: "committed" });
+      };
+      if (this.abandoned || this.#received >= this.artifact.chunkSha256.length)
+        this.#settle();
+    });
   }
 
   abandon(): void {
     this.abandoned = true;
     this.#kept.close();
+    this.#settle?.();
   }
 }
 

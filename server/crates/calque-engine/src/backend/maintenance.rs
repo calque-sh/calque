@@ -350,7 +350,7 @@ impl LocalBackend {
         let now_ms = now / 1_000;
         let (newest, newest_digests, older) = {
             let catalog = self.inner.catalog.blocking_lock();
-            let published = catalog.published(&query)?;
+            let published = catalog.artifacts.published(&query)?;
             let Some(newest) = newest_cut(&published, &self.inner.activated) else {
                 return Ok(());
             };
@@ -387,9 +387,14 @@ impl LocalBackend {
                     .between(sequence, newest.sequence, bytes_between)
             },
         )?;
-        let mut plannable = newest_digests;
-        plannable.extend(sorted.kept.into_iter().map(|cut| cut.decoded_sha256));
-        self.set_plannable_cuts(plannable);
+        // At a keep ratio of 0 the planner plans the newest cut as it did
+        // before hints, and the newest digest is left out with the rest: once
+        // a re-cut publishes, it names an older cut until the next pass.
+        let mut plannable = BTreeSet::new();
+        if policy.keep_ratio > 0.0 {
+            plannable = newest_digests;
+            plannable.extend(sorted.kept.into_iter().map(|cut| cut.decoded_sha256));
+        }
         let retired: Vec<ArtifactId> = sorted
             .retired
             .into_iter()
@@ -397,7 +402,7 @@ impl LocalBackend {
             .collect();
         // A store or catalog that keeps failing here must not stop the trim
         // below, or the log would grow for as long as it fails.
-        if let Err(error) = self.retire_cuts(runtime, &retired, now_ms) {
+        if let Err(error) = self.retire_cuts(runtime, plannable, &retired, now_ms) {
             self.report_maintenance_error(&error);
         }
         let tail = self.inner.tail.as_deref();
@@ -559,41 +564,24 @@ impl LocalBackend {
             .collect()
     }
 
-    fn set_plannable_cuts(&self, digests: BTreeSet<String>) {
-        *self
-            .inner
-            .plannable_cuts
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = digests;
-    }
-
-    /// The hints of `hints` that name a cut a page may be planned (see
-    /// `plannable_cuts`). Another names a cut the planner would plan only
-    /// because a plan still pins it.
-    pub(super) fn plannable_hints(&self, hints: BTreeSet<String>) -> BTreeSet<String> {
-        let plannable = self
-            .inner
-            .plannable_cuts
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        hints
-            .into_iter()
-            .filter(|hint| plannable.contains(hint))
-            .collect()
-    }
-
-    /// Retires each of `artifacts` that no plan pins, and deletes the retired
-    /// cuts' objects. A re-encode may have retired or deleted one since the
-    /// pass read the catalog.
+    /// Makes `plannable` the cuts a hint may name, retires each of
+    /// `artifacts` that no plan pins, and deletes the retired cuts' objects.
+    /// A re-encode may have retired or deleted one since the pass read the
+    /// catalog.
     pub(super) fn retire_cuts(
         &self,
         runtime: &tokio::runtime::Runtime,
+        plannable: BTreeSet<String>,
         artifacts: &[ArtifactId],
         now_ms: i64,
     ) -> Result<(), MaintenanceError> {
         let mut catalog = self.inner.catalog.blocking_lock();
+        catalog.plannable_cuts = plannable;
         for artifact in artifacts {
-            match catalog.retire(artifact, now_ms, "a newer cut replaces it") {
+            match catalog
+                .artifacts
+                .retire(artifact, now_ms, "a newer cut replaces it")
+            {
                 Ok(_)
                 | Err(
                     artifact_catalog::CatalogError::ArtifactPinnedByPlan { .. }
@@ -602,7 +590,11 @@ impl LocalBackend {
                 Err(error) => return Err(error.into()),
             }
         }
-        runtime.block_on(catalog.delete_retired(self.inner.store.as_ref(), now_ms))?;
+        runtime.block_on(
+            catalog
+                .artifacts
+                .delete_retired(self.inner.store.as_ref(), now_ms),
+        )?;
         Ok(())
     }
 
