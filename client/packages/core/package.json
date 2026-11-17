@@ -1,6 +1,6 @@
 {
   "name": "@calque/core",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "The direct-columnar artifact reader and local query engine behind @calque/client.",
   "license": "Apache-2.0",
   "repository": {

@@ -5,6 +5,60 @@ Every `@calque` package, the `calque` binary and the
 covers all of them. Calque is pre-alpha: a minor version may break
 configurations, stored state and APIs, and its section says how.
 
+## 0.4.0 (2026-11-17)
+
+### Breaking
+
+- A state directory prepared by 0.3.0, and a recovery unit 0.3.0 took, are
+  refused and need `calque destroy`. Calque now records each served column's
+  version, so `ALTER COLUMN ... TYPE` to the column's own type with a `USING`
+  expression stops the server, asking for `calque destroy`, instead of leaving
+  the old values served.
+- `calque serve` and `calque dev` refuse to start when PostgreSQL could not
+  hold their preparations. Each preparation holds a replication slot and a
+  WAL sender beside change capture's, and the server needs 24 connections plus
+  6 per preparation. A server that started under tighter
+  `max_replication_slots`, `max_wal_senders`, `max_connections` or connection
+  limits now refuses, naming the limit to raise.
+
+### Added
+
+- PostgreSQL 17 is supported as a source, beside 18.
+- After a re-cut, a page that stored an older cut catches up from it instead
+  of downloading the newest, while the server keeps that cut.
+  `--recut-keep-ratio` (default 0.25) sets how many bytes of changes since an
+  older cut the server keeps, per byte of the newest artifact; 0 keeps only
+  the newest cut.
+- `renderBootstrap` takes the page request's `Cookie` header as `cookie`, and
+  leaves out the artifact preload when the page already holds that artifact.
+- A page keeps its working set between visits, encrypted in the browser's
+  origin private file system, and a returning page reads it from disk instead
+  of downloading it again. `createSyncClient({ storeRows: false })` keeps
+  nothing, `SyncClient.clearStoredRows()` erases what is kept, and
+  `calque serve --no-stored-rows` or `calque dev --no-stored-rows` turns it
+  off for every page.
+
+### Changed
+
+- A publication created for another set of tables is refused with the
+  `DROP PUBLICATION` and `CREATE PUBLICATION` statements for its owner to
+  run, instead of pointing at `calque destroy`, which keeps a publication
+  another role owns.
+- A returning page catches up sooner and with less memory: it asks for the
+  changes since its stored copy while it reads that copy, and it decodes
+  change frames with `@bufbuild/protobuf` 2.17.0.
+
+### Fixed
+
+- A table whose row-level security would filter Calque's reads is refused
+  with `ROW_LEVEL_SECURITY_ACTIVE`, naming the role that needs `BYPASSRLS`,
+  instead of serving an empty snapshot.
+- `calque serve` and `calque dev` handle SIGINT and SIGTERM from the moment
+  they print that they are ready, so a stop sent right then exits cleanly.
+- A React Suspense retry that renders more than 5 seconds after a query
+  settled takes back its rows instead of suspending and running the query
+  again.
+
 ## 0.3.0 (2026-11-14)
 
 ### Breaking
