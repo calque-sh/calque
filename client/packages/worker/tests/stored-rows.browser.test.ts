@@ -308,9 +308,19 @@ describe("the stored copy", () => {
   it("is not kept by a store worker that began before an erasure", async () => {
     const key = await newKey();
     const artifact = await artifactOf(BODY);
-    const writer = new StoredRowsWriter(storeWorker, key, artifact);
+    const began = Promise.withResolvers<undefined>();
+    const observed = (): StoreWorker => {
+      const worker = storeWorker();
+      worker.addEventListener("message", (event) => {
+        const data = (event as MessageEvent<{ type?: string } | undefined>)
+          .data;
+        if (data?.type === "begun") began.resolve(undefined);
+      });
+      return worker;
+    };
+    const writer = new StoredRowsWriter(observed, key, artifact);
     sendChunks(writer, BODY);
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await began.promise;
     await eraseStoredRows();
 
     expect(await writer.commit()).toEqual({

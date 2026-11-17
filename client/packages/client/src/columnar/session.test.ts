@@ -4247,9 +4247,16 @@ describe("direct-columnar session", () => {
     releaseRebuild();
     await until(() => workers.length === 2, "the replacement mount");
     expect(await settled(client)).toEqual({ state: "ready" });
+    // A read begun before the barrier may also answer from the rebuilt mount,
+    // so wait for one begun after it.
     await until(
-      () => observed.some((entry) => entry.includes("epoch-two")),
-      "a read from the rebuilt mount",
+      () =>
+        observed.some(
+          (entry) =>
+            Number(entry.split(":")[0]) > barrierAt &&
+            entry.includes("epoch-two"),
+        ),
+      "a read begun after the barrier, from the rebuilt mount",
     );
     reading = false;
     await reader;

@@ -38,6 +38,8 @@
     "verify": "node --import ./scripts/register.mjs scripts/verify-workspace.ts",
     "verify:source-only": "node --import ./scripts/register.mjs scripts/verify-workspace.ts --source-only",
     "verify:packed": "node --import ./scripts/register.mjs scripts/verify-packed-packages.ts",
+    "release:prepare": "node --import ./scripts/register.mjs scripts/release.ts prepare",
+    "release:notes": "node --import ./scripts/register.mjs scripts/release.ts notes",
     "publish:packages": "node --import ./scripts/register.mjs scripts/publish-packages.ts",
     "verify:credentials": "node --import ./scripts/register.mjs scripts/verify-no-credentials.ts",
     "typecheck:harness": "tsc -p scripts/tsconfig.json",

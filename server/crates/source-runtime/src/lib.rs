@@ -2823,6 +2823,9 @@ mod tests {
     #[test]
     #[ignore = "requires CALQUE_CONTROL_DATABASE_URL"]
     fn live_feedback_fence_holds_takeover_until_operation_returns() {
+        // Long enough that acquire, bind, claim and activate finish inside it
+        // on a loaded host; the guard then holds the row past its expiry.
+        const LEASE_TTL: Duration = Duration::from_secs(1);
         let url =
             std::env::var("CALQUE_CONTROL_DATABASE_URL").expect("live control-store database URL");
         let source_id = SourceId::new(format!(
@@ -2843,7 +2846,7 @@ mod tests {
                 source_id: source_id.clone(),
                 source_epoch: epoch.clone(),
                 owner_id: OwnerId::new("runtime-a").unwrap(),
-                ttl: Duration::from_millis(100),
+                ttl: LEASE_TTL,
             })
             .unwrap();
         authority_a.bind_backend(&provisional, 7_654).unwrap();
@@ -2865,7 +2868,7 @@ mod tests {
                 .unwrap();
         });
         entered_rx.recv().unwrap();
-        std::thread::sleep(Duration::from_millis(140));
+        std::thread::sleep(LEASE_TTL + Duration::from_millis(200));
 
         let authority_b = Arc::new(FenceAuthority::new(
             PostgresFenceStore::connect(&url).unwrap(),
