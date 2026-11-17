@@ -61,15 +61,18 @@ fn two_clients_enforce_monotonic_takeover_and_exact_ownership() {
     let authority_a = FenceAuthority::new(store_a);
     let authority_b = FenceAuthority::new(store_b);
 
+    // Long enough that runtime-b's first acquire meets it unexpired on a
+    // loaded host; runtime-b then waits past it.
+    const LEASE_A_TTL_MS: u64 = 1_000;
     let lease_a = authority_a
-        .acquire(request(&source_id, &epoch, "runtime-a", 100))
+        .acquire(request(&source_id, &epoch, "runtime-a", LEASE_A_TTL_MS))
         .unwrap();
     assert!(matches!(
         authority_b.acquire(request(&source_id, &epoch, "runtime-b", 500)),
         Err(FenceError::LeaseHeld { .. })
     ));
 
-    thread::sleep(Duration::from_millis(140));
+    thread::sleep(Duration::from_millis(LEASE_A_TTL_MS + 200));
     let lease_b = authority_b
         .acquire(request(&source_id, &epoch, "runtime-b", 500))
         .unwrap();
