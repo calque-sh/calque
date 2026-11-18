@@ -12,6 +12,7 @@ use calque_engine::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::describe;
 use crate::lifecycle::{
     bounded_stop, shutdown_after, shutdown_runtime, with_state_remedy, CommandError,
 };
@@ -70,7 +71,7 @@ pub(crate) async fn stop_serving<S: GenerationSource>(
 
 /// A source served across its schema generations.
 pub(crate) trait GenerationSource {
-    type Error: CommandError + From<std::io::Error> + From<StateError> + std::fmt::Display;
+    type Error: CommandError + From<std::io::Error> + From<StateError> + std::error::Error;
 
     /// Prepares the source and starts serving it. The source moves to its
     /// next schema generation when what it is asked to serve differs from
@@ -168,15 +169,17 @@ pub(crate) async fn first_generation<S: GenerationSource>(
                     "The source's schema changed ({}): moving to the next schema generation",
                     error
                         .stopped_on()
-                        .map_or_else(|| error.to_string(), str::to_owned)
+                        .map_or_else(|| describe(&error), str::to_owned)
                         .trim_end_matches('.')
                 ));
                 force_move = true;
             }
             Err(error) if may_suspend && error.suspends_schema() => {
-                let refusal =
-                    with_state_remedy(error, source.state_dir(), source.database_url_env())
-                        .to_string();
+                let refusal = describe(&with_state_remedy(
+                    error,
+                    source.state_dir(),
+                    source.database_url_env(),
+                ));
                 print_suspended(&refusal);
                 return Ok(FirstGeneration::Suspended {
                     force_move,
@@ -270,8 +273,13 @@ async fn supervise<S: GenerationSource>(
         };
         if let Some(generation) = serving.take() {
             routes.replace(source.between_generations(BetweenGenerations::Preparing));
-            if let Err(error) = generation.retire::<S::Error>().await {
-                tracing::warn!(%error, "stopping the retired schema generation failed");
+            // A generation that stopped on a schema change fails its stop with
+            // that change, which the move has already printed.
+            match generation.retire::<S::Error>().await {
+                Err(error) if !error.moves_schema() => {
+                    tracing::warn!(%error, "stopping the retired schema generation failed");
+                }
+                _ => {}
             }
         }
         match start(source, force_move).await {
@@ -295,9 +303,11 @@ async fn supervise<S: GenerationSource>(
                 } else {
                     BetweenGenerations::Preparing
                 }));
-                let message =
-                    with_state_remedy(error, source.state_dir(), source.database_url_env())
-                        .to_string();
+                let message = describe(&with_state_remedy(
+                    error,
+                    source.state_dir(),
+                    source.database_url_env(),
+                ));
                 if last_refusal.as_deref() != Some(message.as_str()) {
                     if suspended {
                         print_suspended(&message);

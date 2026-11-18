@@ -1116,6 +1116,11 @@ fn dev_suspends_a_source_whose_served_column_is_renamed_until_it_binds_again() {
     ));
     dev.prints_within("Schema generation 2: serving", Duration::from_secs(60));
     assert_eq!(readyz(dev.port), Some(204));
+    let stderr = dev.stderr();
+    assert!(
+        !stderr.iter().any(|line| line.contains("retired")),
+        "the move's stop is reported once: {stderr:#?}"
+    );
     let (plan, artifact) =
         served_artifact(dev.port, &fixture.bearer(), std::slice::from_ref(&relation));
     assert!(plan.to_string().contains(":g2"), "{plan}");
@@ -1123,4 +1128,46 @@ fn dev_suspends_a_source_whose_served_column_is_renamed_until_it_binds_again() {
     dev.signal("-INT");
     let (status, took) = dev.exit_within(STOP_TIMEOUT);
     assert!(status.success(), "{status} after {took:?}");
+}
+
+/// A source suspended on a renamed column starts its next schema generation
+/// once the column is renamed back. When PostgreSQL has stopped answering by
+/// then, `dev` retries every second and the retry line names what the driver
+/// failed on, not only that it failed.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn dev_names_the_cause_when_its_next_schema_generation_cannot_reach_postgres() {
+    let _one = exclusive();
+    let fixture = Fixture::create();
+    let relation = format!("public.{}", fixture.table);
+    let config = fixture.manifest(&["id", "title"]);
+    let proxy = Proxy::start();
+    let dev = Dev::launch(
+        &fixture,
+        &["--config", config.to_str().unwrap()],
+        &proxy.url,
+    );
+    let alter = |statement: String| {
+        Client::connect(&database_url(), NoTls)
+            .unwrap()
+            .batch_execute(&statement)
+            .unwrap();
+    };
+
+    alter(format!(
+        "ALTER TABLE {relation} RENAME COLUMN title TO heading"
+    ));
+    dev.prints_within("Schema suspended: ", Duration::from_secs(30));
+    proxy.drop_connections();
+    alter(format!(
+        "ALTER TABLE {relation} RENAME COLUMN heading TO title"
+    ));
+    const RETRY: &str = "The next schema generation did not start, retrying every second: ";
+    dev.prints_within(RETRY, Duration::from_secs(60));
+    let printed = dev.printed.lock().unwrap().clone();
+    let retry = printed.iter().find(|line| line.starts_with(RETRY)).unwrap();
+    assert!(
+        retry.ends_with("error connecting to server: connection timed out"),
+        "{retry}"
+    );
 }

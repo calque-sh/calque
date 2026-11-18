@@ -36,7 +36,7 @@ fn main() -> ExitCode {
 /// errors here embed their source's message; a driver's often does not, and
 /// its cause is the part that says what to fix, such as which certificate a
 /// TLS handshake refused.
-fn describe(error: &dyn std::error::Error) -> String {
+pub(crate) fn describe(error: &dyn std::error::Error) -> String {
     let mut message = error.to_string();
     let mut cause = error.source();
     while let Some(error) = cause {
