@@ -139,8 +139,18 @@ impl SchemaRegistry {
         snapshot: &EnrollmentSnapshot,
         requirements: &EnrollmentRequirements,
     ) -> Result<Self, SchemaRegistryError> {
+        Self::initialize_at(snapshot, requirements, 1)
+    }
+
+    /// The registry of `schema_generation`, compiled from the source as it
+    /// stands: a move to a new generation gives every table a new ID.
+    pub fn initialize_at(
+        snapshot: &EnrollmentSnapshot,
+        requirements: &EnrollmentRequirements,
+        schema_generation: u64,
+    ) -> Result<Self, SchemaRegistryError> {
         require_ready(snapshot, requirements)?;
-        Self::compile(snapshot, 1)
+        Self::compile(snapshot, schema_generation)
     }
 
     pub const fn schema_generation(&self) -> u64 {

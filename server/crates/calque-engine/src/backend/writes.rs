@@ -181,6 +181,9 @@ impl LocalBackend {
         request: &MutationBatchRequest,
     ) -> Result<MutationAuthorization, MutationHttpError> {
         let serving = self.serving();
+        if serving.artifact() == ARTIFACT_RETIRED {
+            return Err(MutationHttpError::Unavailable);
+        }
         let (credential, capability) = self.resolve_command_capability(bearer)?;
         let scope = match &self.inner.tenants {
             Some(_) => serving

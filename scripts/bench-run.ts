@@ -69,7 +69,15 @@ import {
   thresholdRows,
   wireByPurpose,
 } from "./bench-results.ts";
-import { RETAKES, takeSamples } from "./bench-samples.ts";
+import { RETAKES, type Retaken, takeSamples } from "./bench-samples.ts";
+import {
+  prepareSchemaRun,
+  schemaDevArguments,
+  schemaSample,
+  type SchemaResult,
+  settleSchema,
+  schemaSummary,
+} from "./bench-schema.ts";
 import { storedRowsSummary } from "./bench-stored-rows.ts";
 import {
   readRecut,
@@ -173,6 +181,7 @@ async function measure(run: Run) {
     await delay(500);
   }
   const autovacuumWaitMs = hrtimeMs() - vacuumStarted;
+  prepareSchemaRun(run);
 
   const preparations: (number | null)[] = [];
   for (let n = 0; n < run.plan.preparations; n += 1) {
@@ -191,7 +200,7 @@ async function measure(run: Run) {
       run.calquePublicBaseUrl,
       run.serviceEnvironment,
       logPath,
-      devArguments(run.options),
+      [...devArguments(run.options), ...schemaDevArguments(run)],
     );
     run.server = server;
     run.servers.add(server.handle);
@@ -314,33 +323,77 @@ async function measure(run: Run) {
 
   const warmups: ColdResult[] = [];
   const traced: ColdResult[] = [];
-  for (let n = 0; n < run.plan.warmups; n += 1) {
-    const sample = await coldSample(run, "warmup", n);
-    settleCold(run, sample, null);
-    warmups.push(sample);
+  const schema: SchemaResult[] = [];
+  let schemaRetaken: Retaken[] = [];
+  let taken: Awaited<ReturnType<typeof takeSamples<ColdResult>>> = {
+    samples: [],
+    judged: [],
+    retaken: [],
+    timedOutAt: null,
+  };
+  let movedTables: string[] = [];
+  if (run.options.schemaChange !== undefined) {
+    // Every sample is a schema sample. A judged one that is INVALID_RUN for
+    // the instrument alone is taken again, as a cold sample is; every other
+    // sample counts as it ran.
+    const server = run.server;
+    const take = async (kind: SchemaResult["kind"], n: number) => {
+      const sample = await schemaSample(run, kind, n);
+      if (server.handle.child.exitCode !== null)
+        throw new Error("calque dev exited during the schema samples");
+      return sample;
+    };
+    for (let n = 0; n < run.plan.warmups; n += 1)
+      schema.push(await take("warmup", n));
+    const judgedSchema = await takeSamples(
+      {
+        warmups: 0,
+        judged: run.plan.cold,
+        retakes: RETAKES,
+        valueMs: (sample: SchemaResult) => sample.reachedMs,
+      },
+      (n) => take("schema", n),
+      (sample, { retake }) => settleSchema(run, sample, retake),
+    );
+    schema.push(...judgedSchema.samples);
+    schemaRetaken = judgedSchema.retaken;
+    for (let n = 0; n < run.plan.traced; n += 1)
+      schema.push(await take("traced", n));
+    // The load moved the issue panel, so the realtime session needs a
+    // reference of the page as it is now.
+    log("reading PostgreSQL after the schema samples");
+    run.source = readSourceState(run.tables, run.sourceEnvironment);
+    run.queryExpectation = readQueryExpectation(run.sourceEnvironment);
+    log("reference pass after the schema samples");
+    await referencePass(run, "reference-after-schema");
+  } else {
+    for (let n = 0; n < run.plan.warmups; n += 1) {
+      const sample = await coldSample(run, "warmup", n);
+      settleCold(run, sample, null);
+      warmups.push(sample);
+    }
+    taken = await takeSamples(
+      {
+        warmups: 0,
+        judged: run.plan.cold,
+        retakes: RETAKES,
+        valueMs: (sample: ColdResult) => sample.reachedMs,
+      },
+      (n) => coldSample(run, "cold", n),
+      (sample, { retake }) => settleCold(run, sample, retake),
+    );
+    for (let n = 0; n < run.plan.traced; n += 1) {
+      const sample = await coldSample(run, "traced", n);
+      settleCold(run, sample, null);
+      traced.push(sample);
+    }
+    const afterCold = readSourceState(run.tables, run.sourceEnvironment);
+    movedTables = Object.keys(run.source.digests).filter(
+      (collection) =>
+        afterCold.digests[collection] !== run.source?.digests[collection],
+    );
   }
-  const taken = await takeSamples(
-    {
-      warmups: 0,
-      judged: run.plan.cold,
-      retakes: RETAKES,
-      valueMs: (sample: ColdResult) => sample.reachedMs,
-    },
-    (n) => coldSample(run, "cold", n),
-    (sample, { retake }) => settleCold(run, sample, retake),
-  );
   const cold = taken.judged;
-  for (let n = 0; n < run.plan.traced; n += 1) {
-    const sample = await coldSample(run, "traced", n);
-    settleCold(run, sample, null);
-    traced.push(sample);
-  }
-
-  const afterCold = readSourceState(run.tables, run.sourceEnvironment);
-  const movedTables = Object.keys(run.source.digests).filter(
-    (collection) =>
-      afterCold.digests[collection] !== run.source?.digests[collection],
-  );
   log("empty pages");
   const emptyPageRss = await emptyPagePeaks(run);
   log("realtime");
@@ -386,6 +439,7 @@ async function measure(run: Run) {
     cold.some((sample) => sample.query?.verdict === "INCORRECT") ||
     traced.some((sample) => sample.verdict === "INCORRECT") ||
     realtime.probes.some((sample) => sample.verdict === "INCORRECT") ||
+    schema.some((sample) => sample.verdict === "INCORRECT") ||
     realtime.finalProblems.length > 0;
   const correctnessFailed = incorrect || movedTables.length > 0;
   const passedCold = cold.filter((sample) => sample.verdict === "PASS");
@@ -464,8 +518,15 @@ async function measure(run: Run) {
       query: cold.map((sample) => sample.query?.verdict ?? "DNC"),
       traced: traced.map((sample) => sample.verdict),
       probes: realtime.probes.map((sample) => sample.verdict),
+      schema: schema.map((sample) => sample.verdict),
     },
-    retaken: { cold: taken.retaken, probes: realtime.retaken },
+    retaken: {
+      cold: taken.retaken,
+      probes: realtime.retaken,
+      ...(run.options.schemaChange === undefined
+        ? {}
+        : { schema: schemaRetaken }),
+    },
     artifactRetries: {
       warmup: withRetryMarks(warmups),
       cold: withRetryMarks(taken.samples),
@@ -572,5 +633,14 @@ async function measure(run: Run) {
       ],
     },
     ...(servedBrotli(run) === null ? {} : { brotli: brotliSummary(cold) }),
+    ...(run.options.schemaChange === undefined
+      ? {}
+      : {
+          schema: schemaSummary(
+            run.options.schemaChange,
+            schema,
+            schemaRetaken,
+          ),
+        }),
   };
 }

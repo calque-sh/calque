@@ -238,10 +238,10 @@ calque dev --public-base-url http://127.0.0.1:5173/_calque/ \
 ```
 
 `--public-base-url` is the Vite proxy's address, which every URL the server
-hands the page names. After you edit the columns in `calque.config.json`, stop
-the server, run `calque destroy --state-dir .calque-dev --yes`, and start it
-again: it prepares the tables anew with the columns the file names. The
-server keeps running; leave it in this terminal. `calque dev` allows the origin
+hands the page names. When you save an edit to the columns in
+`calque.config.json`, the running server prepares the tables again with the
+columns the file names, within seconds, and the open page rebuilds from them.
+The server keeps running; leave it in this terminal. `calque dev` allows the origin
 `http://127.0.0.1:5173` unless `--allow-origin` names another.
 
 ### With the container

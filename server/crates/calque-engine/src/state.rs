@@ -24,6 +24,9 @@ pub(crate) const STATE_FILE: &str = "state.json";
 pub(crate) const REGISTRY_FILE: &str = "registry.json";
 pub(crate) const SECRETS_FILE: &str = "secrets.json";
 pub(crate) const CLIENT_ENV_FILE: &str = "client.env";
+/// Present from a stop on a schema change until the source moves, so a start
+/// in between moves it too.
+pub(crate) const SCHEMA_MOVE_FILE: &str = "schema-move-pending";
 pub(crate) const SNAPSHOT_BUILD_DIRECTORY: &str = "builds";
 pub(crate) const SNAPSHOT_JOURNAL_DIRECTORY: &str = "journals";
 pub(crate) const SNAPSHOT_WORKSPACE_DIRECTORY: &str = "workspaces";
@@ -329,6 +332,27 @@ impl StateStore {
     pub fn read_registry(&self) -> Result<SchemaRegistry, StateError> {
         let bytes = self.read_private_file(REGISTRY_FILE, MAX_REGISTRY_FILE_BYTES)?;
         SchemaRegistry::decode(&bytes).map_err(|error| in_file(&self.registry_path())(error.into()))
+    }
+
+    /// Whether the runtime stopped on a schema change and the source has not
+    /// moved since. The next start moves it whatever its catalog shows: a
+    /// publication restored by hand, for one, shows nothing of the changes
+    /// pgoutput left out while it was altered.
+    pub fn schema_move_pending(&self) -> bool {
+        self.root.join(SCHEMA_MOVE_FILE).exists()
+    }
+
+    pub fn record_schema_move_pending(&self) -> Result<(), StateError> {
+        self.atomic_replace(SCHEMA_MOVE_FILE, b"")
+    }
+
+    pub fn clear_schema_move_pending(&self) -> Result<(), StateError> {
+        let path = self.root.join(SCHEMA_MOVE_FILE);
+        match fs::remove_file(&path) {
+            Ok(()) => sync_directory(&self.root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_at(&path)(error)),
+        }
     }
 
     pub fn load_or_create_secrets(&self) -> Result<LocalSecrets, StateError> {

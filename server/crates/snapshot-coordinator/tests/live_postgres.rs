@@ -259,7 +259,7 @@ async fn exported_snapshot_and_transactional_marker_define_a_temp_stream_cut() {
         .await
         .expect("start the temporary stream once the worker imported S");
 
-    let identity = CutIdentity::generate();
+    let identity = CutIdentity::generate(1);
     let emitted = emit_cut_marker(&mut setup, identity.clone())
         .await
         .expect("commit dedicated transactional cut marker");
@@ -443,7 +443,7 @@ async fn copy_after_the_cut_reads_the_exported_snapshot_while_the_stream_is_held
         )
         .await
         .unwrap();
-    let emitted = emit_cut_marker(&mut setup, CutIdentity::generate())
+    let emitted = emit_cut_marker(&mut setup, CutIdentity::generate(1))
         .await
         .expect("commit cut marker");
     let mut applied = 0;

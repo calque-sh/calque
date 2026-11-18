@@ -46,9 +46,10 @@ every row holding it, and PostgreSQL logs no row change for it. Calque records
 which value holds each label it serves and reads those enums every second
 while it streams and at every start. Adding a value, with or without `BEFORE`
 or `AFTER`, keeps it serving. Renaming a value it enrolled or has served, or
-giving that value's label to another, stops change capture, and
-`calque destroy`, then a new start, prepares the working set again from a
-snapshot. Two cases stop it with nothing served wrong: PostgreSQL renumbering
+giving that value's label to another, moves the source to its next schema
+generation, which prepares the working set again from a snapshot (see
+[Schema changes](#schema-changes)). Two cases move it with nothing served
+wrong: PostgreSQL renumbering
 an enum after many values were added before one another, and a row taking a
 new value while another value of the same enum changed and Calque read
 neither change before the row, as with two values added while Calque was
@@ -154,12 +155,13 @@ CREATE PUBLICATION calque_app FOR TABLE public.users (id, name, team_id);
 ```
 
 A publication that already exists must publish exactly each collection's
-columns, through a list or as the whole table. `serve` refuses one that
-publishes other columns and prints the statement that publishes the right
-ones; `calque destroy` drops a publication Calque's role owns, and the next
-start creates it anew. `calque dev` refuses a `calque.config.json` that names
-other columns than the ones its state directory was prepared with, and names
-the `calque destroy` after which it prepares them.
+columns, through a list or as the whole table. When Calque's role owns it, a
+start whose collections name other columns alters it to publish them and moves
+the source to its next schema generation. When another role owns it, `serve`
+refuses and prints the statement that publishes the right ones, and the start
+after its owner runs it moves the source. `calque dev` reads
+`calque.config.json` again every second and moves the source when its
+collections change, without a restart.
 
 The columns must include the primary key: `serve` and `dev` refuse a
 collection that leaves out a key column before they create the publication,
@@ -174,7 +176,8 @@ IDENTITY DEFAULT`.
 A column outside the list may have any type, generated columns included, and
 a migration may add, change or drop it while Calque runs. PostgreSQL refuses
 to drop a column a publication lists: remove it from `columns` and
-`writableColumns`, run `calque destroy`, restart `serve`, then drop it. When a
+`writableColumns`, restart `serve`, which moves the source to a generation
+without it, then drop it. When a
 column outside the list is `NOT NULL` with no default, an insert through
 Calque cannot give it a value, so the table takes updates and deletes but no
 insert: `calque init` offers none, and `serve` refuses a command that lists
@@ -184,10 +187,54 @@ constraint is the table's own and reads served columns alone, a foreign key's
 referenced columns included, as the catalog held it when Calque started. Any
 other refusal reaches the browser as an unnamed conflict. A row filter is still
 refused with `PUBLICATION_ROW_FILTER_UNSUPPORTED`, because Calque serves
-complete tables. Changing the publication while Calque runs stops change
-capture, as any change to the publication does. Run with `--table` and no
+complete tables. Changing the publication while Calque runs moves the source
+to its next schema generation, and the move puts back the definition the
+collections name when Calque's role owns the publication. Run with `--table` and no
 `calque.config.json`, `calque dev` creates its publication without a list, so
 every column of each table reaches the browser.
+
+## Schema changes
+
+The tables and columns a source serves are its schema generation. A change to
+them moves the source to the next generation, with no `calque destroy`:
+Calque stops appending to its change log, prepares the working set again from
+a snapshot, and serves it under the new generation. Every change committed
+during the move is in that snapshot. Open pages rebuild on their own, and a
+page that loads during the move waits for it. These move a source:
+
+- a start of `serve`, or a save of `calque.config.json` under `dev`, whose
+  collections name other tables or columns;
+- a published column renamed, retyped, dropped or rewritten in place, whether
+  Calque was streaming or stopped;
+- a value of a served enum renamed;
+- the publication altered.
+
+A move costs one snapshot and one rebuild of every open page. For a column
+rewritten in place on a table published whole, an enum value renamed, a table
+dropped or a publication altered behind Calque's back, a page can show old
+values beside newer commits for up to about a second before the move replaces
+them; the other changes show nothing wrong.
+
+When the live schema no longer has what the collections name, such as a served
+column renamed or dropped, Calque suspends the source instead. It logs the
+table, the column and the edit to `calque.config.json` that binds them,
+answers `/readyz` with `503` and every bootstrap with `503` and
+`SCHEMA_SUSPENDED`, and tries again every second. It serves again once the
+schema or the configuration binds. A running `serve` suspends, but a start of
+`serve` refuses such a schema, since its configuration is the one thing a
+start can change. While a source is suspended its slot keeps WAL, as it does
+while Calque is stopped.
+
+PostgreSQL refuses to retype or drop a column a publication lists. There are
+two ways through: leave the column out of the collection's `columns` and
+`writableColumns`, migrate, then name it again, each step a move; or add a new
+column, backfill it, and switch the collection to it.
+
+A page built from an older `calque.config.json` keeps working when a column is
+added. A page whose generated bindings name a table or column the new
+generation does not serve fails with `SCHEMA_MISMATCH`, and only a build
+generated from the new configuration loads. To remove a column, ship the
+application built without it first, then the configuration.
 
 ## Protecting the primary's disk
 

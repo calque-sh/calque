@@ -668,6 +668,11 @@ impl LocalBackend {
         room: &mut Option<BatchRoom>,
     ) -> Result<Built, ChangeBatchError> {
         let _fence = self.inner.build_fence.build().await;
+        // Retirement takes the build fence, so a build that holds it reads
+        // nothing the next schema generation appended.
+        if self.retired() {
+            return Err(ChangeBatchError::SchemaGenerationMismatch);
+        }
         let (grant, revocation) =
             self.inner
                 .plans

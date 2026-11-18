@@ -31,9 +31,10 @@ use crate::{guard::PostgresConnectionFamily, DatabaseUrl, StateStore};
 
 /// A unit of another version is refused by version, naming the fix, rather
 /// than as an `OracleMismatch` that reads like a corrupt backup.
-/// Version 4 carries the enum labels the source serves. An earlier
-/// unit's enrollment records none, and this release cannot resume it.
-const RECOVERY_FORMAT_VERSION: u32 = 5;
+/// Version 6 carries the source's schema generation. An earlier
+/// unit has none to restore, so a source restored from it would serve
+/// generation 1 under a registry of a later one.
+const RECOVERY_FORMAT_VERSION: u32 = 6;
 const COMPLETE_FILE: &str = "recovery.json";
 const CONTROL_DIRECTORY: &str = "control";
 const STATE_DIRECTORY: &str = "state";
@@ -87,6 +88,11 @@ const CONTROL_TABLES: &[ControlTable] = &[
         name: "source_column_version",
         columns: "source_id, source_epoch, relation_oid, attribute_number, attribute_xmin, relation_filenode",
         order_by: "relation_oid, attribute_number",
+    },
+    ControlTable {
+        name: "source_schema_generation",
+        columns: "source_id, source_epoch, schema_generation, boundary_sequence, serving_from_lsn",
+        order_by: "source_id",
     },
     ControlTable {
         name: "canonical_log_head",
@@ -2219,7 +2225,7 @@ mod tests {
         // corrupt backup.
         assert_eq!(
             RecoveryError::UnsupportedFormat(1).to_string(),
-            "recovery unit is format version 1, and this build reads version 5; restore it with the calque release that took it, or take a fresh unit with calque backup from a deployment running this build"
+            "recovery unit is format version 1, and this build reads version 6; restore it with the calque release that took it, or take a fresh unit with calque backup from a deployment running this build"
         );
         assert_eq!(
             RecoveryError::ActiveSourceLease.to_string(),
@@ -2804,10 +2810,10 @@ mod tests {
     }
 
     /// A unit carries the enum labels its source serves, the enrollment
-    /// fields that bound them and its served columns' versions, so the
-    /// restored source resumes where the unit left it. A unit of an earlier
-    /// format lacks some of them and is refused by version before a restore
-    /// writes anything.
+    /// fields that bound them, its served columns' versions and its schema
+    /// generation, so the restored source resumes where the unit left it. A
+    /// unit of an earlier format lacks some of them and is refused by version
+    /// before a restore writes anything.
     #[test]
     #[ignore = "requires CALQUE_CONTROL_DATABASE_URL or CALQUE_DATABASE_URL"]
     fn a_unit_carries_the_served_enum_labels_and_an_earlier_format_is_refused() {
@@ -2865,6 +2871,30 @@ mod tests {
         };
         let columns_before = column_versions(&mut control);
         assert!(!columns_before.is_empty());
+        control
+            .execute(
+                "INSERT INTO calque_control.source_schema_generation
+                     (source_id, source_epoch, schema_generation, boundary_sequence,
+                      serving_from_lsn)
+                 SELECT source_id, source_epoch, 2, 0, '0/30'
+                   FROM calque_control.source_slot_enrollment WHERE source_id = $1",
+                &[&source_id.as_str()],
+            )
+            .unwrap();
+        let schema_generation = |control: &mut Client| -> Vec<String> {
+            control
+                .query(
+                    "SELECT concat_ws(':', schema_generation, boundary_sequence, serving_from_lsn)
+                       FROM calque_control.source_schema_generation
+                      WHERE source_id = $1",
+                    &[&source_id.as_str()],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect()
+        };
+        assert_eq!(schema_generation(&mut control), ["2:0:0/30"]);
 
         create_recovery_backup(
             &database,
@@ -2884,11 +2914,12 @@ mod tests {
         .unwrap();
         assert_eq!(carried(&mut control), before);
         assert_eq!(column_versions(&mut control), columns_before);
+        assert_eq!(schema_generation(&mut control), ["2:0:0/30"]);
 
         let earlier = temporary.path().join("earlier");
         copy_tree(&backup_root, &earlier).unwrap();
         let mut manifest = read_manifest(&earlier).unwrap();
-        manifest.format_version = 4;
+        manifest.format_version = 5;
         fs::write(
             earlier.join(COMPLETE_FILE),
             serde_json::to_vec_pretty(&manifest).unwrap(),
@@ -2905,7 +2936,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(error, RecoveryError::UnsupportedFormat(4)),
+            matches!(error, RecoveryError::UnsupportedFormat(5)),
             "{error}"
         );
         assert!(!refused.exists());

@@ -66,8 +66,9 @@ export type SyncErrorCode =
   | "INVALID_QUERY"
   /**
    * A server response broke the protocol: a malformed or oversized body, or a
-   * bootstrap plan that does not match the generated schema. Recovery `reset`;
-   * `retry` for a plan that had already expired. A mutation response that
+   * bootstrap plan that contradicts itself. Recovery `reset`; `retry` for a
+   * plan that had already expired. A plan that merely does not match the
+   * generated bindings is `SCHEMA_MISMATCH`. A mutation response that
    * breaks the protocol is `MUTATION_AMBIGUOUS` instead, since the mutation
    * may have committed.
    */
@@ -96,6 +97,24 @@ export type SyncErrorCode =
    * after three rebuilds within a minute, with recovery `reset`.
    */
   | "RESNAPSHOT_REQUIRED"
+  /**
+   * The bootstrap plan does not bind the page's generated bindings: a table or
+   * column the bindings name is missing from the plan or is served with
+   * another type or primary key, as after a schema change the page was not
+   * rebuilt for. The message names the table and column. The page was built
+   * from an older configuration, so recovery is `none`: load a build generated
+   * from the current one. A served column the bindings do not name is ignored
+   * and never raises this.
+   */
+  | "SCHEMA_MISMATCH"
+  /**
+   * The source's live schema no longer binds the server's configuration, so
+   * the server answers the bootstrap `503 SCHEMA_SUSPENDED` until it does
+   * again. The client waits it out on the server's schedule as it waits out
+   * `ARTIFACT_PREPARING` and reports it only when the wait would pass 120 s.
+   * Recovery `retry`.
+   */
+  | "SCHEMA_SUSPENDED"
   /**
    * The bootstrap request or the artifact download failed with an HTTP status
    * other than 401, 403, the bootstrap's preparing 503 or its 422

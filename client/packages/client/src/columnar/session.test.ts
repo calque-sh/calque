@@ -51,6 +51,7 @@ import {
   makeClient,
   makePublishingClient,
   makeRebuildableClient,
+  planAt,
   settled,
   type Frame,
   type PaintedFrame,
@@ -1897,11 +1898,11 @@ describe("direct-columnar session", () => {
     const status = await settled(client);
     expect(status).toMatchObject({
       state: "error",
-      error: { code: "INVALID_RESPONSE" },
+      error: { code: "SCHEMA_MISMATCH", recovery: "none" },
     });
     if (status.state !== "error") throw new Error("expected an error");
     expect(status.error.message).toBe(
-      "the generated bindings do not match what the server serves: events.level is served as f64, not text; regenerate them with calque-bindings from the calque.config.json the server runs",
+      "the generated bindings do not match what the server serves: events.level is served as f64, not text; this page was built from an older configuration, so load a build generated from the calque.config.json the server runs",
     );
     expect(workerFactory).not.toHaveBeenCalled();
     // Spawned before the plan was asked for, and terminated with its refusal.
@@ -3750,6 +3751,70 @@ describe("direct-columnar session", () => {
       "cursor-q",
     );
     expect(resumed?.throughCursorInclusive).toBeUndefined();
+    await client.close();
+  });
+
+  it("rebuilds_across_a_schema_move_that_changed_every_table_id", async () => {
+    const moved = (): Response => {
+      const text = JSON.stringify(planAt("cursor-q"))
+        .replaceAll('"tableId":"public.events"', '"tableId":"table:aa:g2"')
+        .replaceAll('"tableId":"public.issues"', '"tableId":"table:bb:g2"')
+        .replaceAll('"public.events"', '"table:aa:g2"')
+        .replaceAll('"public.issues"', '"table:bb:g2"');
+      return new Response(text, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const harness = makeRebuildableClient(
+      [
+        {
+          cursor: "cursor-p",
+          marker: "epoch-one",
+          change: {
+            error: "change authorization belongs to another schema generation",
+            code: "RESNAPSHOT_REQUIRED",
+          },
+        },
+        {
+          cursor: "cursor-q",
+          marker: "epoch-two",
+          change: { cursor: "cursor-q" },
+        },
+      ],
+      undefined,
+      { bootstrap: (index) => (index === 1 ? moved() : undefined) },
+    );
+    const { client, poll, workers } = harness;
+    expect(await settled(client)).toEqual({ state: "ready" });
+    await until(() => poll.open > 0, "the change stream to poll");
+    poll.answer();
+    await until(
+      () => workers.length === 2,
+      "the rebuild to mint a second mount",
+    );
+    expect(await settled(client)).toEqual({ state: "ready" });
+    const tableIds = (index: number) => {
+      const open = workers[index]?.requests.find(
+        (request) => request.type === "open",
+      );
+      return open?.type === "open"
+        ? (
+            open.changeStream as { tables: { tableId: string }[] } | undefined
+          )?.tables.map((table) => table.tableId)
+        : undefined;
+    };
+    expect(tableIds(0)).toEqual(["public.events", "public.issues"]);
+    expect(tableIds(1)).toEqual(["table:aa:g2", "table:bb:g2"]);
+    expect(await client.db.events.query().run()).toEqual([
+      { id: 1n, level: "epoch-two" },
+      { id: 2n, level: "epoch-two" },
+    ]);
+    const resumed = poll.requests.at(-1);
+    expect(resumed?.tables.map((table) => table.tableId)).toEqual([
+      "table:aa:g2",
+      "table:bb:g2",
+    ]);
     await client.close();
   });
 

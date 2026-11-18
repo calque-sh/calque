@@ -16,7 +16,8 @@ use thiserror::Error;
 mod normalizer;
 
 pub use normalizer::{
-    ColumnCodec, PostgresTextCodec, SchemaNormalizer, TableCodec, POSTGRES_EPOCH_UNIX_MICROS,
+    carries_cut_marker, cut_marker_generation, ColumnCodec, PostgresTextCodec, SchemaNormalizer,
+    TableCodec, POSTGRES_EPOCH_UNIX_MICROS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -67,13 +68,28 @@ pub trait FenceAuthority: Send + Sync {
 #[error("canonical normalization failed: {message}")]
 pub struct NormalizationError {
     message: String,
+    relation_changed: bool,
 }
 
 impl NormalizationError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            relation_changed: false,
         }
+    }
+
+    /// A Relation message, or a relation, the registry does not describe: the
+    /// source's schema moved on.
+    pub fn relation_changed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            relation_changed: true,
+        }
+    }
+
+    pub const fn is_relation_change(&self) -> bool {
+        self.relation_changed
     }
 }
 
@@ -935,6 +951,7 @@ mod tests {
                 },
                 build_id: "build-1".to_owned(),
                 nonce: "nonce-1".to_owned(),
+                schema_generation: 1,
                 message_lsn: "0/F".to_owned(),
                 commit_lsn: PgLsn::from(transaction.commit_lsn.get()).to_string(),
                 commit_time_unix_micros: 0,
@@ -960,6 +977,7 @@ mod tests {
             CanonicalEntry::Barrier(CanonicalBarrier {
                 build_id,
                 nonce,
+                schema_generation: 1,
                 ..
             }) if build_id == "build-1" && nonce == "nonce-1"
         ));

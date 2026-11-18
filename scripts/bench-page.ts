@@ -41,6 +41,11 @@ export interface BenchWindow {
     readonly publications: number;
     /** The page's last 512 publications that moved a collection, oldest first. */
     readonly publicationLog?: readonly PagePublication[];
+    /** Every change of the client's status, oldest first. */
+    readonly statusLog?: readonly {
+      readonly state: string;
+      readonly at: number;
+    }[];
     readonly shown?: () => readonly unknown[];
     readonly db: Record<
       string,

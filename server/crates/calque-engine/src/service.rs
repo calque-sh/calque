@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     task::{Context, Poll},
 };
 
@@ -17,10 +17,11 @@ use axum::{
 use http_body::{Body as _, Frame, SizeHint};
 use pin_project_lite::pin_project;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tower::ServiceExt as _;
 
 use crate::{
     AllowedOrigin, ArtifactService, HttpBinding, LocalBackend, LocalMutationBackend,
-    LocalSourceHealth, OperationErrorClass, OperationsMetrics,
+    LocalSourceHealth, MovingBackend, OperationErrorClass, OperationsMetrics,
 };
 
 type DependencyProbe = Arc<dyn Fn() -> Result<(), OperationErrorClass> + Send + Sync>;
@@ -139,7 +140,6 @@ struct LocalHttpPolicy {
     binding: HttpBinding,
     origins: Arc<BTreeSet<String>>,
     refused: RefusedRequests,
-    health: LocalSourceHealth,
     request_permits: Arc<Semaphore>,
 }
 
@@ -197,9 +197,112 @@ pub fn local_router(
     origins: impl IntoIterator<Item = AllowedOrigin>,
     max_inflight_requests: usize,
 ) -> Router {
-    let application = application_router(backend, artifacts, health.clone(), metrics)
-        .merge(mutation_http::router(mutations));
-    protect_local_router(application, health, binding, origins, max_inflight_requests)
+    protect_local_router(
+        generation_routes(backend, mutations, artifacts, health, metrics),
+        binding,
+        origins,
+        max_inflight_requests,
+    )
+}
+
+/// The routes of the schema generation a source serves, swapped as it moves.
+/// A request goes to the routes current when it arrives; one in
+/// flight on routes swapped out finishes on them.
+#[derive(Clone)]
+pub struct GenerationRoutes {
+    current: Arc<RwLock<Router>>,
+}
+
+impl GenerationRoutes {
+    pub fn new(routes: Router) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(routes)),
+        }
+    }
+
+    pub fn replace(&self, routes: Router) {
+        *self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = routes;
+    }
+
+    fn current(&self) -> Router {
+        self.current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// One generation's application routes, the mutation route included. Every
+/// `/v1/` route answers `503` while the runtime's replication session is not
+/// connected.
+pub fn generation_routes(
+    backend: LocalBackend,
+    mutations: LocalMutationBackend,
+    artifacts: ArtifactService,
+    health: LocalSourceHealth,
+    metrics: OperationsMetrics,
+) -> Router {
+    application_router(backend, artifacts, health.clone(), metrics)
+        .merge(mutation_http::router(mutations))
+        .layer(middleware::from_fn_with_state(health, refuse_unconnected))
+}
+
+async fn refuse_unconnected(
+    axum::extract::State(health): axum::extract::State<LocalSourceHealth>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.uri().path().starts_with("/v1/") && !health.is_connected() {
+        return empty_response(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    next.run(request).await
+}
+
+/// The routes served while no schema generation is: the bootstrap, change and
+/// mutation routes answer as [`MovingBackend`] says, every other `/v1/` route
+/// `503`, `/readyz` `503` and `/healthz` `204`.
+pub fn moving_routes(backend: MovingBackend) -> Router {
+    Router::new()
+        .route(
+            "/healthz",
+            get(|| async { empty_response(StatusCode::NO_CONTENT) }),
+        )
+        .route(
+            "/readyz",
+            get(|| async { empty_response(StatusCode::SERVICE_UNAVAILABLE) }),
+        )
+        .merge(bootstrap_http::router(backend.clone()))
+        .merge(change_http::router(backend.clone()))
+        .merge(mutation_http::router(backend))
+        .fallback(|request: Request| async move {
+            if request.uri().path().starts_with("/v1/") {
+                empty_response(StatusCode::SERVICE_UNAVAILABLE)
+            } else {
+                empty_response(StatusCode::NOT_FOUND)
+            }
+        })
+}
+
+/// The routes `routes` holds when each request arrives, inside one protection
+/// layer, for a process whose source moves between schema generations.
+pub fn switched_local_router(
+    routes: GenerationRoutes,
+    binding: HttpBinding,
+    origins: impl IntoIterator<Item = AllowedOrigin>,
+    max_inflight_requests: usize,
+) -> Router {
+    let dispatch = Router::new().fallback(move |request: Request| {
+        let current = routes.current();
+        async move {
+            let Ok(response): Result<Response, std::convert::Infallible> =
+                current.oneshot(request).await;
+            response
+        }
+    });
+    protect_local_router(dispatch, binding, origins, max_inflight_requests)
 }
 
 fn application_router(
@@ -303,7 +406,6 @@ fn has_expected_host(request: &Request, binding: &HttpBinding) -> bool {
 
 fn protect_local_router(
     router: Router,
-    health: LocalSourceHealth,
     binding: HttpBinding,
     origins: impl IntoIterator<Item = AllowedOrigin>,
     max_inflight_requests: usize,
@@ -317,7 +419,6 @@ fn protect_local_router(
                 .collect(),
         ),
         refused: RefusedRequests::default(),
-        health,
         request_permits: Arc::new(Semaphore::new(max_inflight_requests)),
     };
     router.layer(middleware::from_fn_with_state(
@@ -366,8 +467,6 @@ async fn enforce_local_request(
         } else {
             cors_response(empty_response(StatusCode::NO_CONTENT), origin, true)
         }
-    } else if request.uri().path().starts_with("/v1/") && !policy.health.is_connected() {
-        empty_response(StatusCode::SERVICE_UNAVAILABLE)
     } else {
         next.run(request).await
     };
@@ -550,6 +649,23 @@ mod tests {
         fn is_end_stream(&self) -> bool {
             self.emitted
         }
+    }
+
+    /// The protection layer over `router` with its `/v1/` routes refused
+    /// while `health` is not connected, as [`generation_routes`] refuses them.
+    fn protect_local_router(
+        router: Router,
+        health: LocalSourceHealth,
+        binding: HttpBinding,
+        origins: impl IntoIterator<Item = AllowedOrigin>,
+        max_inflight_requests: usize,
+    ) -> Router {
+        super::protect_local_router(
+            router.layer(middleware::from_fn_with_state(health, refuse_unconnected)),
+            binding,
+            origins,
+            max_inflight_requests,
+        )
     }
 
     fn router(healthy: bool) -> Router {
@@ -1300,5 +1416,53 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+    }
+
+    /// A request goes to the routes current when it arrives: a generation's
+    /// routes until a move swaps in the routes between generations, which
+    /// answer `/readyz` `503`, `/healthz` `204` and every other `/v1/` route
+    /// `503`, then the next generation's once they are swapped in.
+    #[tokio::test]
+    async fn the_switched_router_serves_the_routes_current_when_a_request_arrives() {
+        let generation = |healthy| {
+            control_router(
+                LocalSourceHealth::for_test(healthy),
+                OperationsMetrics::new(),
+                Arc::new(|| Ok(())),
+            )
+        };
+        let routes = GenerationRoutes::new(generation(true));
+        let router = switched_local_router(
+            routes.clone(),
+            HttpBinding::loopback(8787).unwrap(),
+            [AllowedOrigin::parse("http://127.0.0.1:5173").unwrap()],
+            DEFAULT_MAX_INFLIGHT_REQUESTS,
+        );
+        let status = |path: &'static str| {
+            let router = router.clone();
+            async move { router.oneshot(request(path)).await.unwrap().status() }
+        };
+        assert_eq!(status("/readyz").await, StatusCode::NO_CONTENT);
+
+        let token = crate::SecretToken::generate().unwrap();
+        routes.replace(moving_routes(MovingBackend::new(
+            crate::LocalCredentialPolicy::DevelopmentSharedBearer {
+                token: *token.as_bytes(),
+                principal: authz::Principal::new(
+                    crate::LOCAL_DEVELOPMENT_SUBJECT,
+                    std::collections::BTreeMap::new(),
+                )
+                .unwrap(),
+            },
+            1,
+            crate::BetweenGenerations::Preparing,
+        )));
+        assert_eq!(status("/readyz").await, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status("/healthz").await, StatusCode::NO_CONTENT);
+        assert_eq!(status("/v1/tenants").await, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status("/elsewhere").await, StatusCode::NOT_FOUND);
+
+        routes.replace(generation(true));
+        assert_eq!(status("/readyz").await, StatusCode::NO_CONTENT);
     }
 }

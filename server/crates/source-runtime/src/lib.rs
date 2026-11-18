@@ -26,6 +26,7 @@ mod column_versions;
 mod enum_labels;
 mod persistent_ingest;
 mod publication;
+mod schema_generation;
 mod slot_owner;
 
 pub use column_versions::ColumnVersion;
@@ -37,10 +38,14 @@ pub use persistent_ingest::{
 };
 pub(crate) use publication::PUBLICATION_CHECK_INTERVAL;
 pub use publication::{inspect_owned_publication, OwnedPublication};
+pub use schema_generation::{
+    read_schema_generation, RecordedSchemaGeneration, SchemaBoundary, SchemaMoveBaseline,
+};
 pub use slot_owner::{
     establish_persistent_source, establish_persistent_source_interruptible,
-    provision_persistent_slot, ActiveSourceSession, OpenTransaction, SlotEnrollment, SlotMetadata,
-    SlotProvisioningConfig, SourceRuntimeError, DEFAULT_OPEN_TRANSACTION_WAIT,
+    provision_persistent_slot, start_schema_generation, ActiveSourceSession, OpenTransaction,
+    SlotEnrollment, SlotMetadata, SlotProvisioningConfig, SourceRuntimeError,
+    DEFAULT_OPEN_TRANSACTION_WAIT,
 };
 
 /// Cross-thread, single-purpose revocation for source-session startup.
@@ -219,6 +224,14 @@ CREATE TABLE IF NOT EXISTS calque_control.source_enum_version (
     value_xmin bigint NOT NULL,
     seen_from_lsn text NOT NULL,
     PRIMARY KEY (source_id, value_oid, value_xmin)
+);
+CREATE TABLE IF NOT EXISTS calque_control.source_schema_generation (
+    source_id text PRIMARY KEY
+        REFERENCES calque_control.source_slot_enrollment (source_id) ON DELETE CASCADE,
+    source_epoch text NOT NULL,
+    schema_generation bigint NOT NULL CHECK (schema_generation > 1),
+    boundary_sequence bigint NOT NULL CHECK (boundary_sequence >= 0),
+    serving_from_lsn pg_lsn
 );
 CREATE TABLE IF NOT EXISTS calque_control.source_column_version (
     source_id text NOT NULL
@@ -497,6 +510,31 @@ pub trait FenceStore: Send + Sync {
         versions: &[ColumnVersion],
     ) -> Result<(), FenceError>;
 
+    /// The source's recorded schema generation, or `None` before any move.
+    fn load_schema_generation(
+        &self,
+        lease: &LeaseIdentity,
+    ) -> Result<Option<RecordedSchemaGeneration>, FenceError>;
+
+    /// Records a move to `generation`, above the one recorded, with its
+    /// boundary at the canonical log head, and replaces the shape the
+    /// enrollment's sessions are checked against with `baseline`.
+    fn record_schema_move(
+        &self,
+        lease: &LeaseIdentity,
+        generation: u64,
+        baseline: &SchemaMoveBaseline,
+    ) -> Result<RecordedSchemaGeneration, FenceError>;
+
+    /// Records that the boundary of the move to `generation` closed at the
+    /// barrier whose WAL ends at `from_lsn`.
+    fn record_schema_generation_serving(
+        &self,
+        lease: &LeaseIdentity,
+        generation: u64,
+        from_lsn: u64,
+    ) -> Result<(), FenceError>;
+
     fn transition_active(
         &self,
         lease: &LeaseIdentity,
@@ -767,6 +805,30 @@ where
         })
     }
 
+    /// The source's recorded schema generation, or `None` before any move.
+    pub fn load_schema_generation(
+        &self,
+        lease: &ProvisionalLease,
+    ) -> Result<Option<RecordedSchemaGeneration>, FenceError> {
+        self.operate(lease, |identity| {
+            self.store.load_schema_generation(identity)
+        })
+    }
+
+    /// Records a move to `generation` before the stream this lease opens
+    /// acknowledges anything.
+    pub(crate) fn record_schema_move(
+        &self,
+        lease: &ProvisionalLease,
+        generation: u64,
+        baseline: &SchemaMoveBaseline,
+    ) -> Result<RecordedSchemaGeneration, FenceError> {
+        self.operate(lease, |identity| {
+            self.store
+                .record_schema_move(identity, generation, baseline)
+        })
+    }
+
     fn activate(
         &self,
         lease: ProvisionalLease,
@@ -896,6 +958,18 @@ where
     ) -> Result<(), FenceError> {
         self.operate_active(lease, |identity| {
             self.store.record_column_versions(identity, versions)
+        })
+    }
+
+    pub(crate) fn record_schema_generation_serving(
+        &self,
+        lease: &ActiveLease,
+        generation: u64,
+        from_lsn: u64,
+    ) -> Result<(), FenceError> {
+        self.operate_active(lease, |identity| {
+            self.store
+                .record_schema_generation_serving(identity, generation, from_lsn)
         })
     }
 
@@ -1483,6 +1557,164 @@ impl FenceStore for PostgresFenceStore {
         })
     }
 
+    fn load_schema_generation(
+        &self,
+        lease: &LeaseIdentity,
+    ) -> Result<Option<RecordedSchemaGeneration>, FenceError> {
+        self.with_owned_lease(lease, |transaction, _current| {
+            transaction
+                .query_opt(
+                    "SELECT schema_generation, boundary_sequence, serving_from_lsn
+                       FROM calque_control.source_schema_generation
+                      WHERE source_id = $1 AND source_epoch = $2",
+                    &[&lease.source_id.as_str(), &lease.source_epoch.as_str()],
+                )
+                .map_err(store_error)?
+                .map(|row| schema_generation::recorded_from_row(row).map_err(store_error))
+                .transpose()
+        })
+    }
+
+    fn record_schema_move(
+        &self,
+        lease: &LeaseIdentity,
+        generation: u64,
+        baseline: &SchemaMoveBaseline,
+    ) -> Result<RecordedSchemaGeneration, FenceError> {
+        let requested =
+            i64::try_from(generation).map_err(|_| FenceError::SchemaGenerationNotAhead {
+                recorded: None,
+                requested: generation,
+            })?;
+        self.with_owned_lease(lease, |transaction, current| {
+            if current.phase != LeasePhase::Provisional {
+                return Err(FenceError::WrongLeasePhase {
+                    expected: LeasePhase::Provisional,
+                    actual: current.phase,
+                });
+            }
+            // The canonical log creates its head table on first connect.
+            let log_installed: bool = transaction
+                .query_one(
+                    "SELECT to_regclass('calque_control.canonical_log_head') IS NOT NULL",
+                    &[],
+                )
+                .map_err(store_error)?
+                .get(0);
+            let head: i64 = if log_installed {
+                transaction
+                    .query_opt(
+                        "SELECT head_sequence FROM calque_control.canonical_log_head
+                          WHERE source_id = $1 AND source_epoch = $2",
+                        &[&lease.source_id.as_str(), &lease.source_epoch.as_str()],
+                    )
+                    .map_err(store_error)?
+                    .map_or(0, |row| row.get(0))
+            } else {
+                0
+            };
+            let recorded = transaction
+                .query_opt(
+                    "INSERT INTO calque_control.source_schema_generation (
+                        source_id, source_epoch, schema_generation, boundary_sequence,
+                        serving_from_lsn
+                     ) VALUES ($1, $2, $3, $4, NULL)
+                     ON CONFLICT (source_id) DO UPDATE
+                        SET source_epoch = EXCLUDED.source_epoch,
+                            schema_generation = EXCLUDED.schema_generation,
+                            boundary_sequence = EXCLUDED.boundary_sequence,
+                            serving_from_lsn = NULL
+                      WHERE calque_control.source_schema_generation.schema_generation
+                            < EXCLUDED.schema_generation
+                     RETURNING schema_generation, boundary_sequence, serving_from_lsn",
+                    &[
+                        &lease.source_id.as_str(),
+                        &lease.source_epoch.as_str(),
+                        &requested,
+                        &head,
+                    ],
+                )
+                .map_err(store_error)?;
+            let Some(row) = recorded else {
+                return Err(FenceError::SchemaGenerationNotAhead {
+                    recorded: transaction
+                        .query_one(
+                            "SELECT schema_generation FROM calque_control.source_schema_generation
+                              WHERE source_id = $1",
+                            &[&lease.source_id.as_str()],
+                        )
+                        .map_err(store_error)?
+                        .get::<_, i64>(0)
+                        .try_into()
+                        .ok(),
+                    requested: generation,
+                });
+            };
+            let affected = transaction
+                .execute(
+                    "UPDATE calque_control.source_slot_enrollment
+                        SET publication_fingerprint = $3, enum_labels_from_lsn = $4
+                      WHERE source_id = $1 AND source_epoch = $2",
+                    &[
+                        &lease.source_id.as_str(),
+                        &lease.source_epoch.as_str(),
+                        &baseline.publication_fingerprint,
+                        &slot_owner::format_lsn(baseline.enum_labels_from_lsn),
+                    ],
+                )
+                .map_err(store_error)?;
+            if affected != 1 {
+                return Err(FenceError::SlotEnrollmentMismatch);
+            }
+            for table in ["source_enum_label", "source_enum_version"] {
+                transaction
+                    .execute(
+                        &format!("DELETE FROM calque_control.{table} WHERE source_id = $1"),
+                        &[&lease.source_id.as_str()],
+                    )
+                    .map_err(store_error)?;
+            }
+            insert_enum_labels(transaction, lease, &baseline.enum_labels)?;
+            replace_column_versions(transaction, lease, &baseline.column_versions)?;
+            schema_generation::recorded_from_row(row).map_err(store_error)
+        })
+    }
+
+    fn record_schema_generation_serving(
+        &self,
+        lease: &LeaseIdentity,
+        generation: u64,
+        from_lsn: u64,
+    ) -> Result<(), FenceError> {
+        let generation_value = i64::try_from(generation)
+            .map_err(|_| FenceError::SchemaGenerationMismatch(generation))?;
+        self.with_owned_lease(lease, |transaction, current| {
+            if current.phase != LeasePhase::Active {
+                return Err(FenceError::WrongLeasePhase {
+                    expected: LeasePhase::Active,
+                    actual: current.phase,
+                });
+            }
+            let affected = transaction
+                .execute(
+                    "UPDATE calque_control.source_schema_generation
+                        SET serving_from_lsn = $4
+                      WHERE source_id = $1 AND source_epoch = $2 AND schema_generation = $3",
+                    &[
+                        &lease.source_id.as_str(),
+                        &lease.source_epoch.as_str(),
+                        &generation_value,
+                        &postgres::types::PgLsn::from(from_lsn),
+                    ],
+                )
+                .map_err(store_error)?;
+            if affected != 1 {
+                return Err(FenceError::SchemaGenerationMismatch(generation));
+            }
+            Ok(())
+        })
+    }
+
     fn transition_active(
         &self,
         lease: &LeaseIdentity,
@@ -2017,6 +2249,13 @@ pub enum FenceError {
     InvalidStoredToken(i64),
     #[error("control store contains invalid lease phase {0}")]
     InvalidStoredPhase(String),
+    #[error("schema generation {requested} is not above the one recorded ({recorded:?})")]
+    SchemaGenerationNotAhead {
+        recorded: Option<u64>,
+        requested: u64,
+    },
+    #[error("the recorded schema generation is not {0}")]
+    SchemaGenerationMismatch(u64),
 }
 
 #[cfg(test)]
@@ -2253,6 +2492,31 @@ mod tests {
             &self,
             _: &LeaseIdentity,
             _: &[ColumnVersion],
+        ) -> Result<(), FenceError> {
+            unreachable!("not scripted")
+        }
+
+        fn load_schema_generation(
+            &self,
+            _: &LeaseIdentity,
+        ) -> Result<Option<RecordedSchemaGeneration>, FenceError> {
+            unreachable!("not scripted")
+        }
+
+        fn record_schema_move(
+            &self,
+            _: &LeaseIdentity,
+            _: u64,
+            _: &SchemaMoveBaseline,
+        ) -> Result<RecordedSchemaGeneration, FenceError> {
+            unreachable!("not scripted")
+        }
+
+        fn record_schema_generation_serving(
+            &self,
+            _: &LeaseIdentity,
+            _: u64,
+            _: u64,
         ) -> Result<(), FenceError> {
             unreachable!("not scripted")
         }

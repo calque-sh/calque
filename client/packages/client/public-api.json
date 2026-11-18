@@ -7,7 +7,7 @@
     "./bootstrap-render",
     "./vite"
   ],
-  "reachableDeclarationGraphSha256": "8ca07e136c75ba89bf81b1a0bbfc5bd2f7299aeb9742bf29d3fd101a22cd2448",
+  "reachableDeclarationGraphSha256": "37c57abb1d0b86342f7f5bd48106bdc74ea229a5c31a9f9f8e7cc926c52dcd8b",
   "rootValues": [
     "MutationSubmissionError",
     "SyncError",

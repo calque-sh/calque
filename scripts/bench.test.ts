@@ -375,6 +375,26 @@ test("--no-stored-rows reaches calque dev, --returning takes returning visits, a
   );
 });
 
+test("--schema-change takes one of three cases, makes every cold sample a schema sample and leaves the run unjudged", () => {
+  assert.equal(parseBenchArguments([]).schemaChange, undefined);
+  for (const change of ["config-add", "rewrite-whole", "rename-suspend"]) {
+    const options = parseBenchArguments(["--smoke", "--schema-change", change]);
+    assert.equal(options.schemaChange, change);
+    assert.deepEqual(unjudgedReasons(options), [`schema samples (${change})`]);
+  }
+  for (const bad of [
+    ["--schema-change", "drop-table"],
+    ["--schema-change"],
+    ["--schema-change", "config-add", "--schema-change", "config-add"],
+  ])
+    assert.throws(() => parseBenchArguments(bad), /usage: pnpm bench/u);
+  for (const other of [["--realtime-only"], ["--returning"], ["--tail", "1"]])
+    assert.throws(
+      () => parseBenchArguments(["--schema-change", "config-add", ...other]),
+      /--schema-change makes every cold sample a schema sample/u,
+    );
+});
+
 test("--recut-tail-ratio and --recut-min-interval reach calque dev and leave the run unjudged", () => {
   const options = parseBenchArguments([
     "--recut-tail-ratio",
@@ -2646,6 +2666,25 @@ test("a capture signal keeps the match readable and invalidates the sample", () 
   assert.equal(
     reordered.droppedFrameSignals[0]?.kind,
     "non-increasing-timestamp",
+  );
+  // Frames stamped out of order after the match, each showing the expected
+  // state: the signal invalidates the sample, and nothing contradicts it.
+  const late = judgeStablePaint(
+    [frame(0, 1_000, B), frame(1, 990, B), frame(2, 1_800, B)],
+    "full",
+    B,
+  );
+  assert.equal(late.matchMs, 1_000);
+  assert.equal(late.contradiction, null);
+  assert.equal(late.droppedFrameSignals[0]?.kind, "non-increasing-timestamp");
+  const differs = judgeStablePaint(
+    [frame(0, 1_000, B), frame(1, 990, B), frame(2, 1_800, C)],
+    "full",
+    B,
+  );
+  assert.equal(
+    differs.contradiction?.contradictingTimestampMilliseconds,
+    1_800,
   );
   assert.throws(
     () => judgeStablePaint([frame(0, 1_000, A, null)], "grid", A),

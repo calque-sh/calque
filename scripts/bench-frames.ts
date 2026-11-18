@@ -653,10 +653,14 @@ export class StableFrameDetector {
     this.#previousTimestampMilliseconds =
       observation.monotonicTimestampMilliseconds;
 
-    const qualified =
-      !this.invalid &&
+    // The stable-paint rule: a frame inside the hold window contradicts the
+    // match only when it shows something else. A dropped-frame signal stops
+    // a match being taken, but a frame after it that shows the expected state
+    // is not a contradiction.
+    const expected =
       observation.roiSha256 === this.#expectedHash &&
       observation.pageContractQualified;
+    const qualified = !this.invalid && expected;
     const match = this.#matchTimestampMilliseconds;
     if (match === undefined) {
       // Every frame after the match can only confirm or contradict it, so it is
@@ -679,7 +683,7 @@ export class StableFrameDetector {
       return null;
     }
     this.#holdWindowFrameCount += 1;
-    if (!qualified && this.#holdWindowContradiction === null) {
+    if (!expected && this.#holdWindowContradiction === null) {
       this.#holdWindowContradiction = Object.freeze({
         holdWindowMilliseconds: STABLE_PAINT_RULE.holdWindowMilliseconds,
         matchTimestampMilliseconds: match,

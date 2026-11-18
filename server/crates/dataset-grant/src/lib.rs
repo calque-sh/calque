@@ -124,6 +124,7 @@ pub struct GrantPresentation<'a> {
 }
 
 /// Verifies grants against a rotating set of issuer keys.
+#[derive(Clone)]
 pub struct GrantVerifier {
     keys: BTreeMap<String, UnparsedPublicKey<[u8; ED25519_PUBLIC_KEY_BYTES]>>,
     audience: String,

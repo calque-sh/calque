@@ -1714,16 +1714,19 @@ fn serve_against_another_database_refuses_before_writing_a_fence_there() {
 }
 
 /// A publication altered while serve runs stops CDC within seconds, with no
-/// reconnect to notice it, as a start that meets it refuses it. The stop's log
-/// line names the publication, and serve exits with the refusal and the remedy
-/// that start would print: restore the definition, destroy, and rerun serve.
+/// reconnect to notice it, and the stop's log line names the publication.
+/// Serve then moves the source to its next schema generation: the move puts
+/// back the definition, which Calque's role owns, and a bootstrap plans at
+/// generation 2. A start while a move is pending, as one whose
+/// process stopped before the move began, moves the source again.
 #[test]
 #[ignore = "requires TEST_DATABASE_URL"]
-fn a_publication_altered_while_serving_stops_cdc_and_exits_naming_its_remedy() {
+fn a_publication_altered_while_serving_moves_the_source_to_its_next_generation() {
     let _exclusive = exclusive();
     let fixture = Fixture::new("drift");
     fixture.seed();
     let mut served = serve(&fixture, 1);
+    assert_eq!(served.line("schema_generation"), Some("1"));
     let stderr_lines = served.stderr.take().unwrap();
 
     let mut admin = Client::connect(&database_url(), NoTls).unwrap();
@@ -1759,25 +1762,38 @@ fn a_publication_altered_while_serving_stops_cdc_and_exits_naming_its_remedy() {
         "{stop}"
     );
 
-    let exited_cleanly = served.shutdown();
-    let exit: Vec<String> = stderr_lines.iter().collect();
-    let state_dir = fixture.directory.path().join("state");
-    let state_dir = state_dir.display();
-    fixture.drop_source();
+    let relation = fixture.relation();
+    let grant = fixture.grant(1);
+    let plan = loop {
+        let response = bootstrap_response_holding(served.port, &grant, &relation, &[]);
+        if response.status == 200 {
+            break Plan::parse(&response.json());
+        }
+        assert_eq!(response.status, 503, "{}", response.text());
+        assert!(
+            Instant::now() < deadline,
+            "serve did not plan at the next generation within {DELIVERY_TIMEOUT:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(plan.table_id.ends_with(":g2"), "{}", plan.table_id);
+    let row_filter: Option<String> = admin
+        .query_one(
+            "SELECT rowfilter FROM pg_catalog.pg_publication_tables WHERE pubname = $1",
+            &[&fixture.publication()],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(row_filter, None);
+    assert!(served.shutdown());
 
-    assert!(!exited_cleanly, "{exit:#?}");
-    assert_eq!(
-        exit.iter()
-            .map(String::as_str)
-            .filter(|line| line.starts_with("calque: "))
-            .collect::<Vec<_>>(),
-        [format!(
-            "calque: {drift} Restore the publication's definition if it was altered, then run \
-             calque destroy --state-dir {state_dir} --database-url-env {DATABASE_ENV} --yes and \
-             rerun serve to prepare the working set anew, since the one it holds may no longer \
-             match PostgreSQL."
-        )]
-    );
+    let state_dir = fixture.directory.path().join("state");
+    std::fs::write(state_dir.join("schema-move-pending"), b"").unwrap();
+    let served = serve(&fixture, 1);
+    assert_eq!(served.line("schema_generation"), Some("3"));
+    assert!(!state_dir.join("schema-move-pending").exists());
+    assert!(served.shutdown());
+    fixture.drop_source();
 }
 
 /// Clients that arrive together, the way every client of a restarted process

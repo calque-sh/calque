@@ -2,7 +2,13 @@ use std::{
     ops::{Deref, DerefMut},
     sync::mpsc,
     thread,
+    time::Duration,
 };
+
+/// How long a drop waits for the closing thread. The terminate message is
+/// written at once; this bounds the wait for PostgreSQL to close the socket,
+/// which a server that stopped answering never does.
+const CLOSE_WAIT: Duration = Duration::from_millis(250);
 
 /// A blocking connection that may be dropped on any thread.
 ///
@@ -51,17 +57,21 @@ impl<C: Send + 'static> Drop for DropOffRuntime<C> {
         // that could not be spawned leaves it here instead of dropping it
         // inside the closure on this thread.
         let (handover, incoming) = mpsc::channel::<C>();
+        let (closed, closing) = mpsc::channel::<()>();
         match thread::Builder::new()
             .name("postgres-close".to_owned())
-            .spawn(move || drop(incoming.recv()))
-        {
-            Ok(closer) => {
+            .spawn(move || {
+                drop(incoming.recv());
+                let _ = closed.send(());
+            }) {
+            Ok(_closer) => {
                 // The receiver lives on the new thread until it has the value,
                 // so this send cannot fail.
                 let _ = handover.send(connection);
-                // Joining keeps the terminate message ordered before the
-                // process exits. It costs one round trip.
-                let _ = closer.join();
+                // Waiting keeps the terminate message ordered before the
+                // process exits. It costs one round trip, and a server that
+                // never answers leaves the thread to finish on its own.
+                let _ = closing.recv_timeout(CLOSE_WAIT);
             }
             Err(error) => {
                 // Threads are unavailable only under real resource exhaustion.
@@ -115,6 +125,26 @@ mod tests {
         runtime.block_on(async move {
             drop(connection);
         });
+    }
+
+    /// A connection to a server that stopped answering never finishes
+    /// closing; its drop returns once `CLOSE_WAIT` has passed.
+    #[test]
+    fn a_close_that_never_finishes_does_not_hold_the_drop() {
+        struct NeverCloses(mpsc::Receiver<()>);
+
+        impl Drop for NeverCloses {
+            fn drop(&mut self) {
+                let _ = self.0.recv();
+            }
+        }
+
+        let (release, held) = mpsc::channel();
+        let started = std::time::Instant::now();
+        drop(DropOffRuntime::new(NeverCloses(held)));
+        let took = started.elapsed();
+        assert!(took >= CLOSE_WAIT && took < CLOSE_WAIT * 8, "{took:?}");
+        drop(release);
     }
 
     #[test]

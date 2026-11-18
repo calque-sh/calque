@@ -20,17 +20,17 @@ use postgres::{error::SqlState, Client};
 use source_control::quote_identifier;
 use source_control::{
     inspect_enum_labels, inspect_source, ActivatedSource, EnrollmentRequirements,
-    EnrollmentSnapshot, PgoutputLaunchProfile, QualifiedTable, SchemaRegistry, SharedEnumLabels,
-    SourceIdentity, TableInspection,
+    EnrollmentSnapshot, PgoutputLaunchProfile, QualifiedTable, SchemaRegistry, SchemaRegistryError,
+    SharedEnumLabels, SourceIdentity, TableInspection,
 };
 use source_runtime::{
     establish_persistent_source, establish_persistent_source_interruptible,
-    inspect_owned_publication, provision_persistent_slot, AcquireRequest, ActiveSourceSession,
-    FenceAuthority, FenceError, FenceStore, LeaseIdentity, OwnedPublication, OwnerId,
-    PersistentIngestBoundary, PersistentIngestConfig, PersistentIngestDisposition,
-    PersistentIngestError, PersistentIngestObserver, PostgresFenceStore, PostgresRefusal,
-    SlotProvisioningConfig, SourceRuntimeError, SourceStartupShutdown,
-    DEFAULT_OPEN_TRANSACTION_WAIT,
+    inspect_owned_publication, provision_persistent_slot, read_schema_generation,
+    start_schema_generation, AcquireRequest, ActiveSourceSession, FenceAuthority, FenceError,
+    FenceStore, LeaseIdentity, OwnedPublication, OwnerId, PersistentIngestBoundary,
+    PersistentIngestConfig, PersistentIngestDisposition, PersistentIngestError,
+    PersistentIngestObserver, PostgresFenceStore, PostgresRefusal, SlotProvisioningConfig,
+    SourceRuntimeError, SourceStartupShutdown, DEFAULT_OPEN_TRANSACTION_WAIT,
 };
 use sync_types::{CursorCodec, CursorPosition};
 use thiserror::Error;
@@ -160,8 +160,14 @@ pub fn prepare_local_source(
     secrets: &LocalSecrets,
     persisted_registry: Option<SchemaRegistry>,
 ) -> Result<PreparedLocalSource, LocalSourceError> {
-    prepare_local_source_unexplained(database_url, state, secrets, persisted_registry, None)
-        .map_err(|error| SourceContext::of(database_url, None).explained(error))
+    prepare_moving_local_source(
+        database_url,
+        state,
+        secrets,
+        persisted_registry,
+        None,
+        false,
+    )
 }
 
 /// Prepares a source whose publication publishes exactly `columns` of each
@@ -173,12 +179,46 @@ pub fn prepare_selected_local_source(
     persisted_registry: Option<SchemaRegistry>,
     columns: &SelectedColumns,
 ) -> Result<PreparedLocalSource, LocalSourceError> {
-    prepare_local_source_unexplained(
+    prepare_moving_local_source(
         database_url,
         state,
         secrets,
         persisted_registry,
         Some(columns),
+        false,
+    )
+}
+
+/// Prepares a source, moving it to a new schema generation when the
+/// registry it served no longer binds what it is asked to serve.
+///
+/// The source serves `persisted_registry` when its generation is the one the
+/// source recorded, the publication publishes what `columns` select (every
+/// column of `state.tables` without them), and the live catalog still matches
+/// it. Otherwise the publication, when Calque's role owns it, is altered to
+/// the selection, and the registry is compiled from the live source at the
+/// next generation. A caller writes a registry of another generation than the
+/// one it passed before starting the runtime, which records the move.
+/// `force_move` moves even when nothing above differs: the runtime stopped on a
+/// change the catalog does not show, such as a column rewritten in place.
+///
+/// A live shape the selection cannot bind is refused with an error whose
+/// [`LocalSourceError::suspends_schema`] holds.
+pub fn prepare_moving_local_source(
+    database_url: &DatabaseUrl,
+    state: &LocalState,
+    secrets: &LocalSecrets,
+    persisted_registry: Option<SchemaRegistry>,
+    columns: Option<&SelectedColumns>,
+    force_move: bool,
+) -> Result<PreparedLocalSource, LocalSourceError> {
+    prepare_local_source_unexplained(
+        database_url,
+        state,
+        secrets,
+        persisted_registry,
+        columns,
+        force_move,
     )
     .map_err(|error| SourceContext::of(database_url, None).explained(error))
 }
@@ -189,6 +229,7 @@ fn prepare_local_source_unexplained(
     secrets: &LocalSecrets,
     persisted_registry: Option<SchemaRegistry>,
     columns: Option<&SelectedColumns>,
+    force_move: bool,
 ) -> Result<PreparedLocalSource, LocalSourceError> {
     let mut client = connect_owned(
         database_url,
@@ -201,7 +242,7 @@ fn prepare_local_source_unexplained(
     if let Some(warning) = slot_wal_warning(&mut client)? {
         tracing::warn!("{warning}");
     }
-    ensure_owned_publication(
+    let altered = ensure_owned_publication(
         database_url,
         &mut client,
         &state.names.publication_name,
@@ -222,18 +263,39 @@ fn prepare_local_source_unexplained(
     );
     let registry = match persisted_registry {
         Some(registry) => {
-            if column_list_changed(&registry, &snapshot) {
-                return Err(LocalSourceError::PublicationDrift {
-                    publication: state.names.publication_name.clone(),
-                });
-            }
-            registry.verify_live(&mut client)?;
             if registry.source_identity() != &state.source_identity
                 || registry.publication().name != state.names.publication_name
             {
                 return Err(LocalSourceError::RegistryStateMismatch);
             }
-            registry
+            let recorded = read_schema_generation(&mut client, &state.names.source_id)?
+                .map_or(1, |recorded| recorded.generation);
+            let current = registry.schema_generation() == recorded
+                && !altered
+                && !force_move
+                && registry
+                    .tables()
+                    .iter()
+                    .map(|table| &table.inspection.table)
+                    .collect::<BTreeSet<_>>()
+                    == requirements.tables.iter().collect()
+                && !column_list_changed(&registry, &snapshot)
+                && match registry.verify_live(&mut client) {
+                    Ok(()) => true,
+                    Err(SchemaRegistryError::LiveDrift) => false,
+                    Err(error) => return Err(error.into()),
+                };
+            if current {
+                registry
+            } else {
+                let generation = registry.schema_generation().max(recorded) + 1;
+                let moved = SchemaRegistry::initialize_at(&snapshot, &requirements, generation)?;
+                tracing::info!(
+                    schema_generation = generation,
+                    "the source moves to schema generation {generation}"
+                );
+                moved
+            }
         }
         None => SchemaRegistry::initialize(&snapshot, &requirements)?,
     };
@@ -479,9 +541,10 @@ pub enum CdcStopRemedy {
     /// `calque destroy`, then a rerun; see
     /// [`LocalSourceError::requires_destroying_state`].
     DestroyState,
-    /// Restoring the app-owned publication's enrolled definition, then a
-    /// rerun; see [`LocalSourceError::publication_drifted`].
-    RestorePublication,
+    /// Preparing the source again, which moves it to the next schema
+    /// generation; see [`LocalSourceError::moves_schema`]. A command
+    /// that serves the source does that itself.
+    MoveSchema,
 }
 
 /// What the health slot holds while the runtime is not serving.
@@ -504,10 +567,10 @@ impl HealthFailure {
     }
 
     fn stopped_on(error: &LocalSourceError, source: &SourceContext) -> Self {
-        let remedy = if error.requires_destroying_state() {
+        let remedy = if error.moves_schema() {
+            CdcStopRemedy::MoveSchema
+        } else if error.requires_destroying_state() {
             CdcStopRemedy::DestroyState
-        } else if error.publication_drifted() {
-            CdcStopRemedy::RestorePublication
         } else {
             CdcStopRemedy::Rerun
         };
@@ -964,6 +1027,18 @@ fn start_local_source_runtime_sampling(
                         return Err(session_error(error, &prepared.activated));
                     }
                 }
+                let schema_boundary = match start_schema_generation(
+                    &authority,
+                    &provisional,
+                    database_url.connection_url(PostgresConnectionFamily::SlotProvisioning),
+                    &prepared.activated,
+                ) {
+                    Ok(boundary) => Arc::new(boundary),
+                    Err(error) => {
+                        authority.release_after_failure(&provisional);
+                        return Err(session_error(error, &prepared.activated));
+                    }
+                };
                 if let Err(error) = startup_not_cancelled(&stop_rx) {
                     authority.release_after_failure(&provisional);
                     return Err(error);
@@ -1026,6 +1101,7 @@ fn start_local_source_runtime_sampling(
                     let ingest = PersistentIngestConfig::new(&state_dir)
                         .with_bounds(max_transactions_per_batch, ingest_timeout)?
                         .ending_once_current()
+                        .with_schema_boundary(schema_boundary)
                         .with_observer(Arc::new(CanonicalHeadIngestObserver {
                             signal: head_signal,
                             metrics: metrics.clone(),
@@ -1883,6 +1959,12 @@ fn connect_owned_waiting(
 /// Before the first enrollment, one that exists without the definition was
 /// made for another table set or by hand, not altered, so the refusal names
 /// the statements that replace it rather than a destroy that would keep it.
+/// Makes the publication publish `tables`, with `columns`' lists when given,
+/// and says whether it altered the publication of an enrolled source, which
+/// moves the source to a new schema generation. A publication that does not
+/// exist is created; one an enrolled source no longer finds as it should be
+/// is altered when Calque's role owns it, and refused with the statement that
+/// fixes it otherwise.
 fn ensure_owned_publication(
     database_url: &DatabaseUrl,
     client: &mut Client,
@@ -1890,13 +1972,13 @@ fn ensure_owned_publication(
     tables: &[QualifiedTable],
     columns: Option<&SelectedColumns>,
     enrolled: bool,
-) -> Result<(), LocalSourceError> {
+) -> Result<bool, LocalSourceError> {
     if tables.is_empty() {
         return Err(LocalSourceError::EmptyTableSet);
     }
     let existing = client.query_opt(
-        "SELECT pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot, puballtables
-               FROM pg_catalog.pg_publication WHERE pubname = $1",
+        "SELECT pg_catalog.pg_has_role(current_user, pubowner, 'USAGE')
+           FROM pg_catalog.pg_publication WHERE pubname = $1",
         &[&publication],
     )?;
     let selection = match columns {
@@ -1906,24 +1988,26 @@ fn ensure_owned_publication(
             published: BTreeMap::new(),
         },
     };
-    if existing.is_none() {
+    let quoted = quote_identifier(publication);
+    let Some(existing) = existing else {
         if let Some(table) = first_table_not_owned(client, tables)? {
             return Err(LocalSourceError::PublicationMissing {
                 publication: publication.to_owned(),
                 table,
                 statement: format!(
-                    "CREATE PUBLICATION {} FOR TABLE {};",
-                    quote_identifier(publication),
+                    "CREATE PUBLICATION {quoted} FOR TABLE {};",
                     selection.clauses.join(", ")
                 ),
             });
         }
-        return match create_owned_publication(
+        return match define_owned_publication(
             database_url,
             client,
-            publication,
             tables,
-            &selection.clauses,
+            &format!(
+                "CREATE PUBLICATION {quoted} FOR TABLE {}",
+                selection.clauses.join(", ")
+            ),
         ) {
             Err(LocalSourceError::Postgres(error))
                 if error.code() == Some(&SqlState::INSUFFICIENT_PRIVILEGE) =>
@@ -1934,14 +2018,26 @@ fn ensure_owned_publication(
                     publication,
                 ))
             }
-            created => created,
+            Err(error) => Err(error),
+            Ok(()) => Ok(enrolled),
         };
-    }
+    };
+    let owned: bool = existing.get(0);
+    let requested = tables.iter().cloned().collect::<BTreeSet<_>>();
+    let definition_holds = matches!(
+        inspect_owned_publication(client, publication, &requested)?,
+        OwnedPublication::Matches { .. }
+    );
+    let differing_columns = match columns {
+        Some(columns) => selection.published.iter().find_map(|(table, published)| {
+            let selected = &columns[table];
+            (published.iter().collect::<BTreeSet<_>>() != selected.iter().collect())
+                .then_some((table, published, selected))
+        }),
+        None => None,
+    };
     if !enrolled {
-        let requested = tables.iter().cloned().collect::<BTreeSet<_>>();
-        if inspect_owned_publication(client, publication, &requested)? == OwnedPublication::Drifted
-        {
-            let quoted = quote_identifier(publication);
+        if !definition_holds {
             return Err(LocalSourceError::PublicationDefinitionDiffers {
                 publication: publication.to_owned(),
                 statement: format!(
@@ -1950,28 +2046,69 @@ fn ensure_owned_publication(
                 ),
             });
         }
-    }
-    validate_owned_publication(client, publication, tables)?;
-    let Some(columns) = columns else {
-        return Ok(());
-    };
-    for (table, published) in &selection.published {
-        let selected = &columns[table];
-        if published.iter().collect::<BTreeSet<_>>() != selected.iter().collect() {
-            return Err(LocalSourceError::PublishedColumnsDiffer {
+        return match differing_columns {
+            Some((table, published, selected)) => Err(LocalSourceError::PublishedColumnsDiffer {
                 publication: publication.to_owned(),
                 table: table.display_name(),
                 published: published.clone(),
                 selected: selected.iter().cloned().collect(),
                 statement: format!(
-                    "CREATE PUBLICATION {} FOR TABLE {};",
-                    quote_identifier(publication),
+                    "ALTER PUBLICATION {quoted} SET TABLE {};",
                     selection.clauses.join(", ")
                 ),
-            });
-        }
+            }),
+            None => Ok(false),
+        };
     }
-    Ok(())
+    let lists_hold = match columns {
+        Some(_) => differing_columns.is_none(),
+        None => !publication_lists_columns(client, publication)?,
+    };
+    if definition_holds && lists_hold {
+        return Ok(false);
+    }
+    let statement = format!(
+        "ALTER PUBLICATION {quoted} SET (publish = 'insert, update, delete, truncate', \
+         publish_via_partition_root = false); ALTER PUBLICATION {quoted} SET TABLE {}",
+        selection.clauses.join(", ")
+    );
+    if !owned {
+        return Err(match differing_columns {
+            Some((table, published, selected)) => LocalSourceError::PublishedColumnsDiffer {
+                publication: publication.to_owned(),
+                table: table.display_name(),
+                published: published.clone(),
+                selected: selected.iter().cloned().collect(),
+                statement: format!("{statement};"),
+            },
+            None => LocalSourceError::PublicationDrift {
+                publication: publication.to_owned(),
+            },
+        });
+    }
+    define_owned_publication(database_url, client, tables, &statement)?;
+    tracing::info!(
+        publication,
+        "altered publication {publication} to publish what the configuration selects"
+    );
+    Ok(true)
+}
+
+/// Whether `publication` publishes any table under a column list.
+fn publication_lists_columns(
+    client: &mut Client,
+    publication: &str,
+) -> Result<bool, postgres::Error> {
+    Ok(client
+        .query_one(
+            "SELECT EXISTS (
+               SELECT 1 FROM pg_catalog.pg_publication_rel AS listed
+                 JOIN pg_catalog.pg_publication AS publication
+                   ON publication.oid = listed.prpubid
+                WHERE publication.pubname = $1 AND listed.prattrs IS NOT NULL)",
+            &[&publication],
+        )?
+        .get(0))
 }
 
 /// The publication a manifest's selected columns call for.
@@ -2170,12 +2307,13 @@ pub fn inspect_slot_wal_bound(
     Ok(slot_wal_warning(&mut client)?)
 }
 
-fn create_owned_publication(
+/// Runs `statement`, which creates or alters the publication of `tables`,
+/// once every table is locked.
+fn define_owned_publication(
     database_url: &DatabaseUrl,
     client: &mut Client,
-    publication: &str,
     tables: &[QualifiedTable],
-    clauses: &[String],
+    statement: &str,
 ) -> Result<(), LocalSourceError> {
     let quoted = quoted_tables(tables);
     let bound = publication_lock_bound(client, tables.len())?;
@@ -2202,16 +2340,13 @@ fn create_owned_publication(
     for (table, quoted_table) in held_elsewhere {
         lock_for_publication(&mut transaction, table, quoted_table, deadline, bound)?;
     }
-    // Every table is held by now. CREATE PUBLICATION goes back to the
+    // Every table is held by now. The statement goes back to the
     // connection's own timeouts, not what was left of the last wait,
     // which can be a millisecond.
     transaction.batch_execute(&format!(
-        "SET LOCAL statement_timeout = {}; SET LOCAL lock_timeout = {}; \
-         CREATE PUBLICATION {} FOR TABLE {}",
+        "SET LOCAL statement_timeout = {}; SET LOCAL lock_timeout = {}; {statement}",
         OWNED_STATEMENT_TIMEOUT.as_millis(),
         OWNED_LOCK_TIMEOUT.as_millis(),
-        quote_identifier(publication),
-        clauses.join(", ")
     ))?;
     transaction.commit()?;
     Ok(())
@@ -2446,7 +2581,7 @@ pub enum LocalSourceError {
         publication: String,
         statement: String,
     },
-    #[error("the PostgreSQL publication {publication} publishes columns {published} of {table}, and the manifest selects {selected}; Calque publishes exactly the selected columns, as {statement}", published = .published.join(", "), selected = .selected.join(", "))]
+    #[error("the PostgreSQL publication {publication} publishes columns {published} of {table}, and the manifest selects {selected}. Calque publishes exactly the selected columns: run {statement} as the publication's owner, then start Calque again.", published = .published.join(", "), selected = .selected.join(", "))]
     PublishedColumnsDiffer {
         publication: String,
         table: String,
@@ -2491,14 +2626,11 @@ impl LocalSourceError {
     /// an earlier release wrote, whether connecting the log refused it or an
     /// ingest step met it, a schema registry that does not match the state
     /// beside it, a source another state directory enrolled or an earlier
-    /// release enrolled, a publication whose columns are not the selected
-    /// ones, which destroy drops so the next start creates it with them, an
-    /// enum value whose label the working set may carry stale, or a
-    /// replication slot that was dropped or that PostgreSQL invalidated, since
-    /// the changes it held cannot be replayed and the working set has to be
-    /// prepared anew. A failed session cleanup after one of them needs it too,
-    /// since the cause
-    /// stands.
+    /// release enrolled, or a replication slot that was dropped or that
+    /// PostgreSQL invalidated, since the changes it held cannot be replayed
+    /// and the working set has to be prepared anew. A failed session cleanup
+    /// after one of them needs it too, since the cause stands. A schema change
+    /// does not: it moves the source to its next schema generation.
     pub fn requires_destroying_state(&self) -> bool {
         match self {
             Self::Canonical(error)
@@ -2511,25 +2643,59 @@ impl LocalSourceError {
             Self::Runtime(
                 SourceRuntimeError::SlotMissing { .. }
                 | SourceRuntimeError::SlotLost { .. }
-                | SourceRuntimeError::ColumnChanged { .. }
-                | SourceRuntimeError::ColumnRewritten { .. }
-                | SourceRuntimeError::EnumLabel(_)
                 | SourceRuntimeError::EnrolledByEarlierRelease,
             )
-            | Self::Ingest(PersistentIngestError::EnumLabel(_))
             | Self::RegistryStateMismatch
-            | Self::EnrolledByAnotherState
-            | Self::PublishedColumnsDiffer { .. } => true,
+            | Self::EnrolledByAnotherState => true,
             Self::SessionCleanupFailedAfter(cause) => cause.requires_destroying_state(),
             _ => false,
         }
     }
 
+    /// Whether the source's schema moved on from the registry the runtime
+    /// serves: a Relation message or the watch found a published column
+    /// dropped, renamed, retyped or rewritten, an enum label Calque may serve
+    /// changed, or the publication altered. Preparing the source again moves it
+    /// to the next schema generation. A failed session cleanup
+    /// after one is one too, since the cause stands.
+    pub fn moves_schema(&self) -> bool {
+        match self {
+            Self::Runtime(
+                SourceRuntimeError::ColumnChanged { .. }
+                | SourceRuntimeError::ColumnRewritten { .. }
+                | SourceRuntimeError::EnumLabel(_),
+            )
+            | Self::Ingest(PersistentIngestError::EnumLabel(_))
+            | Self::PublicationDrift { .. } => true,
+            Self::Ingest(PersistentIngestError::Ingest(IngestError::Normalize(error))) => {
+                error.is_relation_change()
+            }
+            Self::SessionCleanupFailedAfter(cause) => cause.moves_schema(),
+            _ => false,
+        }
+    }
+
+    /// Whether the live source cannot be served as configured until it or
+    /// the configuration changes: a selected column or a configured table is
+    /// missing, a key column is left out, or a table is not ready to enroll.
+    /// The source is suspended rather than stopped.
+    pub fn suspends_schema(&self) -> bool {
+        match self {
+            Self::SelectedColumnMissing { .. }
+            | Self::SelectedColumnsOmitKey { .. }
+            | Self::SelectedColumnsUnderFullIdentity { .. }
+            | Self::Registry(source_control::SchemaRegistryError::EnrollmentNotReady(_)) => true,
+            Self::SessionCleanupFailedAfter(cause) => cause.suspends_schema(),
+            _ => false,
+        }
+    }
+
     /// Whether this is the publication no longer having its enrolled
-    /// definition. Restoring the definition and then `calque destroy` gets
-    /// past it. A start meets it
-    /// during enrollment and a reconnect when it opens a session. A failed session cleanup after it
-    /// is one too, since the cause stands.
+    /// definition, which a start meets during enrollment when Calque's role
+    /// cannot restore it, and a reconnect when it opens a session. Restoring
+    /// the definition and starting again gets past it, and moves the source to
+    /// its next schema generation. A failed session cleanup after it is one
+    /// too, since the cause stands.
     pub fn publication_drifted(&self) -> bool {
         match self {
             Self::PublicationDrift { .. } => true,
@@ -2849,9 +3015,9 @@ mod tests {
             health.failure(),
             Some(format!("persistent CDC failed: {drift}"))
         );
-        assert_eq!(health.failure_remedy(), CdcStopRemedy::RestorePublication);
+        assert_eq!(health.failure_remedy(), CdcStopRemedy::MoveSchema);
         guard.record_cleanup_failure();
-        assert_eq!(health.failure_remedy(), CdcStopRemedy::RestorePublication);
+        assert_eq!(health.failure_remedy(), CdcStopRemedy::MoveSchema);
 
         let (guard, health) = guard_and_health(true);
         guard.record(HealthFailure::stopped_on(
@@ -3446,46 +3612,109 @@ mod tests {
                 reason: "reason wal_removed".to_owned(),
             }),
         ];
-        let renamed = || EnumLabelDrift::Changed {
-            enum_type: "mood".to_owned(),
-            label: "calm".to_owned(),
-        };
-        let stale_label = [
-            LocalSourceError::Runtime(SourceRuntimeError::EnumLabel(renamed())),
-            LocalSourceError::Ingest(PersistentIngestError::EnumLabel(renamed())),
-            LocalSourceError::Runtime(SourceRuntimeError::EnrolledByEarlierRelease),
-            LocalSourceError::Runtime(SourceRuntimeError::ColumnChanged {
-                table: "public.items".to_owned(),
-                column: "kind".to_owned(),
-            }),
-            LocalSourceError::Runtime(SourceRuntimeError::ColumnRewritten {
-                table: "public.items".to_owned(),
-                column: "kind".to_owned(),
-            }),
-        ];
         for error in paths(earlier)
             .into_iter()
-            .chain([LocalSourceError::RegistryStateMismatch])
+            .chain([
+                LocalSourceError::RegistryStateMismatch,
+                LocalSourceError::EnrolledByAnotherState,
+                LocalSourceError::Runtime(SourceRuntimeError::EnrolledByEarlierRelease),
+            ])
             .chain(slot_gone)
-            .chain(stale_label)
         {
             assert!(error.requires_destroying_state(), "{error:?}");
+            assert!(
+                !error.moves_schema() && !error.suspends_schema(),
+                "{error:?}"
+            );
             let after = LocalSourceError::SessionCleanupFailedAfter(Box::new(error));
             assert!(after.requires_destroying_state(), "{after:?}");
+        }
+        for error in schema_moves() {
+            assert!(!error.requires_destroying_state(), "{error:?}");
+            assert!(
+                error.moves_schema() && !error.suspends_schema(),
+                "{error:?}"
+            );
+            let after = LocalSourceError::SessionCleanupFailedAfter(Box::new(error));
+            assert!(after.moves_schema(), "{after:?}");
+        }
+        for error in schema_suspensions() {
+            assert!(!error.requires_destroying_state(), "{error:?}");
+            assert!(
+                error.suspends_schema() && !error.moves_schema(),
+                "{error:?}"
+            );
+            let after = LocalSourceError::SessionCleanupFailedAfter(Box::new(error));
+            assert!(after.suspends_schema(), "{after:?}");
         }
         for error in paths(|| LogError::PostgresUnavailable).into_iter().chain([
             LocalSourceError::CdcStartupTimeout,
             LocalSourceError::SessionCleanupFailed,
             LocalSourceError::SourceIdentityChanged,
-            LocalSourceError::PublicationDrift {
-                publication: "calque_drifted".to_owned(),
-            },
             LocalSourceError::Ingest(PersistentIngestError::EnumReadingUnavailable),
+            LocalSourceError::Ingest(PersistentIngestError::Ingest(IngestError::Normalize(
+                cdc_ingest::NormalizationError::new("a malformed message"),
+            ))),
+            LocalSourceError::PublishedColumnsDiffer {
+                publication: "calque_pub".to_owned(),
+                table: "public.items".to_owned(),
+                published: vec!["id".to_owned(), "kind".to_owned()],
+                selected: vec!["id".to_owned()],
+                statement: "ALTER PUBLICATION calque_pub SET TABLE public.items (id);".to_owned(),
+            },
         ]) {
             assert!(!error.requires_destroying_state(), "{error:?}");
+            assert!(
+                !error.moves_schema() && !error.suspends_schema(),
+                "{error:?}"
+            );
             let after = LocalSourceError::SessionCleanupFailedAfter(Box::new(error));
             assert!(!after.requires_destroying_state(), "{after:?}");
         }
+    }
+
+    /// What a stop on a schema change reports, which moves the source to its
+    /// next schema generation.
+    fn schema_moves() -> Vec<LocalSourceError> {
+        let renamed = || EnumLabelDrift::Changed {
+            enum_type: "mood".to_owned(),
+            label: "calm".to_owned(),
+        };
+        let column = || ("public.items".to_owned(), "kind".to_owned());
+        vec![
+            LocalSourceError::Runtime(SourceRuntimeError::EnumLabel(renamed())),
+            LocalSourceError::Ingest(PersistentIngestError::EnumLabel(renamed())),
+            LocalSourceError::Runtime(SourceRuntimeError::ColumnChanged {
+                table: column().0,
+                column: column().1,
+            }),
+            LocalSourceError::Runtime(SourceRuntimeError::ColumnRewritten {
+                table: column().0,
+                column: column().1,
+            }),
+            LocalSourceError::PublicationDrift {
+                publication: "calque_drifted".to_owned(),
+            },
+            LocalSourceError::Ingest(PersistentIngestError::Ingest(IngestError::Normalize(
+                cdc_ingest::NormalizationError::relation_changed("public.items has another column"),
+            ))),
+        ]
+    }
+
+    /// What a live schema the configuration cannot bind reports, which
+    /// suspends the source.
+    fn schema_suspensions() -> Vec<LocalSourceError> {
+        vec![
+            LocalSourceError::SelectedColumnMissing {
+                table: "public.items".to_owned(),
+                column: "kind".to_owned(),
+            },
+            LocalSourceError::Registry(source_control::SchemaRegistryError::EnrollmentNotReady(
+                source_control::EnrollmentReport {
+                    diagnostics: Vec::new(),
+                },
+            )),
+        ]
     }
 
     /// A session cleanup that fails after the loop stopped on an error or
@@ -4138,13 +4367,13 @@ mod tests {
         fixture.remove();
     }
 
-    /// A row filter or a column list on an enrolled table refuses the next
-    /// start as drift of the publication, ahead of the inspection that would
-    /// refuse it with no remedy. Restoring the definition, as the refusal
-    /// says, lets the source start again.
+    /// A row filter or a column list put on an enrolled table is altered
+    /// back at the next start, which moves the source to its next schema
+    /// generation, since pgoutput left out what the altered definition did
+    /// not publish.
     #[test]
     #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
-    fn a_row_filter_or_column_list_on_an_enrolled_table_is_publication_drift() {
+    fn a_row_filter_or_column_list_on_an_enrolled_table_moves_the_source() {
         let mut fixture = EnrollmentLockFixture::create("pub_filter");
         let start = |fixture: &EnrollmentLockFixture, registry: Option<SchemaRegistry>| {
             prepare_local_source(
@@ -4154,11 +4383,25 @@ mod tests {
                 registry,
             )
         };
-        let registry = start(&fixture, None)
+        let mut registry = start(&fixture, None)
             .unwrap_or_else(|error| panic!("enrollment failed: {error:?}"))
             .registry;
         let publication = quote_identifier(&fixture.state.names.publication_name);
         let relation = fixture.relation(0);
+        let published_whole = |fixture: &mut EnrollmentLockFixture| -> bool {
+            fixture
+                .source
+                .query_one(
+                    "SELECT bool_and(listed.prqual IS NULL AND listed.prattrs IS NULL)
+                       FROM pg_catalog.pg_publication_rel AS listed
+                       JOIN pg_catalog.pg_publication AS publication
+                         ON publication.oid = listed.prpubid
+                      WHERE publication.pubname = $1",
+                    &[&fixture.state.names.publication_name],
+                )
+                .unwrap()
+                .get(0)
+        };
 
         for definition in [
             format!("{relation} WHERE (id > 0)"),
@@ -4170,24 +4413,17 @@ mod tests {
                     "ALTER PUBLICATION {publication} SET TABLE {definition}"
                 ))
                 .unwrap();
-            match start(&fixture, Some(registry.clone())) {
-                Err(LocalSourceError::PublicationDrift { publication }) => {
-                    assert_eq!(publication, fixture.state.names.publication_name);
-                }
-                Err(error) => panic!("{definition} was refused as {error:?}, not as drift"),
-                Ok(_) => panic!("{definition} was accepted"),
-            }
+            let moved = start(&fixture, Some(registry.clone()))
+                .unwrap_or_else(|error| panic!("{definition} was refused: {error:?}"))
+                .registry;
+            assert!(
+                moved.schema_generation() > registry.schema_generation(),
+                "{definition} did not move the source past generation {}",
+                registry.schema_generation()
+            );
+            assert!(published_whole(&mut fixture), "{definition} was kept");
+            registry = moved;
         }
-
-        fixture
-            .source
-            .batch_execute(&format!(
-                "ALTER PUBLICATION {publication} SET TABLE {relation}"
-            ))
-            .unwrap();
-        start(&fixture, Some(registry))
-            .unwrap_or_else(|error| panic!("the restored publication was refused: {error:?}"));
-        assert!(fixture.publication_exists());
         fixture.remove();
     }
 
@@ -4243,10 +4479,11 @@ mod tests {
 
     /// Selected columns become the publication's column list, in table
     /// order, so a column added later is never published and needs no
-    /// restart. A selection that differs from the published list, names a
-    /// column the table lacks, leaves out a primary-key column, or leaves
-    /// out a column of a REPLICA IDENTITY FULL table is refused before
-    /// anything is created.
+    /// restart. A selection that differs from the published list alters it
+    /// and moves the source to its next schema generation. One
+    /// that names a column the table lacks, leaves out a primary-key column,
+    /// or leaves out a column of a REPLICA IDENTITY FULL table is refused
+    /// before anything is created.
     #[test]
     #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
     fn selected_columns_become_the_publication_column_list() {
@@ -4305,20 +4542,11 @@ mod tests {
             .unwrap_or_else(|error| panic!("an added column stopped the source: {error:?}"));
         assert_eq!(published(&mut fixture), ["id", "value"]);
 
-        match start(&fixture, Some(registry), &["id"]) {
-            Err(LocalSourceError::PublishedColumnsDiffer {
-                published,
-                selected,
-                ..
-            }) => {
-                assert_eq!(published, ["id", "value"]);
-                assert_eq!(selected, ["id"]);
-            }
-            other => panic!(
-                "a narrower selection was not refused as differing: {:?}",
-                other.err()
-            ),
-        }
+        let narrower = start(&fixture, Some(registry.clone()), &["id"])
+            .unwrap_or_else(|error| panic!("a narrower selection was refused: {error:?}"))
+            .registry;
+        assert!(narrower.schema_generation() > registry.schema_generation());
+        assert_eq!(published(&mut fixture), ["id"]);
 
         destroy_local_source(&fixture.database_url, &fixture.state).unwrap();
         match start(&fixture, None, &["value"]) {
@@ -4582,6 +4810,15 @@ mod tests {
                 None,
             )
             .unwrap();
+            self.try_start_prepared(prepared, metrics, slot_lag_source)
+        }
+
+        fn try_start_prepared(
+            &self,
+            prepared: PreparedLocalSource,
+            metrics: OperationsMetrics,
+            slot_lag_source: Option<DatabaseUrl>,
+        ) -> Result<LocalSourceRuntime, LocalSourceError> {
             let config = LocalSourceRuntimeConfig {
                 database_url: &self.database_url,
                 state: &self.state,
@@ -5108,7 +5345,7 @@ mod tests {
             health.failure(),
             Some(format!("persistent CDC failed: {refusal}"))
         );
-        assert_eq!(health.failure_remedy(), CdcStopRemedy::RestorePublication);
+        assert_eq!(health.failure_remedy(), CdcStopRemedy::MoveSchema);
         let error = runtime.shutdown().unwrap_err();
         assert!(
             matches!(
@@ -5148,7 +5385,7 @@ mod tests {
         wait_until(Duration::from_secs(10), "the runtime to stop", || {
             !health.is_healthy()
         });
-        assert_eq!(health.failure_remedy(), CdcStopRemedy::RestorePublication);
+        assert_eq!(health.failure_remedy(), CdcStopRemedy::MoveSchema);
         let error = runtime.shutdown().unwrap_err();
         assert!(
             matches!(
@@ -5372,7 +5609,7 @@ mod tests {
         fn start_stopping_on_enum_label(&self) -> EnumLabelDrift {
             match self.try_start(OperationsMetrics::new()) {
                 Err(error) => {
-                    assert!(error.requires_destroying_state(), "{error:?}");
+                    assert!(error.moves_schema(), "{error:?}");
                     enum_drift(&error)
                         .unwrap_or_else(|| panic!("{error:?}"))
                         .clone()
@@ -5407,7 +5644,8 @@ mod tests {
     }
 
     /// Waits for `runtime` to stop, checks it stopped on an enum label with
-    /// `calque destroy` named as the way past it, and returns the label.
+    /// a move to the next schema generation named as the way past it, and
+    /// returns the label.
     fn stopped_on_enum_label(runtime: LocalSourceRuntime) -> EnumLabelDrift {
         let health = runtime.health();
         wait_until(Duration::from_secs(30), "the runtime to stop", || {
@@ -5415,7 +5653,7 @@ mod tests {
         });
         assert_eq!(
             health.failure_remedy(),
-            CdcStopRemedy::DestroyState,
+            CdcStopRemedy::MoveSchema,
             "{:?}",
             health.failure()
         );
@@ -5861,7 +6099,7 @@ mod tests {
             ),
             "{error:?}"
         );
-        assert_eq!(remedy, CdcStopRemedy::DestroyState);
+        assert_eq!(remedy, CdcStopRemedy::MoveSchema);
     }
 
     const PLAIN_ITEMS: &str =
@@ -5919,6 +6157,154 @@ mod tests {
                 Ok(runtime) => stopped_on(runtime).0,
             }
         }
+
+        /// The schema generation the control rows record for the source, and
+        /// the WAL end its boundary closed at once it has.
+        fn recorded_schema_generation(&mut self) -> Option<(i64, Option<String>)> {
+            self.client
+                .query_opt(
+                    "SELECT schema_generation, serving_from_lsn::text
+                       FROM calque_control.source_schema_generation WHERE source_id = $1",
+                    &[&self.state.names.source_id.as_str()],
+                )
+                .unwrap()
+                .map(|row| (row.get(0), row.get(1)))
+        }
+
+        /// Commits a snapshot cut marker naming `generation`, as a build at
+        /// that generation does, and returns the 32-bit xid its canonical
+        /// transaction key records with the marker's WAL position.
+        fn commit_cut_marker(&mut self, generation: u64) -> (u32, String) {
+            let identity =
+                serde_json::to_vec(&snapshot_coordinator::CutIdentity::generate(generation))
+                    .unwrap();
+            let mut transaction = self.client.transaction().unwrap();
+            let row = transaction
+                .query_one(
+                    "SELECT pg_logical_emit_message(true, $1::text, $2::bytea)::text,
+                            pg_current_xact_id()::text",
+                    &[&pgoutput_decoder::CUT_MARKER_PREFIX, &identity],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            let xid = row.get::<_, String>(1).parse::<u64>().unwrap() % (1 << 32);
+            (u32::try_from(xid).unwrap(), row.get(0))
+        }
+
+        /// The xid of each transaction in the canonical log, in sequence order.
+        fn logged_xids(&mut self) -> Vec<u32> {
+            self.canonical_log()
+                .into_iter()
+                .map(|(_, xid)| xid)
+                .collect()
+        }
+
+        fn wait_until_logged(&mut self, xid: u32, what: &str) {
+            wait_until(Duration::from_secs(10), what, || {
+                self.logged_xids().contains(&xid)
+            });
+        }
+
+        fn lsn_after(&mut self, later: &str, earlier: &str) -> bool {
+            self.client
+                .query_one(
+                    "SELECT $1::text::pg_lsn > $2::text::pg_lsn",
+                    &[&later, &earlier],
+                )
+                .unwrap()
+                .get(0)
+        }
+    }
+
+    /// A move to the next schema generation appends nothing the source
+    /// commits from the slot's last acknowledgement until the first cut of
+    /// the new generation, whose snapshot holds it, and still acknowledges it
+    /// so the slot frees its WAL. The move is recorded before the stream
+    /// starts. A cut of the earlier generation leaves the boundary open; the
+    /// new generation's closes it, with the WAL end it closed at recorded, and
+    /// what commits after it is appended, across a restart too.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_move_appends_nothing_until_the_next_generations_cut_then_resumes() {
+        let mut fixture = ReconnectFixture::create_holding("schema_move", false, PLAIN_ITEMS);
+        let secrets = LocalSecrets::generate().unwrap();
+        let prepare = |fixture: &ReconnectFixture, registry: Option<SchemaRegistry>, force| {
+            prepare_moving_local_source(
+                &fixture.database_url,
+                &fixture.state,
+                &secrets,
+                registry,
+                None,
+                force,
+            )
+            .unwrap()
+        };
+        let start = |fixture: &ReconnectFixture, prepared| {
+            fixture
+                .try_start_prepared(prepared, OperationsMetrics::new(), None)
+                .unwrap()
+        };
+
+        let first = prepare(&fixture, None, false);
+        let registry = first.registry.clone();
+        let runtime = start(&fixture, first);
+        let served = fixture.commit_row(1);
+        fixture.wait_until_logged(served, "the row served at generation 1");
+        runtime.shutdown().unwrap();
+        assert_eq!(fixture.recorded_schema_generation(), None);
+
+        let while_stopped = fixture.commit_row(2);
+        let moved = prepare(&fixture, Some(registry), true);
+        assert_eq!(moved.registry.schema_generation(), 2);
+        let moved_registry = moved.registry.clone();
+        let runtime = start(&fixture, moved);
+        assert_eq!(fixture.recorded_schema_generation(), Some((2, None)));
+        let while_moving = fixture.commit_row(3);
+        let (stale_cut, stale_cut_lsn) = fixture.commit_cut_marker(1);
+        wait_until(
+            Duration::from_secs(10),
+            "the boundary's transactions acknowledged",
+            || fixture.acknowledged_past(&stale_cut_lsn),
+        );
+        let logged = fixture.logged_xids();
+        assert!(
+            !logged.contains(&while_stopped) && !logged.contains(&while_moving),
+            "a transaction inside the boundary was appended: {logged:?}"
+        );
+        assert!(logged.contains(&stale_cut), "{logged:?}");
+        assert_eq!(fixture.recorded_schema_generation(), Some((2, None)));
+
+        let (closing_cut, closing_cut_lsn) = fixture.commit_cut_marker(2);
+        let after = fixture.commit_row(4);
+        fixture.wait_until_logged(after, "the row committed after the generation 2 cut");
+        assert!(fixture.logged_xids().contains(&closing_cut));
+        let Some((2, Some(serving_from))) = fixture.recorded_schema_generation() else {
+            panic!(
+                "the boundary did not close at generation 2: {:?}",
+                fixture.recorded_schema_generation()
+            );
+        };
+        assert!(
+            fixture.lsn_after(&serving_from, &closing_cut_lsn),
+            "the boundary closed at {serving_from}, not past its cut at {closing_cut_lsn}"
+        );
+        runtime.shutdown().unwrap();
+
+        let restarted = prepare(&fixture, Some(moved_registry), false);
+        assert_eq!(restarted.registry.schema_generation(), 2);
+        let runtime = start(&fixture, restarted);
+        let after_restart = fixture.commit_row(5);
+        fixture.wait_until_logged(after_restart, "the row committed after the restart");
+        runtime.shutdown().unwrap();
+        let logged = fixture.logged_xids();
+        for xid in [served, closing_cut, after, after_restart] {
+            assert_eq!(
+                logged.iter().filter(|logged| **logged == xid).count(),
+                1,
+                "{xid} in {logged:?}"
+            );
+        }
+        assert!(!logged.contains(&while_stopped) && !logged.contains(&while_moving));
     }
 
     fn is_rewritten_value(error: &LocalSourceError) -> bool {
@@ -5947,7 +6333,7 @@ mod tests {
             .unwrap();
         let (error, remedy) = stopped_on(runtime);
         assert!(is_rewritten_value(&error), "{error:?}");
-        assert_eq!(remedy, CdcStopRemedy::DestroyState);
+        assert_eq!(remedy, CdcStopRemedy::MoveSchema);
     }
 
     /// The same rewrite while nothing runs refuses the next start, even after
@@ -5967,7 +6353,7 @@ mod tests {
             .unwrap();
         let error = fixture.start_stopping();
         assert!(is_rewritten_value(&error), "{error:?}");
-        assert!(error.requires_destroying_state());
+        assert!(error.moves_schema());
     }
 
     /// A new table file without a column change, or a column change without

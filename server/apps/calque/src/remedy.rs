@@ -70,22 +70,19 @@ pub(crate) fn reconnect_or_forget(state_dir: &Path, database_url_env: &str, reru
     )
 }
 
-/// The remedy for the app-owned publication having been altered, which the
-/// refusal it follows describes. pgoutput leaves out what an altered
-/// definition does not publish, from the alteration's commit on, so the
-/// working set is prepared anew even once the definition is back. `calque
-/// destroy` drops only a publication it can verify, so the definition is
-/// restored first; after `--local-state-only` the next enrollment would take
-/// the same publication name and meet it again.
-pub(crate) fn restore_publication(destroy: Destroy<'_>, rerun: &str) -> String {
-    format!("Restore the publication's definition if it was altered, then run {destroy} and rerun {rerun} to prepare the working set anew, since the one it holds may no longer match PostgreSQL.")
+/// The remedy for the publication having been altered where Calque's role
+/// cannot restore it. pgoutput leaves out what an altered definition does not
+/// publish, from the alteration's commit on, so the next start moves the
+/// source to its next schema generation, a fresh cut, even once the
+/// definition is back.
+pub(crate) fn restore_publication(rerun: &str) -> String {
+    format!("Restore the publication's definition as its owner, or make Calque's role its owner, then rerun {rerun}: it moves the source to its next schema generation and prepares the working set anew, since the one it holds may no longer match PostgreSQL.")
 }
 
 /// The remedy a runtime whose CDC loop stopped before readiness names. A
 /// cause that needs `calque destroy` gets that command alone, since a rerun
-/// meets the same refusal, and a drifted publication gets restoring it, as
-/// a start that meets it does; any other cause may not recur, so a rerun
-/// comes first.
+/// meets the same refusal, and a schema change a rerun, which moves the
+/// source on; any other cause may not recur, so a rerun comes first.
 pub(crate) fn after_stopped_runtime(
     destroy: Destroy<'_>,
     rerun: &str,
@@ -93,7 +90,9 @@ pub(crate) fn after_stopped_runtime(
 ) -> String {
     match remedy {
         CdcStopRemedy::DestroyState => destroy.then_rerun(rerun),
-        CdcStopRemedy::RestorePublication => restore_publication(destroy, rerun),
+        CdcStopRemedy::MoveSchema => format!(
+            "Rerun {rerun}: it prepares the source again at its next schema generation."
+        ),
         CdcStopRemedy::Rerun => format!(
             "Rerun {rerun}; if it stops again, run {destroy} and then rerun {rerun} to rebuild from a complete snapshot."
         ),
@@ -172,8 +171,8 @@ mod tests {
             "Run calque destroy --state-dir .calque-dev --database-url-env CALQUE_DATABASE_URL --yes, then rerun dev to prepare the working set anew."
         );
         assert_eq!(
-            after_stopped_runtime(destroy(), "dev", CdcStopRemedy::RestorePublication),
-            "Restore the publication's definition if it was altered, then run calque destroy --state-dir .calque-dev --database-url-env CALQUE_DATABASE_URL --yes and rerun dev to prepare the working set anew, since the one it holds may no longer match PostgreSQL."
+            after_stopped_runtime(destroy(), "dev", CdcStopRemedy::MoveSchema),
+            "Rerun dev: it prepares the source again at its next schema generation."
         );
         assert_eq!(
             after_stopped_runtime(destroy(), "dev", CdcStopRemedy::Rerun),

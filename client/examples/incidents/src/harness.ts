@@ -76,6 +76,10 @@ const writes: TrackedWrite[] = [];
 const commentsBefore = new WeakMap<TrackedWrite, ReadonlySet<string>>();
 const shownValues: ShownValue[] = [];
 let publications = 0;
+/** Every change of the client's status, as `performance.now()` saw it. */
+let statusLog: readonly { readonly state: string; readonly at: number }[] = [
+  { state: client.status.state, at: performance.now() },
+];
 let publicationLog: readonly {
   readonly commitTimeUnixMicros: string | null;
   readonly at: number;
@@ -354,7 +358,12 @@ client.subscribePublications((publication) => {
 });
 
 client.subscribe(() => {
-  if (client.status.state === "ready") coldLoad.readyAt ??= performance.now();
+  const state = client.status.state;
+  if (state === "ready") coldLoad.readyAt ??= performance.now();
+  if (statusLog.at(-1)?.state !== state)
+    statusLog = [...statusLog, { state, at: performance.now() }].slice(
+      -MAX_RECORDS,
+    );
 });
 
 const probe = {
@@ -382,6 +391,9 @@ const probe = {
   },
   get publicationLog() {
     return publicationLog;
+  },
+  get statusLog() {
+    return statusLog;
   },
   mutations: () => writes.map((write) => ({ ...write })),
   shown: () => shownValues.map((value) => ({ ...value })),

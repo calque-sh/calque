@@ -459,7 +459,7 @@ impl SchemaNormalizer {
     ) -> Result<&TableCodec, NormalizationError> {
         if !self.tables.contains_key(&relation.relation_oid) {
             let registered = self.registered.get(&relation.relation_oid).ok_or_else(|| {
-                fail(format!(
+                changed(format!(
                     "relation OID {} is outside schema generation {}",
                     relation.relation_oid, self.schema_generation
                 ))
@@ -468,7 +468,7 @@ impl SchemaNormalizer {
             self.tables.insert(relation.relation_oid, table);
         }
         let table = self.tables.get(&relation.relation_oid).ok_or_else(|| {
-            fail(format!(
+            changed(format!(
                 "relation OID {} is outside schema generation {}",
                 relation.relation_oid, self.schema_generation
             ))
@@ -502,7 +502,7 @@ fn table_codec_from_registry(
         || relation.columns.len() != inspection.columns.len()
         || registered.column_ids.len() != inspection.columns.len()
     {
-        return Err(fail(format!(
+        return Err(changed(format!(
             "observed relation {}.{} does not match registered table {}",
             relation.namespace, relation.relation_name, registered.table_id
         )));
@@ -518,7 +518,7 @@ fn table_codec_from_registry(
         }
     };
     if relation.replica_identity != replica_identity {
-        return Err(fail(format!(
+        return Err(changed(format!(
             "observed relation {} replica identity differs from registry",
             registered.table_id
         )));
@@ -552,7 +552,7 @@ fn table_codec_from_registry(
                 || column.type_oid != observed.type_oid
                 || column.type_modifier != observed.type_modifier
             {
-                return Err(fail(format!(
+                return Err(changed(format!(
                     "observed relation {} column {} differs from registry",
                     registered.table_id, column.name
                 )));
@@ -563,7 +563,7 @@ fn table_codec_from_registry(
                 ReplicaIdentity::Nothing | ReplicaIdentity::Index => false,
             };
             if observed.is_key != expected_replica_identity {
-                return Err(fail(format!(
+                return Err(changed(format!(
                     "observed relation {} key flag differs at column {}",
                     registered.table_id, column.name
                 )));
@@ -695,7 +695,7 @@ fn validate_relation(
         || relation.layout_generation != table.layout_generation
         || relation.columns.len() != table.columns.len()
     {
-        return Err(fail(format!(
+        return Err(changed(format!(
             "relation {}.{} layout differs from pinned table {} schema",
             relation.namespace, relation.relation_name, table.table_id
         )));
@@ -706,7 +706,7 @@ fn validate_relation(
             || observed.type_modifier != expected.type_modifier
             || observed.is_key != expected.is_replica_identity
         {
-            return Err(fail(format!(
+            return Err(changed(format!(
                 "relation {}.{} column layout differs at {}",
                 relation.namespace, relation.relation_name, expected.name
             )));
@@ -914,11 +914,36 @@ fn decode_mutation_marker(
     Ok((marker.server_transaction_id, ids))
 }
 
+/// Whether `transaction` carries a snapshot cut marker.
+pub fn carries_cut_marker(transaction: &DecodedTransaction) -> bool {
+    transaction.changes.iter().any(|change| {
+        matches!(
+            change,
+            DecodedChange::LogicalMessage(message) if message.kind == LogicalMessageKind::CutMarker
+        )
+    })
+}
+
+/// The schema generation a transaction's snapshot cut marker names, when the
+/// transaction is a cut marker whose identity parses.
+pub fn cut_marker_generation(transaction: &DecodedTransaction) -> Option<u64> {
+    let [DecodedChange::LogicalMessage(message)] = transaction.changes.as_slice() else {
+        return None;
+    };
+    if message.kind != LogicalMessageKind::CutMarker {
+        return None;
+    }
+    serde_json::from_slice::<CutIdentity>(&message.content)
+        .ok()
+        .map(|identity| identity.schema_generation)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CutIdentity {
     build_id: String,
     nonce: String,
+    schema_generation: u64,
 }
 
 fn normalize_cut_marker(
@@ -938,6 +963,9 @@ fn normalize_cut_marker(
             "snapshot cut identity fields must contain 1-512 bytes",
         ));
     }
+    if identity.schema_generation == 0 {
+        return Err(fail("snapshot cut schema generation must be nonzero"));
+    }
     if marker.message_lsn.get() > transaction.commit_lsn.get() {
         return Err(fail("snapshot cut marker LSN follows its commit LSN"));
     }
@@ -945,6 +973,7 @@ fn normalize_cut_marker(
         key: transaction_key(transaction, source_epoch),
         build_id: identity.build_id,
         nonce: identity.nonce,
+        schema_generation: identity.schema_generation,
         message_lsn: pg_lsn(marker.message_lsn.get()),
         commit_lsn: pg_lsn(transaction.commit_lsn.get()),
         commit_time_unix_micros,
@@ -965,6 +994,10 @@ fn pg_lsn(value: u64) -> String {
 
 fn fail(message: impl Into<String>) -> NormalizationError {
     NormalizationError::new(message)
+}
+
+fn changed(message: impl Into<String>) -> NormalizationError {
+    NormalizationError::relation_changed(message)
 }
 
 #[cfg(test)]
@@ -1483,7 +1516,7 @@ mod tests {
         let marker = LogicalMessage {
             message_lsn: DecoderLsn::new(20),
             prefix: pgoutput_decoder::CUT_MARKER_PREFIX.to_owned(),
-            content: br#"{"build_id":"build-1","nonce":"nonce-1"}"#.to_vec(),
+            content: br#"{"build_id":"build-1","nonce":"nonce-1","schema_generation":3}"#.to_vec(),
             kind: LogicalMessageKind::CutMarker,
         };
         let entry = normalizer()
@@ -1497,6 +1530,7 @@ mod tests {
             CanonicalEntry::Barrier(CanonicalBarrier {
                 build_id,
                 nonce,
+                schema_generation: 3,
                 message_lsn,
                 ..
             }) if build_id == "build-1" && nonce == "nonce-1" && message_lsn == "0/14"

@@ -189,7 +189,8 @@ fn a_signed_grant_resolves_per_request_and_fails_closed() {
 }
 
 /// A re-encode is published only into the generation it was made under,
-/// and only while that generation's artifact is ready.
+/// and only while that generation's artifact is ready: never once the
+/// source moved to another schema generation and retired it.
 #[test]
 fn a_reencode_is_admitted_only_into_its_served_and_ready_generation() {
     let prepared =
@@ -199,14 +200,15 @@ fn a_reencode_is_admitted_only_into_its_served_and_ready_generation() {
     assert!(admits_reencode(&serving, generation));
     assert!(!admits_reencode(&serving, generation + 1));
     assert!(!admits_reencode(&serving, generation - 1));
-    for state in [ARTIFACT_PREPARING, ARTIFACT_FAILED] {
+    for state in [ARTIFACT_PREPARING, ARTIFACT_FAILED, ARTIFACT_RETIRED] {
         serving.set_artifact(state);
         assert!(!admits_reencode(&serving, generation), "{state}");
     }
 }
 
 /// A re-cut is published under the fence lock, only into the generation
-/// it was cut for, and only while that generation's artifact is ready.
+/// it was cut for, and only while that generation's artifact is ready: never
+/// once the source moved to another schema generation and retired it.
 #[test]
 fn a_re_cut_is_admitted_under_the_fence_lock_into_its_ready_generation() {
     let prepared =
@@ -226,7 +228,7 @@ fn a_re_cut_is_admitted_under_the_fence_lock_into_its_ready_generation() {
     assert!(Arc::ptr_eq(&admission.lock, &fence));
     assert!((admission.admit)());
     assert!(!(admission_for(generation + 1).admit)());
-    for state in [ARTIFACT_PREPARING, ARTIFACT_FAILED] {
+    for state in [ARTIFACT_PREPARING, ARTIFACT_FAILED, ARTIFACT_RETIRED] {
         current_serving(&serving).set_artifact(state);
         assert!(!(admission.admit)(), "{state}");
     }
@@ -940,6 +942,61 @@ fn a_request_names_the_tables_its_plan_signed() {
     assert_eq!(
         resolved.opened.table_starts,
         BTreeMap::from([(fixture.table(), Some(fixture.cursor(1)))])
+    );
+}
+
+/// A page of the schema generation before a move holds a plan the next
+/// generation's process opens, under the same key and source epoch. Its
+/// change request names that generation's tables and is refused with
+/// `SCHEMA_GENERATION_MISMATCH`, which rebuilds the page.
+#[test]
+fn a_plan_of_another_schema_generation_is_refused_as_a_mismatch() {
+    let before = fixture();
+    let token = before.token("plan-1", 2_000_000);
+    let request = before.request("plan-1", &token, "device-1", Some(1));
+    assert!(before.resolve_request(&request, 1_000_000).is_ok());
+
+    let moved = crate::snapshot::tests::prepared_source_for(
+        before.prepared.activated.source_epoch().clone(),
+        crate::test_support::tasks_registry_at(2),
+    );
+    let serving = Arc::new(ServingAuthorization::new(
+        moved.policy.clone(),
+        moved.scope.clone(),
+        ARTIFACT_READY,
+    ));
+    let plans = plans_for(&moved, 1, moved.policy.generation());
+    assert!(matches!(
+        plans.resolve(&serving, &request, request.request(), 1_000_000),
+        Err(ChangeBatchError::SchemaGenerationMismatch)
+    ));
+}
+
+/// A renewal that names tables of another schema generation is asked to
+/// rebuild; one naming a table no generation served is invalid.
+#[test]
+fn a_renewal_across_schema_generations_is_asked_to_rebuild() {
+    let table_at = |generation| {
+        crate::test_support::tasks_registry_at(generation).tables()[0]
+            .table_id
+            .clone()
+    };
+    let complete = BTreeSet::from([table_at(2)]);
+    assert_eq!(
+        resident_tables_refusal(&BTreeSet::from([table_at(2)]), &complete, 2),
+        None
+    );
+    assert_eq!(
+        resident_tables_refusal(&BTreeSet::from([table_at(1)]), &complete, 2),
+        Some(BootstrapHttpError::ResnapshotRequired)
+    );
+    assert_eq!(
+        resident_tables_refusal(
+            &BTreeSet::from([TableId::new("outside").unwrap()]),
+            &complete,
+            2
+        ),
+        Some(BootstrapHttpError::InvalidRequest)
     );
 }
 

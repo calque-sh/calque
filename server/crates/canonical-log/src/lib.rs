@@ -159,6 +159,9 @@ pub struct CanonicalBarrier {
     pub key: TransactionKey,
     pub build_id: String,
     pub nonce: String,
+    /// The schema generation of the cut whose marker this is.
+    #[serde(default)]
+    pub schema_generation: u64,
     pub message_lsn: String,
     pub commit_lsn: String,
     pub commit_time_unix_micros: u64,
@@ -822,7 +825,9 @@ const APPEND_GROUP_SQL: &str = "WITH
 /// retention floor and snapshot-build leases; artifact-provider retention
 /// remains a separate boundary.
 pub struct PostgresFencedCanonicalLog {
-    client: Mutex<Client>,
+    /// The log's last owner can be dropped on a runtime thread, such as a
+    /// retired backend's routes swapped out under `axum::serve`.
+    client: Mutex<DropOffRuntime<Client>>,
     append_statement: OnceLock<Statement>,
     read_statements: OnceLock<ReadStatements>,
     writer: FencedWriterIdentity,
@@ -890,7 +895,7 @@ impl PostgresFencedCanonicalLog {
             .map_err(postgres_log_error)?;
         Self::install_schema(&mut client)?;
         let log = Self {
-            client: Mutex::new(client),
+            client: Mutex::new(DropOffRuntime::new(client)),
             append_statement: OnceLock::new(),
             read_statements: OnceLock::new(),
             writer,
@@ -1802,7 +1807,7 @@ impl PostgresFencedCanonicalLog {
         let mut outcomes = Vec::with_capacity(encoded.len());
         if let [only] = statements.as_slice() {
             outcomes.extend(self.run_append_statement(
-                &mut *client,
+                &mut **client,
                 &statement,
                 &encoded[only.clone()],
                 durable_lsn.as_deref(),
@@ -3206,6 +3211,7 @@ mod tests {
             },
             build_id: format!("build-{sequence}"),
             nonce: format!("nonce-{sequence}"),
+            schema_generation: 1,
             message_lsn: format!("0/{:X}", sequence.saturating_sub(1)),
             commit_lsn: format!("0/{sequence:X}"),
             commit_time_unix_micros: sequence,

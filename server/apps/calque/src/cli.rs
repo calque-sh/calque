@@ -545,11 +545,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Command::Serve(command) => {
-            multi_thread_runtime()?.block_on(serve::run(command))?;
+            run_until_stopped(serve::run(command))??;
             Ok(())
         }
         Command::Dev(command) => {
-            multi_thread_runtime()?.block_on(dev::run_dev(command))?;
+            run_until_stopped(dev::run_dev(command))??;
             Ok(())
         }
         Command::Status(command) => {
@@ -573,6 +573,21 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
     }
+}
+
+/// How long a serving command's exit waits for the blocking tasks still
+/// running once it has stopped.
+const BLOCKING_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Runs a serving command, then stops its runtime. A blocking task still
+/// running once the command has stopped is waiting on a PostgreSQL that
+/// stopped answering, such as a log reader's connect, so the exit leaves it
+/// after `BLOCKING_EXIT_WAIT` rather than at the stop bound.
+fn run_until_stopped<T>(command: impl std::future::Future<Output = T>) -> std::io::Result<T> {
+    let runtime = multi_thread_runtime()?;
+    let result = runtime.block_on(command);
+    runtime.shutdown_timeout(BLOCKING_EXIT_WAIT);
+    Ok(result)
 }
 
 fn multi_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {

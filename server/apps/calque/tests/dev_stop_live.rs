@@ -213,6 +213,8 @@ struct Dev {
     port: u16,
     /// What `dev` printed up to and including its readiness line.
     lines: Vec<String>,
+    /// What `dev` printed after its readiness line.
+    printed: Arc<Mutex<Vec<String>>>,
     /// Set to make the stderr reader close its end of the pipe.
     stderr_closing: Arc<AtomicBool>,
     stderr_reader: Option<JoinHandle<()>>,
@@ -261,6 +263,7 @@ impl Dev {
             child,
             port,
             lines: Vec::new(),
+            printed: Arc::default(),
             stderr_closing,
             stderr_reader: Some(stderr_reader),
             stderr_tail,
@@ -289,8 +292,12 @@ impl Dev {
             );
         }
         dev.lines = lines;
+        let printed = Arc::clone(&dev.printed);
         thread::spawn(move || {
-            let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+            for line in stdout.lines() {
+                let Ok(line) = line else { break };
+                printed.lock().unwrap().push(line);
+            }
         });
         while readyz(port) != Some(204) {
             assert!(
@@ -333,6 +340,27 @@ impl Dev {
                 self.stderr()
             );
             thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Waits up to `bound` for `dev` to print a line starting with `line`
+    /// after its readiness line.
+    fn prints_within(&self, line: &str, bound: Duration) {
+        let started = Instant::now();
+        while !self
+            .printed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|printed| printed.starts_with(line))
+        {
+            assert!(
+                started.elapsed() < bound,
+                "dev did not print {line:?} within {bound:?}: {:#?}\nstderr: {:#?}",
+                self.printed.lock().unwrap(),
+                self.stderr()
+            );
+            thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -886,10 +914,11 @@ fn served_artifact(port: u16, bearer: &str, relations: &[String]) -> (serde_json
 
 /// With a manifest, `dev` publishes each table with a column list naming
 /// the collection's columns: a column the manifest leaves out is in neither
-/// the publication, the plan nor the artifact. A manifest that names other
-/// columns of a prepared table is refused with the destroy that prepares
-/// them, and a manifest that leaves out a `--tenant-column` that is not in
-/// the key is refused rather than served to every tenant.
+/// the publication, the plan nor the artifact. Saving a manifest that names
+/// another column moves the source to its next schema generation, which
+/// serves it without a restart, and a start with the narrower manifest moves
+/// it again. A manifest that leaves out a `--tenant-column` that
+/// is not in the key is refused rather than served to every tenant.
 #[test]
 #[ignore = "requires TEST_DATABASE_URL"]
 fn dev_serves_only_the_columns_its_manifest_names() {
@@ -904,25 +933,29 @@ fn dev_serves_only_the_columns_its_manifest_names() {
                  ADD COLUMN tenant_id int8 NOT NULL DEFAULT 1"
         ))
         .unwrap();
+    let published = || -> Vec<String> {
+        Client::connect(&database_url(), NoTls)
+            .unwrap()
+            .query_one(
+                "SELECT attnames::text[] FROM pg_catalog.pg_publication_tables WHERE pubname = $1",
+                &[&fixture.names().publication_name],
+            )
+            .unwrap()
+            .get(0)
+    };
     let config = fixture.manifest(&["id", "title"]);
     let config_argument = config.to_str().unwrap();
     let mut dev = Dev::start_with(&fixture, &["--config", config_argument]);
     assert!(
-        dev.lines
-            .iter()
-            .any(|line| *line == format!("Columns: the ones {} names", config.display())),
+        dev.lines.iter().any(|line| *line
+            == format!(
+                "Columns: the ones {} names; dev serves its edits as they are saved",
+                config.display()
+            )),
         "{:#?}",
         dev.lines
     );
-    let published: Vec<String> = Client::connect(&database_url(), NoTls)
-        .unwrap()
-        .query_one(
-            "SELECT attnames::text[] FROM pg_catalog.pg_publication_tables WHERE pubname = $1",
-            &[&fixture.names().publication_name],
-        )
-        .unwrap()
-        .get(0);
-    assert_eq!(published, ["id", "title"]);
+    assert_eq!(published(), ["id", "title"]);
     let (plan, artifact) =
         served_artifact(dev.port, &fixture.bearer(), std::slice::from_ref(&relation));
     assert!(
@@ -934,26 +967,45 @@ fn dev_serves_only_the_columns_its_manifest_names() {
         !holds(&artifact, SECRET),
         "the artifact holds an unlisted value"
     );
+
+    fixture.manifest(&["id", "title", "secret"]);
+    dev.prints_within(
+        "Configuration changed: moving to the next schema generation",
+        Duration::from_secs(10),
+    );
+    dev.prints_within("Schema generation 2: serving", Duration::from_secs(60));
+    assert_eq!(published(), ["id", "title", "secret"]);
+    let (plan, artifact) =
+        served_artifact(dev.port, &fixture.bearer(), std::slice::from_ref(&relation));
+    assert!(plan.to_string().contains(":g2"), "{plan}");
+    assert!(plan.to_string().contains("secret"), "{plan}");
+    assert!(holds(&artifact, SECRET));
+
+    let saved = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, &saved[..saved.len() / 2]).unwrap();
+    dev.prints_within(
+        "Configuration not applied, still serving the last one: ",
+        Duration::from_secs(10),
+    );
+    let (plan, _) = served_artifact(dev.port, &fixture.bearer(), std::slice::from_ref(&relation));
+    assert!(plan.to_string().contains(":g2"), "{plan}");
     dev.signal("-INT");
     let (status, took) = dev.exit_within(STOP_TIMEOUT);
     assert!(status.success(), "{status} after {took:?}");
 
-    fixture.manifest(&["id", "title", "secret"]);
-    let mut widened = dev_command(&fixture, reserved_port(), &database_url());
-    widened.args(["--config", config_argument]);
-    let refused = output_within(widened, Duration::from_secs(60));
-    assert!(!refused.status.success());
-    let stderr = String::from_utf8_lossy(&refused.stderr);
-    assert!(
-        stderr.contains(&format!(
-            "{} names columns id, secret, title of {relation}, but {} serves id, title, the columns it was prepared with.",
-            config.display(),
-            fixture.state().display()
-        )) && stderr.contains("calque destroy"),
-        "{stderr}"
-    );
-
     fixture.manifest(&["id", "title"]);
+    let mut dev = Dev::start_with(&fixture, &["--config", config_argument]);
+    dev.prints_within("Schema generation 3: serving", Duration::from_secs(10));
+    assert_eq!(published(), ["id", "title"]);
+    let (plan, artifact) =
+        served_artifact(dev.port, &fixture.bearer(), std::slice::from_ref(&relation));
+    assert!(plan.to_string().contains(":g3"), "{plan}");
+    assert!(!plan.to_string().contains("secret"), "{plan}");
+    assert!(!holds(&artifact, SECRET));
+    dev.signal("-INT");
+    let (status, took) = dev.exit_within(STOP_TIMEOUT);
+    assert!(status.success(), "{status} after {took:?}");
+
     let mut tenant = dev_command(&fixture, reserved_port(), &database_url());
     tenant.args([
         "--config",
@@ -1029,4 +1081,46 @@ fn dev_refuses_a_bootstrap_with_another_bearer() {
     assert_eq!(status, 401, "{refused}");
     let (status, planned) = bootstrap_status(dev.port, &bearer, &relation);
     assert_eq!(status, 200, "{planned}");
+}
+
+/// Renaming a served column leaves a live schema the configuration does not
+/// bind: `dev` suspends the source, answering a bootstrap `503`
+/// `SCHEMA_SUSPENDED` and `/readyz` `503`, and serves its next schema
+/// generation once the column is renamed back, with no restart.
+#[test]
+#[ignore = "requires TEST_DATABASE_URL"]
+fn dev_suspends_a_source_whose_served_column_is_renamed_until_it_binds_again() {
+    let _one = exclusive();
+    let fixture = Fixture::create();
+    let relation = format!("public.{}", fixture.table);
+    let config = fixture.manifest(&["id", "title"]);
+    let mut dev = Dev::start_with(&fixture, &["--config", config.to_str().unwrap()]);
+    let alter = |statement: String| {
+        Client::connect(&database_url(), NoTls)
+            .unwrap()
+            .batch_execute(&statement)
+            .unwrap();
+    };
+
+    alter(format!(
+        "ALTER TABLE {relation} RENAME COLUMN title TO heading"
+    ));
+    dev.prints_within("Schema suspended: ", Duration::from_secs(30));
+    let (status, response) = bootstrap_status(dev.port, &fixture.bearer(), &relation);
+    assert_eq!(status, 503, "{response}");
+    assert!(response.contains("SCHEMA_SUSPENDED"), "{response}");
+    assert_eq!(readyz(dev.port), Some(503));
+
+    alter(format!(
+        "ALTER TABLE {relation} RENAME COLUMN heading TO title"
+    ));
+    dev.prints_within("Schema generation 2: serving", Duration::from_secs(60));
+    assert_eq!(readyz(dev.port), Some(204));
+    let (plan, artifact) =
+        served_artifact(dev.port, &fixture.bearer(), std::slice::from_ref(&relation));
+    assert!(plan.to_string().contains(":g2"), "{plan}");
+    assert!(holds(&artifact, "row 1"));
+    dev.signal("-INT");
+    let (status, took) = dev.exit_within(STOP_TIMEOUT);
+    assert!(status.success(), "{status} after {took:?}");
 }

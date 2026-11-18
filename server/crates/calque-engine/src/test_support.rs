@@ -58,17 +58,30 @@ pub(crate) fn inspection(
 /// The registry every engine test plans against: one uuid-keyed `tasks` table
 /// with a text title.
 pub(crate) fn registry() -> SchemaRegistry {
-    registry_for(vec![inspection(
-        "tasks",
-        16_384,
-        vec![
-            column(1, "id", 2_950, "uuid", false, Some(1)),
-            column(2, "title", 25, "text", false, None),
-        ],
-    )])
+    tasks_registry_at(1)
+}
+
+/// [`registry`] as schema generation `schema_generation` compiles it.
+pub(crate) fn tasks_registry_at(schema_generation: u64) -> SchemaRegistry {
+    registry_at(
+        vec![inspection(
+            "tasks",
+            16_384,
+            vec![
+                column(1, "id", 2_950, "uuid", false, Some(1)),
+                column(2, "title", 25, "text", false, None),
+            ],
+        )],
+        schema_generation,
+    )
 }
 
 pub(crate) fn registry_for(tables: Vec<TableInspection>) -> SchemaRegistry {
+    registry_at(tables, 1)
+}
+
+/// The registry of `tables` at `schema_generation`, as a move compiles it.
+pub(crate) fn registry_at(tables: Vec<TableInspection>, schema_generation: u64) -> SchemaRegistry {
     let identity = SourceIdentity {
         system_identifier: "7612345678901234567".to_owned(),
         database_name: "app".to_owned(),
@@ -111,7 +124,7 @@ pub(crate) fn registry_for(tables: Vec<TableInspection>) -> SchemaRegistry {
         tables: required,
         pgoutput_profile: PgoutputLaunchProfile::V1,
     };
-    SchemaRegistry::initialize(&snapshot, &requirements).unwrap()
+    SchemaRegistry::initialize_at(&snapshot, &requirements, schema_generation).unwrap()
 }
 
 /// A TCP listener that accepts every connection and never answers, so a

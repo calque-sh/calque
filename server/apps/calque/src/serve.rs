@@ -15,13 +15,14 @@ use blob_store::{
     S3Endpoint,
 };
 use calque_engine::{
-    check_postgres_capacity, inspect_local_identity, local_router, metrics_router,
-    prepare_selected_local_source, start_local_source_runtime, AllowedOrigin, ArtifactBuilder,
-    AuthorizationFenceStore, CanonicalHeadSignal, CommandOperation, DatabaseUrl,
-    GenerationArtifactPublisher, GuardError, HttpBinding, LocalArtifactResolver, LocalBackend,
+    check_postgres_capacity, generation_routes, inspect_local_identity, metrics_router,
+    moving_routes, prepare_moving_local_source, start_local_source_runtime, switched_local_router,
+    AllowedOrigin, ArtifactBuilder, AuthorizationFenceStore, BetweenGenerations,
+    CanonicalHeadSignal, CommandOperation, DatabaseUrl, GenerationArtifactPublisher,
+    GenerationRoutes, GuardError, HttpBinding, LocalArtifactResolver, LocalBackend,
     LocalBackendConfig, LocalCredentialPolicy, LocalMemoryPolicy, LocalMutationBackend,
-    LocalMutationError, LocalMutationSupport, LocalNames, LocalRevocationConfig,
-    LocalSnapshotOutcome, LocalSourceRuntimeConfig, LocalState, MountedCommands,
+    LocalMutationError, LocalMutationSupport, LocalNames, LocalRevocationConfig, LocalSecrets,
+    LocalSnapshotOutcome, LocalSourceRuntimeConfig, LocalState, MountedCommands, MovingBackend,
     MutationCommandPolicy, OperationsMetrics, PreparedLocalSource, RecompileAuthorization,
     RecutConfig, RecutPolicy, ReencodeConfig, SelectedColumns, StateStore, TenantSettings, Tenants,
     TenantsConfig, LOCAL_ACTIVE_ARTIFACT_CAPACITY_BYTES, MAX_LOCAL_ARTIFACT_BYTES,
@@ -39,13 +40,14 @@ use uuid::Uuid;
 
 use crate::cli::{ServeCommand, TenantArguments};
 use crate::dev::describe_source_identity;
+use crate::generations::{
+    first_generation, serve_generations, stop_serving, FirstGeneration, Generation,
+    GenerationSource,
+};
 use crate::init::{
     is_environment_variable_name, is_identifier, postgres_identifier, IDENTIFIER_GRAMMAR,
 };
-use crate::lifecycle::{
-    bounded_stop, shutdown_after, shutdown_runtime, shutdown_signal, with_state_remedy,
-    CommandError,
-};
+use crate::lifecycle::{shutdown_after, shutdown_signal, with_state_remedy, CommandError};
 use crate::listen::{spawn_metrics_server, stop_metrics_server, ListenError, ReservedListener};
 use crate::log_sink::print_line;
 use crate::open_files::{fit_open_file_limit, ConnectionBounds};
@@ -264,7 +266,7 @@ pub async fn run(command: ServeCommand) -> Result<(), ServeError> {
 
 async fn serve_configured(
     command: ServeCommand,
-    mut config: ValidatedServeConfig,
+    config: ValidatedServeConfig,
 ) -> Result<(), ServeError> {
     let verifier =
         load_grant_verifier(&command.grant_audience, &command.grant_verification_key_env)?;
@@ -295,9 +297,6 @@ async fn serve_configured(
         .iter()
         .map(|origin| AllowedOrigin::parse_https_or_loopback(origin))
         .collect::<Result<Vec<_>, _>>()?;
-    // Bound before any state exists, so a port another process holds is
-    // refused here rather than after enrollment and the initial snapshot.
-    let max_active_plans = command.max_active_plans;
     let ConnectionBounds {
         max_open_streams,
         max_inflight_requests,
@@ -305,9 +304,8 @@ async fn serve_configured(
         max_open_streams: command.max_open_streams,
         max_inflight_requests: command.max_inflight_requests,
     });
-    let change_tail_bytes = command.change_tail_bytes;
-    let no_stored_rows = command.no_stored_rows;
-    let recut_policy = command.recut.policy();
+    // Bound before any state exists, so a port another process holds is
+    // refused here rather than after enrollment and the initial snapshot.
     let reserved_listener = ReservedListener::bind(binding.socket_address(), "--port")?;
     let reserved_metrics_listener = metrics_binding
         .as_ref()
@@ -316,64 +314,10 @@ async fn serve_configured(
 
     let state_store = StateStore::open(&command.state_dir)?;
     tracing::info!(state_dir = %state_store.root().display(), "using state directory");
-    let state = load_or_initialize_state(&state_store, &database_url, &config).await?;
-    // The fence is read before any policy is compiled. The manifest's
-    // generation is a floor: a generation fenced on this source stays fenced
-    // whatever an older manifest says, and a newer manifest fences everything
-    // below it. From here on `config.authorization_generation` is the
-    // generation in force.
+    let (state, tables_changed) =
+        load_or_initialize_state(&state_store, &database_url, &config).await?;
     let fence = AuthorizationFenceStore::new(database_url.clone(), state.names.source_id.clone());
-    let establish = fence.clone();
-    let configured_generation = config.authorization_generation;
-    config.authorization_generation =
-        run_blocking(move || establish.establish(configured_generation)).await?;
     let secrets = state_store.load_or_create_secrets()?;
-    let had_registry = state_store.registry_path().exists();
-    let persisted_registry = if had_registry {
-        Some(state_store.read_registry()?)
-    } else {
-        None
-    };
-    let prepare_database_url = database_url.clone();
-    let prepare_state = state.clone();
-    let prepare_secrets = secrets.clone();
-    let selected = selected_columns(&config);
-    let prepared = run_blocking(move || {
-        prepare_selected_local_source(
-            &prepare_database_url,
-            &prepare_state,
-            &prepare_secrets,
-            persisted_registry,
-            &selected,
-        )
-    })
-    .await?;
-    let prepared = apply_configured_policy(prepared, &config)?;
-    // The generations fenced on this source that a plan may still name.
-    let retired = {
-        let fence = fence.clone();
-        let source_epoch = prepared.activated.source_epoch().clone();
-        run_blocking(move || fence.retirements(&source_epoch, PLAN_TTL)).await?
-    };
-    if !had_registry {
-        state_store.write_registry(&prepared.registry)?;
-    }
-    // What a fence order recompiles: the same permits over the same enrolled
-    // registry, at the order's generation.
-    let recompile: RecompileAuthorization = {
-        let base = prepared.clone();
-        let permits = compile_collection_permits(&prepared.registry, &config)?;
-        let attribute = config.partition_attribute.clone();
-        Arc::new(move |generation| {
-            policy_at(&base, &permits, attribute.as_deref(), generation)
-                .map_err(|error| error.to_string())
-        })
-    };
-    // The advertised commands and the mounted mutation route must name the
-    // same tables; checking here fails a mismatch before CDC starts or a
-    // listener exists.
-    let commands = compile_command_manifest(&prepared.registry, &config)?;
-    let mount = MutationMount::compile(&commands);
     let partitioned = config.partition_attribute.is_some();
     // Before change capture takes its own slot and sender, so a PostgreSQL
     // that cannot hold every build that may run at once is refused at
@@ -389,208 +333,66 @@ async fn serve_configured(
         &state.names.slot_name,
     )
     .await?;
-
-    let mut catalog = SqliteArtifactCatalog::open(state_store.root().join("catalog.sqlite3"))?;
     let store = open_object_store(object_store_kind, state_store.root())?;
     // A store that cannot round-trip is discovered now, not after the snapshot
     // is cut and a browser holds an artifact URL it cannot fetch.
     probe_object_store(&store).await?;
-    let head_signal = CanonicalHeadSignal::new();
     let metrics = OperationsMetrics::new();
-    let owner = format!("serve-runtime-{}", Uuid::new_v4().simple());
-    let runtime_database_url = database_url.clone();
-    let runtime_state = state.clone();
-    let runtime_prepared = prepared.clone();
-    let runtime_head_signal = head_signal.clone();
-    let runtime_metrics = metrics.clone();
-    let runtime_state_dir = state_store.root().to_path_buf();
-    let runtime_database_url_env = config.source.database_url_env.clone();
-    let runtime = run_blocking(move || {
-        start_local_source_runtime(
-            runtime_prepared,
-            LocalSourceRuntimeConfig::new(
-                &runtime_database_url,
-                &runtime_state,
-                &runtime_state_dir,
-                owner,
-            )
-            .with_metrics(runtime_metrics)
-            .with_database_url_env(runtime_database_url_env),
-            runtime_head_signal,
-        )
-    })
-    .await?;
-    let cancellation = CancellationToken::new();
-    let builder = ArtifactBuilder {
-        database_url: database_url.clone(),
-        state_root: state_store.root().to_path_buf(),
-        catalog_path: state_store.root().join("catalog.sqlite3"),
-        store: store.clone(),
-        barrier_provider: runtime.barrier_provider(),
-        head_signal: head_signal.clone(),
-        cancellation: cancellation.clone(),
+    let mut source = ServeSource {
+        configured_generation: config.authorization_generation,
+        config,
+        verifier,
+        tenant_settings: tenant_settings(&command.tenants, command.recut.policy()),
+        recut_policy: command.recut.policy(),
+        max_active_plans: command.max_active_plans,
+        max_open_streams,
+        change_tail_bytes: command.change_tail_bytes,
+        no_stored_rows: command.no_stored_rows,
+        database_url,
+        state_store,
+        state,
+        tables_changed,
+        secrets,
+        store,
         metrics: metrics.clone(),
+        fence,
+        artifact_resolver,
+        change_endpoint,
+        contract: None,
     };
-    let started = Instant::now();
-    // A partitioned scope has no source-wide artifact: each tenant's is built
-    // on its first request, and the ones published before a restart are
-    // found again.
-    let (artifact, tenants) = if partitioned {
-        let opened = Tenants::open(
-            TenantsConfig {
-                settings: tenant_settings(&command.tenants, recut_policy),
-                builder: builder.clone(),
-                log_readers: runtime.log_readers(),
-            },
-            &prepared,
-        )
-        .await;
-        match opened {
-            Ok(tenants) => ("per-tenant", Some(tenants)),
-            Err(error) => return Err(shutdown_after(runtime, error.into()).await),
-        }
-    } else {
-        if let Err(error) = builder
-            .recover_interrupted_recuts(&prepared, &mut catalog)
-            .await
-        {
-            return Err(shutdown_after(runtime, error.into()).await);
-        }
-        match builder
-            .ensure_initial_snapshot(&prepared, &mut catalog)
-            .await
-        {
-            Ok(LocalSnapshotOutcome::Existing) => ("published-existing", None),
-            Ok(LocalSnapshotOutcome::Published) => ("published", None),
-            Err(error) => return Err(shutdown_after(runtime, error.into()).await),
-        }
+    // A start whose manifest does not bind the live schema is refused, naming
+    // the edit; a running serve waits one out.
+    let first = first_generation(&mut source, false).await?;
+    let Some(contract) = source.contract.take() else {
+        return Err(first
+            .stop_after(ServeError::BlockingTask(
+                "the first schema generation reported nothing".to_owned(),
+            ))
+            .await);
     };
-    if !runtime.is_healthy() {
-        let error = ServeError::RuntimeUnhealthy {
-            state_dir: state_store.root().to_path_buf(),
-            database_url_env: config.source.database_url_env.clone(),
-            failure: runtime
-                .failure()
-                .unwrap_or_else(|| "persistent CDC stopped".to_owned()),
-            remedy: runtime.failure_remedy(),
-        };
-        return Err(shutdown_after(runtime, error).await);
-    }
-
-    // A fence order publishes its generation's artifact in the background,
-    // through the same snapshot path startup just ran.
-    let publisher = Arc::new(GenerationArtifactPublisher::new(builder));
 
     // Publication and CDC readiness are proven before a socket can make this
     // process observable as ready: the address is only bound until here.
     let listener = match reserved_listener.listen() {
         Ok(listener) => listener,
-        Err(error) => return Err(shutdown_after(runtime, error.into()).await),
+        Err(error) => return Err(first.stop_after(error.into()).await),
     };
     let metrics_listener = match reserved_metrics_listener
         .map(ReservedListener::listen)
         .transpose()
     {
         Ok(listener) => listener,
-        Err(error) => return Err(shutdown_after(runtime, error.into()).await),
+        Err(error) => return Err(first.stop_after(error.into()).await),
     };
-    // The command registry registers only the advertised operations.
-    let mutation_support = {
-        let mutation_database_url = database_url.clone();
-        let mutation_prepared = prepared.clone();
-        let registration = mount.registration.clone();
-        match run_blocking(move || {
-            LocalMutationSupport::open_with_operations(
-                &mutation_database_url,
-                &mutation_prepared,
-                &registration,
-            )
-        })
-        .await
-        {
-            Ok(support) => support,
-            Err(error) => return Err(shutdown_after(runtime, error).await),
-        }
-    };
-    let reencode_prepared = prepared.clone();
-    let backend = match LocalBackend::new(LocalBackendConfig {
-        metrics: metrics.clone(),
-        source_id: state.names.source_id.clone(),
-        prepared,
-        credential: LocalCredentialPolicy::DatasetGrant(Box::new(verifier)),
-        // Reading and writing are two decisions over the same verified grant:
-        // `credential` decides what it may read, this what it may write.
-        command_policy: MutationCommandPolicy::SignedGrant(mount.commands.clone()),
-        proof_secret: secrets.proof_secret,
-        plan_secret: secrets.plan_secret,
-        catalog,
-        store: store.clone(),
-        log: runtime.provider(),
-        log_readers: runtime.log_readers(),
-        head_signal,
-        artifact_resolver,
-        change_endpoint,
-        plan_ttl: PLAN_TTL,
-        max_active_plans,
-        max_open_streams,
-        change_tail_bytes,
-        max_change_batch_bytes: 8 * 1024 * 1024,
-        stored_rows: !no_stored_rows,
-        memory: LocalMemoryPolicy {
-            active_artifact_capacity_bytes: LOCAL_ACTIVE_ARTIFACT_CAPACITY_BYTES,
-            staging_overlap_bytes: LOCAL_ACTIVE_ARTIFACT_CAPACITY_BYTES,
-            catch_up_buffer_bytes: 16 * 1024 * 1024,
-            query_result_reserve_bytes: calque_engine::LOCAL_QUERY_RESULT_RESERVE_BYTES,
-        },
-        revocation: Some(LocalRevocationConfig {
-            store: fence,
-            retired,
-            recompile,
-            publisher: Arc::clone(&publisher),
-        }),
-        // Each tenant's artifact is compressed by its own background stage.
-        reencode: (!partitioned).then(|| ReencodeConfig {
-            state_root: state_store.root().to_path_buf(),
-            catalog_path: state_store.root().join("catalog.sqlite3"),
-            cancellation: cancellation.clone(),
-        }),
-        // Through the fenced generation's publisher, so a re-cut and a
-        // fenced generation's artifact are never built at once.
-        recut: Some(RecutConfig {
-            publisher,
-            policy: recut_policy,
-            cancellation: cancellation.clone(),
-        }),
-        tenants: tenants.clone(),
-    }) {
-        Ok(backend) => backend,
-        Err(error) => return Err(shutdown_after(runtime, error.into()).await),
-    };
-    backend.spawn_reencode(&reencode_prepared);
-    backend.spawn_recut();
-    if let Some(tenants) = &tenants {
-        tenants.start();
-    }
-    // A mutation needs a signed grant naming its collection and operation;
-    // read authorization never implies write authority. A grant with no write
-    // capability gets a 404 before its body is read, so it cannot tell that a
-    // write surface exists.
-    let artifacts = backend.artifact_service();
-    let mutations = match LocalMutationBackend::new(backend.clone(), mutation_support) {
-        Ok(mutations) => mutations,
-        Err(error) => return Err(shutdown_after(runtime, error.into()).await),
-    };
-    let router = local_router(
-        backend,
-        mutations,
-        artifacts,
-        runtime.health(),
-        metrics.clone(),
+    let routes = GenerationRoutes::new(first.routes(&source));
+    let router = switched_local_router(
+        routes.clone(),
         binding.clone(),
         origins,
         max_inflight_requests,
     );
 
+    let config = &source.config;
     match &config.partition_attribute {
         None => print_line("scope_mode=source-wide"),
         Some(attribute) => {
@@ -625,20 +427,32 @@ async fn serve_configured(
             ));
         }
     }
-    print_line(format_args!("state_dir={}", state_store.root().display()));
+    print_line(format_args!(
+        "state_dir={}",
+        source.state_store.root().display()
+    ));
     print_line(format_args!("object_store={}", object_store_kind.as_str()));
-    print_line(format_args!("commands={}", commands.len()));
+    print_line(format_args!("commands={}", contract.commands));
     // The mounted collections and operations: the ceiling a signed grant is
     // intersected with.
     print_line("mutations=mounted-per-collection-command-grant");
     print_line(format_args!(
         "mutation_commands={}",
-        mount.commands.contract_value()
+        contract.mutation_commands
     ));
-    print_line(format_args!("artifact={artifact}"));
+    print_line(format_args!("artifact={}", contract.artifact));
+    if let FirstGeneration::Serving(generation) = &first {
+        print_line(format_args!(
+            "schema_generation={}",
+            generation.schema_generation
+        ));
+    }
     let stop = shutdown_signal();
     print_line("ready=true");
-    print_line(format_args!("startup_millis={}", elapsed_millis(started)));
+    print_line(format_args!(
+        "startup_millis={}",
+        elapsed_millis(contract.started)
+    ));
     print_line(format_args!("Calque serve is ready at {base_url}"));
 
     let metrics_stop = CancellationToken::new();
@@ -651,19 +465,351 @@ async fn serve_configured(
                 metrics_stop.clone(),
             )
         });
-    let serve_result = axum::serve(listener, router)
-        .with_graceful_shutdown(bounded_stop(stop))
-        .await;
+    let (serve_result, serving) =
+        serve_generations(&mut source, first, &routes, listener, router, stop).await;
     let metrics_result = stop_metrics_server(metrics_server, &metrics_stop).await;
     // A fenced generation's artifact still being cut stops here; the next
     // startup builds it, because it compiles at the fenced generation.
-    cancellation.cancel();
-    let shutdown_result = shutdown_runtime::<ServeError>(runtime).await;
+    let shutdown_result = match serving {
+        Some(generation) => stop_serving(&source, generation).await,
+        None => Ok(()),
+    };
     tracing::info!("stopped");
     serve_result?;
     metrics_result?;
     shutdown_result?;
     Ok(())
+}
+
+/// What serve keeps across the schema generations it serves.
+struct ServeSource {
+    /// The manifest, whose authorization generation is the one in force once
+    /// a generation starts.
+    config: ValidatedServeConfig,
+    /// The manifest's own authorization generation, the floor the durable
+    /// fence is read against.
+    configured_generation: u64,
+    verifier: GrantVerifier,
+    tenant_settings: TenantSettings,
+    recut_policy: RecutPolicy,
+    max_active_plans: usize,
+    max_open_streams: usize,
+    change_tail_bytes: u64,
+    no_stored_rows: bool,
+    database_url: DatabaseUrl,
+    state_store: StateStore,
+    state: LocalState,
+    /// Whether `state`'s tables differ from the state file's, which is
+    /// written once the next generation's preparation took them.
+    tables_changed: bool,
+    secrets: LocalSecrets,
+    store: Arc<dyn ManagedBlobStore>,
+    metrics: OperationsMetrics,
+    fence: AuthorizationFenceStore,
+    artifact_resolver: LocalArtifactResolver,
+    change_endpoint: String,
+    /// What the generation last started reports in the startup contract.
+    contract: Option<GenerationContract>,
+}
+
+/// The startup contract's lines a generation decides.
+struct GenerationContract {
+    artifact: &'static str,
+    commands: usize,
+    mutation_commands: String,
+    /// When the generation began building or finding its artifact.
+    started: Instant,
+}
+
+impl GenerationSource for ServeSource {
+    type Error = ServeError;
+
+    async fn start_generation(&mut self, force_move: bool) -> Result<Generation, ServeError> {
+        // The fence is read before any policy is compiled. The manifest's
+        // generation is a floor: a generation fenced on this source stays
+        // fenced whatever an older manifest says, and a newer manifest fences
+        // everything below it. From here on `config.authorization_generation`
+        // is the generation in force.
+        let establish = self.fence.clone();
+        let configured_generation = self.configured_generation;
+        self.config.authorization_generation =
+            run_blocking(move || establish.establish(configured_generation)).await?;
+        let config = &self.config;
+        let state_store = &self.state_store;
+        let persisted_registry = if state_store.registry_path().exists() {
+            Some(state_store.read_registry()?)
+        } else {
+            None
+        };
+        let persisted_generation = persisted_registry
+            .as_ref()
+            .map(SchemaRegistry::schema_generation);
+        let prepare_database_url = self.database_url.clone();
+        let prepare_state = self.state.clone();
+        let prepare_secrets = self.secrets.clone();
+        let selected = selected_columns(config);
+        let prepared = run_blocking(move || {
+            prepare_moving_local_source(
+                &prepare_database_url,
+                &prepare_state,
+                &prepare_secrets,
+                persisted_registry,
+                Some(&selected),
+                force_move,
+            )
+        })
+        .await?;
+        let prepared = apply_configured_policy(prepared, config)?;
+        // The generations fenced on this source that a plan may still name.
+        let retired = {
+            let fence = self.fence.clone();
+            let source_epoch = prepared.activated.source_epoch().clone();
+            run_blocking(move || fence.retirements(&source_epoch, PLAN_TTL)).await?
+        };
+        if self.tables_changed {
+            state_store.write_state(&self.state)?;
+            self.tables_changed = false;
+        }
+        let schema_generation = prepared.registry.schema_generation();
+        if persisted_generation != Some(schema_generation) {
+            state_store.write_registry(&prepared.registry)?;
+        }
+        // What a fence order recompiles: the same permits over the same enrolled
+        // registry, at the order's generation.
+        let recompile: RecompileAuthorization = {
+            let base = prepared.clone();
+            let permits = compile_collection_permits(&prepared.registry, config)?;
+            let attribute = config.partition_attribute.clone();
+            Arc::new(move |generation| {
+                policy_at(&base, &permits, attribute.as_deref(), generation)
+                    .map_err(|error| error.to_string())
+            })
+        };
+        // The advertised commands and the mounted mutation route must name the
+        // same tables; checking here fails a mismatch before CDC starts or a
+        // listener exists.
+        let commands = compile_command_manifest(&prepared.registry, config)?;
+        let mount = MutationMount::compile(&commands);
+        let partitioned = config.partition_attribute.is_some();
+
+        let mut catalog = SqliteArtifactCatalog::open(state_store.root().join("catalog.sqlite3"))?;
+        let head_signal = CanonicalHeadSignal::new();
+        let metrics = self.metrics.clone();
+        let owner = format!("serve-runtime-{}", Uuid::new_v4().simple());
+        let runtime_database_url = self.database_url.clone();
+        let runtime_state = self.state.clone();
+        let runtime_prepared = prepared.clone();
+        let runtime_head_signal = head_signal.clone();
+        let runtime_metrics = metrics.clone();
+        let runtime_state_dir = state_store.root().to_path_buf();
+        let runtime_database_url_env = config.source.database_url_env.clone();
+        let runtime = run_blocking(move || {
+            start_local_source_runtime(
+                runtime_prepared,
+                LocalSourceRuntimeConfig::new(
+                    &runtime_database_url,
+                    &runtime_state,
+                    &runtime_state_dir,
+                    owner,
+                )
+                .with_metrics(runtime_metrics)
+                .with_database_url_env(runtime_database_url_env),
+                runtime_head_signal,
+            )
+        })
+        .await?;
+        let cancellation = CancellationToken::new();
+        let builder = ArtifactBuilder {
+            database_url: self.database_url.clone(),
+            state_root: state_store.root().to_path_buf(),
+            catalog_path: state_store.root().join("catalog.sqlite3"),
+            store: self.store.clone(),
+            barrier_provider: runtime.barrier_provider(),
+            head_signal: head_signal.clone(),
+            cancellation: cancellation.clone(),
+            metrics: metrics.clone(),
+        };
+        let started = Instant::now();
+        // A partitioned scope has no source-wide artifact: each tenant's is
+        // built on its first request, and the ones published before a restart
+        // are found again.
+        let (artifact, tenants) = if partitioned {
+            let opened = Tenants::open(
+                TenantsConfig {
+                    settings: self.tenant_settings.clone(),
+                    builder: builder.clone(),
+                    log_readers: runtime.log_readers(),
+                },
+                &prepared,
+            )
+            .await;
+            match opened {
+                Ok(tenants) => ("per-tenant", Some(tenants)),
+                Err(error) => return Err(shutdown_after(runtime, error.into()).await),
+            }
+        } else {
+            if let Err(error) = builder
+                .recover_interrupted_recuts(&prepared, &mut catalog)
+                .await
+            {
+                return Err(shutdown_after(runtime, error.into()).await);
+            }
+            match builder
+                .ensure_initial_snapshot(&prepared, &mut catalog)
+                .await
+            {
+                Ok(LocalSnapshotOutcome::Existing) => ("published-existing", None),
+                Ok(LocalSnapshotOutcome::Published) => ("published", None),
+                Err(error) => return Err(shutdown_after(runtime, error.into()).await),
+            }
+        };
+        if !runtime.is_healthy() {
+            let error = ServeError::RuntimeUnhealthy {
+                state_dir: state_store.root().to_path_buf(),
+                database_url_env: config.source.database_url_env.clone(),
+                failure: runtime
+                    .failure()
+                    .unwrap_or_else(|| "persistent CDC stopped".to_owned()),
+                remedy: runtime.failure_remedy(),
+            };
+            return Err(shutdown_after(runtime, error).await);
+        }
+
+        // A fence order publishes its generation's artifact in the background,
+        // through the same snapshot path startup just ran.
+        let publisher = Arc::new(GenerationArtifactPublisher::new(builder));
+        // The command registry registers only the advertised operations.
+        let mutation_support = {
+            let mutation_database_url = self.database_url.clone();
+            let mutation_prepared = prepared.clone();
+            let registration = mount.registration.clone();
+            match run_blocking(move || {
+                LocalMutationSupport::open_with_operations(
+                    &mutation_database_url,
+                    &mutation_prepared,
+                    &registration,
+                )
+            })
+            .await
+            {
+                Ok(support) => support,
+                Err(error) => return Err(shutdown_after(runtime, error).await),
+            }
+        };
+        let reencode_prepared = prepared.clone();
+        let backend = match LocalBackend::new(LocalBackendConfig {
+            metrics: metrics.clone(),
+            source_id: self.state.names.source_id.clone(),
+            prepared,
+            credential: LocalCredentialPolicy::DatasetGrant(Box::new(self.verifier.clone())),
+            // Reading and writing are two decisions over the same verified
+            // grant: `credential` decides what it may read, this what it may
+            // write.
+            command_policy: MutationCommandPolicy::SignedGrant(mount.commands.clone()),
+            proof_secret: self.secrets.proof_secret.clone(),
+            plan_secret: self.secrets.plan_secret.clone(),
+            catalog,
+            store: self.store.clone(),
+            log: runtime.provider(),
+            log_readers: runtime.log_readers(),
+            head_signal,
+            artifact_resolver: self.artifact_resolver.clone(),
+            change_endpoint: self.change_endpoint.clone(),
+            plan_ttl: PLAN_TTL,
+            max_active_plans: self.max_active_plans,
+            max_open_streams: self.max_open_streams,
+            change_tail_bytes: self.change_tail_bytes,
+            max_change_batch_bytes: 8 * 1024 * 1024,
+            stored_rows: !self.no_stored_rows,
+            memory: LocalMemoryPolicy {
+                active_artifact_capacity_bytes: LOCAL_ACTIVE_ARTIFACT_CAPACITY_BYTES,
+                staging_overlap_bytes: LOCAL_ACTIVE_ARTIFACT_CAPACITY_BYTES,
+                catch_up_buffer_bytes: 16 * 1024 * 1024,
+                query_result_reserve_bytes: calque_engine::LOCAL_QUERY_RESULT_RESERVE_BYTES,
+            },
+            revocation: Some(LocalRevocationConfig {
+                store: self.fence.clone(),
+                retired,
+                recompile,
+                publisher: Arc::clone(&publisher),
+            }),
+            // Each tenant's artifact is compressed by its own background stage.
+            reencode: (!partitioned).then(|| ReencodeConfig {
+                state_root: state_store.root().to_path_buf(),
+                catalog_path: state_store.root().join("catalog.sqlite3"),
+                cancellation: cancellation.clone(),
+            }),
+            // Through the fenced generation's publisher, so a re-cut and a
+            // fenced generation's artifact are never built at once.
+            recut: Some(RecutConfig {
+                publisher,
+                policy: self.recut_policy,
+                cancellation: cancellation.clone(),
+            }),
+            tenants: tenants.clone(),
+        }) {
+            Ok(backend) => backend,
+            Err(error) => return Err(shutdown_after(runtime, error.into()).await),
+        };
+        backend.spawn_reencode(&reencode_prepared);
+        backend.spawn_recut();
+        if let Some(tenants) = &tenants {
+            tenants.start();
+        }
+        // A mutation needs a signed grant naming its collection and operation;
+        // read authorization never implies write authority. A grant with no
+        // write capability gets a 404 before its body is read, so it cannot
+        // tell that a write surface exists.
+        let mutations = match LocalMutationBackend::new(backend.clone(), mutation_support) {
+            Ok(mutations) => mutations,
+            Err(error) => return Err(shutdown_after(runtime, error.into()).await),
+        };
+        let routes = generation_routes(
+            backend.clone(),
+            mutations,
+            backend.artifact_service(),
+            runtime.health(),
+            metrics,
+        );
+        self.contract = Some(GenerationContract {
+            artifact,
+            commands: commands.len(),
+            mutation_commands: mount.commands.contract_value(),
+            started,
+        });
+        Ok(Generation {
+            runtime,
+            backend,
+            cancellation,
+            routes,
+            schema_generation,
+        })
+    }
+
+    fn between_generations(&self, state: BetweenGenerations) -> axum::Router {
+        moving_routes(MovingBackend::new(
+            LocalCredentialPolicy::DatasetGrant(Box::new(self.verifier.clone())),
+            self.config.authorization_generation,
+            state,
+        ))
+    }
+
+    /// Serve reads its manifest at start only.
+    fn configuration_changed(&mut self) -> bool {
+        false
+    }
+
+    fn state_store(&self) -> &StateStore {
+        &self.state_store
+    }
+
+    fn state_dir(&self) -> &Path {
+        self.state_store.root()
+    }
+
+    fn database_url_env(&self) -> &str {
+        &self.config.source.database_url_env
+    }
 }
 
 fn tenant_settings(arguments: &TenantArguments, refresh: RecutPolicy) -> TenantSettings {
@@ -1589,23 +1735,26 @@ fn selected_columns(config: &ValidatedServeConfig) -> SelectedColumns {
         .collect()
 }
 
+/// The state the directory holds, or a new one, and whether the manifest
+/// names other tables than it was enrolled for, which moves the source to its
+/// next schema generation.
 async fn load_or_initialize_state(
     store: &StateStore,
     database_url: &DatabaseUrl,
     config: &ValidatedServeConfig,
-) -> Result<LocalState, ServeError> {
+) -> Result<(LocalState, bool), ServeError> {
     let names = LocalNames {
         source_id: SourceId::new(config.source.id.clone())?,
         publication_name: config.source.publication.clone(),
         slot_name: config.source.slot.clone(),
     };
     if store.state_path().exists() {
-        let state = store.read_state()?;
-        if state.names != names || state.tables != config.tables {
+        let mut state = store.read_state()?;
+        if state.names != names {
             return Err(ServeError::PersistedStateMismatch {
                 state_dir: store.root().to_path_buf(),
-                persisted: describe_enrollment(&state.names, &state.tables),
-                configured: describe_enrollment(&names, &config.tables),
+                persisted: describe_enrollment(&state.names),
+                configured: describe_enrollment(&names),
                 database_url_env: config.source.database_url_env.clone(),
             });
         }
@@ -1623,7 +1772,9 @@ async fn load_or_initialize_state(
                 connected: describe_source_identity(&connected),
             });
         }
-        return Ok(state);
+        let tables_changed = state.tables != config.tables;
+        state.tables.clone_from(&config.tables);
+        return Ok((state, tables_changed));
     }
     let identity_database_url = database_url.clone();
     let identity = run_blocking(move || inspect_local_identity(&identity_database_url)).await?;
@@ -1634,22 +1785,17 @@ async fn load_or_initialize_state(
         config.tables.clone(),
     )?;
     store.write_state(&state)?;
-    Ok(state)
+    Ok((state, false))
 }
 
 /// What a state directory is enrolled for, as the persisted-state refusal
 /// names it.
-fn describe_enrollment(names: &LocalNames, tables: &[QualifiedTable]) -> String {
+fn describe_enrollment(names: &LocalNames) -> String {
     format!(
-        "source {}, publication {}, slot {}, tables [{}]",
+        "source {}, publication {}, slot {}",
         names.source_id.as_str(),
         names.publication_name,
         names.slot_name,
-        tables
-            .iter()
-            .map(QualifiedTable::display_name)
-            .collect::<Vec<_>>()
-            .join(", ")
     )
 }
 
@@ -1905,7 +2051,7 @@ pub enum ServeError {
     MissingGrantKey(String),
     #[error("environment variable {0} does not hold a grant verification key: a JSON object {{\"keyId\": ..., \"publicKey\": ...}} whose publicKey is a 32-byte Ed25519 key in unpadded base64url")]
     InvalidGrantKey(String),
-    #[error("{state_dir} is enrolled for {persisted}, but the manifest configures {configured}. Calque will not change an existing enrollment in place. Restore the manifest's source and tables, or run {destroy} and then rerun serve to enroll again.", destroy = Destroy::reading(state_dir, database_url_env))]
+    #[error("{state_dir} is enrolled for {persisted}, but the manifest configures {configured}. Calque will not move an enrollment to another source, publication or slot. Restore the manifest's source, publication and slot, or run {destroy} and then rerun serve to enroll again.", destroy = Destroy::reading(state_dir, database_url_env))]
     PersistedStateMismatch {
         state_dir: PathBuf,
         persisted: String,
@@ -1978,12 +2124,8 @@ pub enum ServeError {
     /// The engine's refusal of a publication that no longer has its enrolled
     /// definition, which enrollment and a CDC reconnect raise alike. See
     /// `remedy::restore_publication`.
-    #[error("{refusal} {remedy}", remedy = restore_publication(Destroy::reading(state_dir, database_url_env), "serve"))]
-    PublicationDrifted {
-        refusal: Box<ServeError>,
-        state_dir: PathBuf,
-        database_url_env: String,
-    },
+    #[error("{refusal} {remedy}", remedy = restore_publication("serve"))]
+    PublicationDrifted { refusal: Box<ServeError> },
     #[error("a blocking startup task did not complete: {0}")]
     BlockingTask(String),
     #[error(transparent)]
@@ -2070,6 +2212,37 @@ impl CommandError for ServeError {
         }
     }
 
+    /// The manifest not binding a generation suspends the source too, as
+    /// the engine's refusals of its column lists do.
+    fn suspends_schema(&self) -> bool {
+        match self {
+            Self::Source(error) => error.suspends_schema(),
+            Self::ConfiguredColumnMissing { .. }
+            | Self::ConfiguredColumnMismatch { .. }
+            | Self::ConfiguredPrimaryKeyMismatch { .. } => true,
+            Self::RuntimeCleanup { startup, .. } => startup.suspends_schema(),
+            _ => false,
+        }
+    }
+
+    fn moves_schema(&self) -> bool {
+        match self {
+            Self::Source(error) => error.moves_schema(),
+            Self::RuntimeUnhealthy { remedy, .. } => {
+                *remedy == calque_engine::CdcStopRemedy::MoveSchema
+            }
+            Self::RuntimeCleanup { startup, .. } => startup.moves_schema(),
+            _ => false,
+        }
+    }
+
+    fn stopped_on(&self) -> Option<&str> {
+        match self {
+            Self::RuntimeUnhealthy { failure, .. } => Some(failure),
+            _ => None,
+        }
+    }
+
     fn runtime_cleanup(startup: Self, cleanup: Self) -> Self {
         Self::RuntimeCleanup {
             startup: Box::new(startup),
@@ -2100,11 +2273,9 @@ impl CommandError for ServeError {
         }
     }
 
-    fn publication_drifted(refusal: Self, state_dir: &Path, database_url_env: &str) -> Self {
+    fn publication_drifted(refusal: Self) -> Self {
         Self::PublicationDrifted {
             refusal: Box::new(refusal),
-            state_dir: state_dir.to_path_buf(),
-            database_url_env: database_url_env.to_owned(),
         }
     }
 }
@@ -3110,14 +3281,16 @@ mod tests {
         );
     }
 
+    /// A state directory enrolled for another publication is refused before
+    /// PostgreSQL is reached; other tables move the source instead.
     #[tokio::test]
-    async fn state_enrolled_for_other_tables_names_both_and_the_destroy_command() {
+    async fn state_enrolled_for_another_publication_names_both_and_the_destroy_command() {
         let directory = tempfile::tempdir().unwrap();
         let store = StateStore::open(directory.path().join("state")).unwrap();
         let config = source_wide_config();
         let names = LocalNames {
             source_id: SourceId::new(config.source.id.clone()).unwrap(),
-            publication_name: config.source.publication.clone(),
+            publication_name: "calque_serve_earlier".to_owned(),
             slot_name: config.source.slot.clone(),
         };
         let identity = SourceIdentity {
@@ -3143,15 +3316,15 @@ mod tests {
         let database_url = DatabaseUrl::parse("postgresql://127.0.0.1:9/app").unwrap();
         let error = load_or_initialize_state(&store, &database_url, &config)
             .await
-            .expect_err("state for other tables is refused")
+            .expect_err("state for another publication is refused")
             .to_string();
         let state_dir = store.root().display();
         assert_eq!(
             error,
             format!(
-                "{state_dir} is enrolled for source serve-smoke, publication calque_serve_smoke, slot calque_serve_smoke_slot, tables [public.projects], \
-                 but the manifest configures source serve-smoke, publication calque_serve_smoke, slot calque_serve_smoke_slot, tables [public.projects, public.tasks]. \
-                 Calque will not change an existing enrollment in place. Restore the manifest's source and tables, \
+                "{state_dir} is enrolled for source serve-smoke, publication calque_serve_earlier, slot calque_serve_smoke_slot, \
+                 but the manifest configures source serve-smoke, publication calque_serve_smoke, slot calque_serve_smoke_slot. \
+                 Calque will not move an enrollment to another source, publication or slot. Restore the manifest's source, publication and slot, \
                  or run calque destroy --state-dir {state_dir} --database-url-env SERVE_SMOKE_DATABASE_URL --yes and then rerun serve to enroll again."
             )
         );
@@ -3273,7 +3446,7 @@ mod tests {
     const EARLIER_LOG: &str = "/srv/calque/source-a serves a canonical log an earlier release of calque wrote, and calque does not migrate it.";
     const FOREIGN_BUILD: &str = "/srv/calque/source-a holds an interrupted build of local-artifact-earlier-release, an artifact this build of calque does not make, and calque does not migrate it.";
     const DESTROY_THEN_SERVE: &str = "Run calque destroy --state-dir /srv/calque/source-a --database-url-env CALQUE_DATABASE_URL --yes, then rerun serve to prepare the working set anew.";
-    const RESTORE_THEN_SERVE: &str = "Restore the publication's definition if it was altered, then run calque destroy --state-dir /srv/calque/source-a --database-url-env CALQUE_DATABASE_URL --yes and rerun serve to prepare the working set anew, since the one it holds may no longer match PostgreSQL.";
+    const RESTORE_THEN_SERVE: &str = "Restore the publication's definition as its owner, or make Calque's role its owner, then rerun serve: it moves the source to its next schema generation and prepares the working set anew, since the one it holds may no longer match PostgreSQL.";
 
     /// The refusal of a canonical log an earlier release wrote, as the CDC
     /// loop stops on it and the stop that joins the loop returns it.
@@ -3365,7 +3538,7 @@ mod tests {
                     publication: "calque_incident".to_owned(),
                 }
             )),
-            "the PostgreSQL publication calque_incident was altered: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists it had at enrollment. Restore the publication's definition if it was altered, then run calque destroy --state-dir /srv/calque/source-a --database-url-env CALQUE_DATABASE_URL --yes and rerun serve to prepare the working set anew, since the one it holds may no longer match PostgreSQL."
+            "the PostgreSQL publication calque_incident was altered: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists it had at enrollment. Restore the publication's definition as its owner, or make Calque's role its owner, then rerun serve: it moves the source to its next schema generation and prepares the working set anew, since the one it holds may no longer match PostgreSQL."
         );
         assert_eq!(
             printed(ServeError::Source(
@@ -3462,31 +3635,26 @@ mod tests {
         );
     }
 
-    /// The remedy is restoring the publication, which destroy refuses to drop
-    /// otherwise, then destroy, since the working set may miss changes.
+    /// A publication altered while the runtime streams is a schema change:
+    /// the remedy is the rerun that moves the source on, named once.
     #[tokio::test]
-    async fn a_runtime_stopped_on_a_drifted_publication_names_restoring_it_once() {
+    async fn a_runtime_stopped_on_a_drifted_publication_names_the_move_once() {
         let error = stop_after(
             || Err(drift()),
             ServeError::RuntimeUnhealthy {
                 state_dir: PathBuf::from("/srv/calque/source-a"),
                 database_url_env: "CALQUE_DATABASE_URL".to_owned(),
                 failure: format!("persistent CDC failed: {DRIFT}"),
-                remedy: calque_engine::CdcStopRemedy::RestorePublication,
+                remedy: calque_engine::CdcStopRemedy::MoveSchema,
             },
         )
         .await;
         let printed = printed(error);
         assert_eq!(
             printed,
-            format!("persistent CDC stopped before the source-wide artifact became ready: persistent CDC failed: {DRIFT} No incomplete browser state was served. {RESTORE_THEN_SERVE}")
+            format!("persistent CDC stopped before the source-wide artifact became ready: persistent CDC failed: {DRIFT} No incomplete browser state was served. Rerun serve: it prepares the source again at its next schema generation.")
         );
-        assert_eq!(
-            printed
-                .matches("Restore the publication's definition")
-                .count(),
-            1
-        );
+        assert_eq!(printed.matches("Rerun serve:").count(), 1);
     }
 
     #[tokio::test]

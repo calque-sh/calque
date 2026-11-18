@@ -102,7 +102,22 @@ export interface BenchOptions {
    * (`betweenVisitsSql`), an even number.
    */
   readonly betweenVisits?: number;
+  /**
+   * `--schema-change <case>`: every warm-up, judged and traced sample is a
+   * schema sample (`bench-schema.ts`), in which the page lives through the
+   * case's schema change under the write load.
+   */
+  readonly schemaChange?: SchemaChange;
 }
+
+/** The schema changes `--schema-change` takes. */
+export const SCHEMA_CHANGES = Object.freeze([
+  "config-add",
+  "rewrite-whole",
+  "rename-suspend",
+] as const);
+
+export type SchemaChange = (typeof SCHEMA_CHANGES)[number];
 
 /** A shaped rate in both directions, and latency added before each response. */
 interface NetworkProfile {
@@ -182,6 +197,9 @@ export function unjudgedReasons(options: BenchOptions): string[] {
       : [
           `${String(options.betweenVisits)} write transactions between the visits`,
         ]),
+    ...(options.schemaChange === undefined
+      ? []
+      : [`schema samples (${options.schemaChange})`]),
   ];
 }
 
@@ -206,7 +224,7 @@ export function rendersPlan(options: Pick<BenchOptions, "network">): boolean {
 }
 
 const USAGE =
-  "usage: pnpm bench [-- --smoke] [--calque <path>] [--dataset <content-v1|v1>] [--network <off|Mbit/s/latency ms|shaped:Mbit/s/RTT ms>] [--diagnostic] [--hold-until-logged <text>] [--realtime-only] [--postgres-bin <dir>] [--no-edge] [--background-clients <n>] [--background-qos utility] [--load-rate <tx/s>] [--tail <transactions>] [--recut-tail-ratio <ratio>] [--recut-min-interval <seconds>] [--recut-keep-ratio <ratio>] [--no-stored-rows] [--returning] [--between-visits <transactions>]";
+  "usage: pnpm bench [-- --smoke] [--calque <path>] [--dataset <content-v1|v1>] [--network <off|Mbit/s/latency ms|shaped:Mbit/s/RTT ms>] [--diagnostic] [--hold-until-logged <text>] [--realtime-only] [--postgres-bin <dir>] [--no-edge] [--background-clients <n>] [--background-qos utility] [--load-rate <tx/s>] [--tail <transactions>] [--recut-tail-ratio <ratio>] [--recut-min-interval <seconds>] [--recut-keep-ratio <ratio>] [--no-stored-rows] [--returning] [--between-visits <transactions>] [--schema-change <config-add|rewrite-whole|rename-suspend>]";
 
 export function parseBenchArguments(
   arguments_: readonly string[],
@@ -231,6 +249,7 @@ export function parseBenchArguments(
   let storedRows = true;
   let returning = false;
   let betweenVisits: number | null = null;
+  let schemaChange: SchemaChange | null = null;
   const value = (index: number) => {
     const next = rest[index + 1];
     if (next === undefined || next.startsWith("--")) throw new Error(USAGE);
@@ -298,6 +317,12 @@ export function parseBenchArguments(
     else if (argument === "--between-visits" && betweenVisits === null) {
       betweenVisits = parseBetweenVisits(value(index));
       index += 1;
+    } else if (argument === "--schema-change" && schemaChange === null) {
+      const name = value(index);
+      schemaChange =
+        SCHEMA_CHANGES.find((candidate) => candidate === name) ?? null;
+      if (schemaChange === null) throw new Error(USAGE);
+      index += 1;
     } else throw new Error(USAGE);
   }
   // The clients follow the realtime session, and would load every cold sample.
@@ -325,6 +350,10 @@ export function parseBenchArguments(
     throw new Error(
       "--between-visits writes between a sample's two visits, so it needs --returning",
     );
+  if (schemaChange !== null && (realtimeOnly || returning || tail !== null))
+    throw new Error(
+      "--schema-change makes every cold sample a schema sample, so it takes no --realtime-only, --returning or --tail",
+    );
   return {
     smoke,
     calque,
@@ -345,6 +374,7 @@ export function parseBenchArguments(
     storedRows,
     returning,
     ...(betweenVisits === null ? {} : { betweenVisits }),
+    ...(schemaChange === null ? {} : { schemaChange }),
   };
 }
 

@@ -56,6 +56,7 @@ fn barrier(epoch: &SourceEpoch, sequence: u64) -> CanonicalBarrier {
         },
         build_id: format!("build-{sequence}"),
         nonce: format!("nonce-{sequence}"),
+        schema_generation: 1,
         message_lsn: format!("0/{sequence:X}"),
         commit_lsn: format!("0/{:X}", sequence + 1),
         commit_time_unix_micros: sequence,

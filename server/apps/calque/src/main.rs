@@ -9,6 +9,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 mod cli;
 mod dev;
+mod generations;
 mod init;
 mod inspect;
 mod lifecycle;

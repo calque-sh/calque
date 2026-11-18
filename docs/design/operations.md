@@ -168,7 +168,7 @@ it.
 | `sources` | Exactly one. |
 | `sources[].id` | Names the source in the state directory and in its rows under PostgreSQL's `calque_control` schema, the authorization fence among them. It, the publication, the slot and the set of tables are fixed for the life of a state directory: `serve` refuses a state directory recorded with different ones. |
 | `sources[].databaseUrlEnv` | The environment variable `serve` reads the database URL from; `serve` refuses to start when it is unset. With an existing state directory, `serve` refuses a database other than the one the directory was enrolled on before it writes anything there. The composition requires `CALQUE_DATABASE_URL`, `init`'s default. |
-| `sources[].publication` | Created `FOR TABLE` the collections' tables if it does not exist and Calque's role owns every one of them; otherwise the start refuses with the `CREATE PUBLICATION` statement for the tables' owner to run. Either way each table carries a column list naming its collection's `columns` in table order, except a table whose replica identity is `FULL`, which is published whole because PostgreSQL refuses its updates and deletes under any column list, so its collection must name every column. An existing one must cover exactly those tables, publish exactly each collection's columns, listed or as the whole table, publish insert, update, delete and truncate, be neither `FOR ALL TABLES` nor `publish_via_partition_root`, and carry no row filter on any table. `serve` refuses one that publishes other columns, with the statement that publishes the right ones; `calque destroy` drops a publication Calque's role owns, so the next start creates it. |
+| `sources[].publication` | Created `FOR TABLE` the collections' tables if it does not exist and Calque's role owns every one of them; otherwise the start refuses with the `CREATE PUBLICATION` statement for the tables' owner to run. Either way each table carries a column list naming its collection's `columns` in table order, except a table whose replica identity is `FULL`, which is published whole because PostgreSQL refuses its updates and deletes under any column list, so its collection must name every column. An existing one must cover exactly those tables, publish exactly each collection's columns, listed or as the whole table, publish insert, update, delete and truncate, be neither `FOR ALL TABLES` nor `publish_via_partition_root`, and carry no row filter on any table. When Calque's role owns it, a start whose collections name other tables or columns alters it to match and moves the source to its next schema generation; otherwise `serve` refuses, with the statement that publishes the right ones. |
 | `sources[].slot` | The logical replication slot, created if it does not exist. An existing one must use `pgoutput` on the same database. |
 | `scopes` | Exactly one. |
 | `scopes[].id` | Printed at startup as `dataset=`. `calque init` writes `--scope-id`, default `all`. |
@@ -180,7 +180,7 @@ it.
 | `collections[].source`, `collections[].scope` | The source's and the scope's `id`. |
 | `collections[].kind` | Fixed in the pre-alpha at `table`; `calque init` writes it. |
 | `collections[].relation` | The table, as `schema` and `table`. Two collections cannot name one table, nor two tables that share a name in different schemas, because a served collection is named by its table alone. |
-| `collections[].columns[]` | Each column's `name`, `postgresType`, the `pg_catalog` name of the type it travels as such as `int4` or `timestamptz` (`text` for an enum, the base type for a domain), and `nullable`, which must match the live table. The list includes the primary key. A column it leaves out is left out of the publication, so PostgreSQL never sends it: it reaches neither the artifact nor the canonical log, may have any type or be generated, and a migration may add, change or drop it while `serve` runs. PostgreSQL refuses to drop a column the publication lists: remove it from `columns` and `writableColumns`, run `calque destroy`, restart `serve`, then drop it. When the list leaves out a `NOT NULL` column with no default, PostgreSQL would refuse every insert, so the table admits none and `calque init` leaves `insert` out of its command. |
+| `collections[].columns[]` | Each column's `name`, `postgresType`, the `pg_catalog` name of the type it travels as such as `int4` or `timestamptz` (`text` for an enum, the base type for a domain), and `nullable`, which must match the live table. The list includes the primary key. A column it leaves out is left out of the publication, so PostgreSQL never sends it: it reaches neither the artifact nor the canonical log, may have any type or be generated, and a migration may add, change or drop it while `serve` runs. PostgreSQL refuses to drop a column the publication lists: remove it from `columns` and `writableColumns`, restart `serve`, which moves the source to a schema generation without it, then drop it. When the list leaves out a `NOT NULL` column with no default, PostgreSQL would refuse every insert, so the table admits none and `calque init` leaves `insert` out of its command. |
 | `collections[].primaryKey` | The table's primary-key columns, in key order, which must match the live table's. No command can write them. |
 | `collections[].partitionColumn` | Under a partitioned scope, the column that holds the tenant. It must be the first column of `primaryKey`, of type `int2`, `int4`, `int8` or `uuid`, the same type in every partitioned collection. |
 | `collections[].shared` | Under a partitioned scope, `true` for a table no tenant owns: every tenant receives it whole. A collection under a partitioned scope sets exactly one of `partitionColumn` and `shared`. |
@@ -745,21 +745,23 @@ creating the publication again, stops the runtime, even when the definition
 `sources[].publication` requires is put back: pgoutput leaves out what an
 altered definition does not publish, from the alteration's commit on, so the
 working set may miss those changes. The `failure` field names the
-publication. When the process is then stopped, it prints the refusal a start
-that meets the same publication prints, then `Restore the publication's
-definition if it was altered, then run calque destroy ... and rerun serve to
-prepare the working set anew` (`dev` under `calque dev`). Destroy drops only a
-publication Calque's role owns and that it can verify, which is why the
-definition is restored first. Changing the publication's owner counts as an
-alteration too.
+publication, and within a second the process moves the source to its next
+schema generation, which prepares the working set again from a
+snapshot. The move puts back a publication Calque's role owns. For one another
+role owns, the move is refused every second, with the statement for its owner
+to run, until the owner runs it. A stop that moves the source writes
+`schema-move-pending` to the state directory, and every start moves the source
+while the file is there, so a start after the process stopped moves it too,
+even when the definition was put back in between. Changing the publication's
+owner counts as an alteration too.
 
 The same reads cover every enum a published column uses, directly or through
 domains. Adding a value keeps the runtime serving. Renaming a value
 Calque enrolled or has served, or giving its label to another value, stops it
-with `state_must_be_destroyed` `true` and a `failure` that names the enum and
-the label: the rows holding the value now carry another label, and the WAL
-logged no row change. Two cases stop it the same way with nothing served
-wrong: PostgreSQL renumbering an enum, which it does after many values were
+with a `failure` that names the enum and the label, and the process moves the
+source to its next schema generation: the rows holding the value now carry
+another label, and the WAL logged no row change. Two cases move it the same
+way with nothing served wrong: PostgreSQL renumbering an enum, which it does after many values were
 added before one another, and a row that takes a new value while another value
 of the same enum changed and no read saw either change before the row, as with
 two values added while Calque was stopped, or within the second before a row
@@ -769,18 +771,23 @@ seconds before a row takes one, avoids the second. An enum grown past the
 `false` and a `failure` that names the column, and a start refuses it.
 
 The reads also cover the definition of every published column. Dropping or
-renaming one, or changing its type or type modifier, stops the runtime with
-`state_must_be_destroyed` `true` and a `failure` that names the table and the
-column: PostgreSQL applies each to every row and logs no row change.
+renaming one, or changing its type or type modifier, stops the runtime with a
+`failure` that names the table and the column, and the process moves the
+source to its next schema generation: PostgreSQL applies each to every row and
+logs no row change. When the manifest names the column the change took away,
+the move finds a schema the manifest does not bind and suspends the source
+until the schema or the manifest binds again (`docs/postgresql.md`, "Schema
+changes").
 `ALTER COLUMN ... TYPE` to the column's own type and modifier with a `USING`
 expression rewrites every value and leaves the definition as it was, but it
 writes the column's `pg_attribute` row and gives the table a new
 `relfilenode` in one transaction. A served column whose row and table file
-both changed since the runtime last read them stops it the same way, with a
-`failure` that names the table and the column. A grant, statistics target,
-default or `NOT NULL` changes only the row, and `VACUUM FULL`, `CLUSTER` or
-`TRUNCATE` only the file, so each alone keeps it serving; both between two
-reads, within a second while it streams or both while it is stopped, stop it.
+both changed since the runtime last read them moves the source the same way,
+with a `failure` that names the table and the column. A grant, statistics
+target, default or `NOT NULL` changes only the row, and `VACUUM FULL`,
+`CLUSTER` or `TRUNCATE` only the file, so each alone keeps it serving; both
+between two reads, within a second while it streams or both while it is
+stopped, move it.
 
 #### When the server is stopped or killed
 

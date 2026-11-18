@@ -5,10 +5,13 @@ import { plan, until, makeClient, settled } from "./session.fixture.js";
 import { stubBrowserFeatures } from "../browser.fixture.js";
 
 /** The bootstrap's answer while the artifact it would plan is being published. */
-function preparing(retryAfterSeconds: number): Response {
+function preparing(
+  retryAfterSeconds: number,
+  code = "ARTIFACT_PREPARING",
+): Response {
   return new Response(
     JSON.stringify({
-      code: "ARTIFACT_PREPARING",
+      code,
       message:
         "this authorization generation's artifact is still being published",
       resnapshotRequired: false,
@@ -143,6 +146,55 @@ describe("direct-columnar session", () => {
     );
     stop();
     await client.close();
+  }, 20_000);
+
+  it("waits out a SCHEMA_SUSPENDED bootstrap as it waits out a preparing one, and reports it past the bound", async () => {
+    let suspendedAnswers = 0;
+    const waiting = makeClient(
+      plan(),
+      undefined,
+      undefined,
+      (inner) => async (input, init) => {
+        if (String(input).endsWith("/v1/bootstrap") && suspendedAnswers < 2) {
+          suspendedAnswers += 1;
+          return preparing(1, "SCHEMA_SUSPENDED");
+        }
+        return inner(input, init);
+      },
+    );
+    await until(
+      () => waiting.client.status.state === "preparing",
+      "the preparing status",
+    );
+    expect(await waiting.client.db.events.query().run()).toEqual([
+      { id: 1n, level: "error" },
+    ]);
+    expect(waiting.client.status).toEqual({ state: "ready" });
+    expect(suspendedAnswers).toBe(2);
+    await waiting.client.close();
+
+    const now = Date.now.bind(Date);
+    let held = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => now() + held);
+    const giving = makeClient(
+      plan(),
+      undefined,
+      undefined,
+      (inner) => async (input, init) => {
+        if (!String(input).endsWith("/v1/bootstrap")) return inner(input, init);
+        held += 45_000;
+        return preparing(1, "SCHEMA_SUSPENDED");
+      },
+    );
+    for (let waited = 0; giving.client.status.state !== "error"; waited += 50) {
+      if (waited > 10_000) throw new Error("the client never gave up");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(giving.client.status).toMatchObject({
+      state: "error",
+      error: { code: "SCHEMA_SUSPENDED", recovery: "retry" },
+    });
+    await giving.client.close();
   }, 20_000);
 
   it("bounds a preparing wait by wall time when the server holds each request open", async () => {

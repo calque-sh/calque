@@ -75,6 +75,12 @@ pub enum BootstrapHttpError {
     ArtifactPreparing {
         retry_after_seconds: u32,
     },
+    /// The source's live schema no longer binds the deployment's
+    /// configuration, and nothing is served until it does again.
+    /// Like `ArtifactPreparing`, it carries only retry guidance.
+    SchemaSuspended {
+        retry_after_seconds: u32,
+    },
 }
 
 /// Upper bound on the `Retry-After` a preparing artifact may advertise.
@@ -164,6 +170,7 @@ fn error_class(error: BootstrapHttpError) -> &'static str {
         BootstrapHttpError::ResnapshotRequired => "resnapshot_required",
         BootstrapHttpError::Unavailable => "unavailable",
         BootstrapHttpError::ArtifactPreparing { .. } => "artifact_preparing",
+        BootstrapHttpError::SchemaSuspended { .. } => "schema_suspended",
     }
 }
 
@@ -478,6 +485,12 @@ fn error_response(error: BootstrapHttpError) -> Response {
             "this authorization generation's artifact is still being published",
             false,
         ),
+        BootstrapHttpError::SchemaSuspended { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SCHEMA_SUSPENDED",
+            "the source's schema no longer matches the server's configuration",
+            false,
+        ),
     };
     let mut response = (
         status,
@@ -493,6 +506,9 @@ fn error_response(error: BootstrapHttpError) -> Response {
         HeaderValue::from_static("no-store, private"),
     );
     if let BootstrapHttpError::ArtifactPreparing {
+        retry_after_seconds,
+    }
+    | BootstrapHttpError::SchemaSuspended {
         retry_after_seconds,
     } = error
     {
@@ -926,6 +942,32 @@ mod tests {
         for field in ["planId", "artifacts", "authorizationScopeToken", "changes"] {
             assert!(!text.contains(field), "{field} must not appear: {text}");
         }
+    }
+
+    #[tokio::test]
+    async fn schema_suspended_refusal_matches_its_frozen_vector() {
+        let suspended = router(RefusingBackend(BootstrapHttpError::SchemaSuspended {
+            retry_after_seconds: 0,
+        }))
+        .oneshot(request(valid_body()))
+        .await
+        .unwrap();
+        assert_eq!(suspended.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            suspended.headers()[header::CACHE_CONTROL],
+            "no-store, private"
+        );
+        assert_eq!(suspended.headers()[header::RETRY_AFTER], "1");
+        let body = to_bytes(suspended.into_body(), MAX_REQUEST_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(include_bytes!(
+                "../../../../spec/bootstrap-error.schema-suspended.example.json"
+            ))
+            .unwrap()
+        );
     }
 
     #[tokio::test]

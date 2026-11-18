@@ -112,7 +112,7 @@ Arbitrary server-side live SQL collections, runtime-created remote scopes, remot
 
 ### Canonical truth and delivery
 
-- **INV-CDC-001 — Durable acknowledgement:** PostgreSQL WAL is acknowledged only after the complete normalized transaction and its index are durably appended by the current fenced owner.
+- **INV-CDC-001 — Durable acknowledgement:** PostgreSQL WAL is acknowledged only after the complete normalized transaction and its index are durably appended by the current fenced owner, or, for a transaction inside a recorded schema boundary, after that boundary's record is durable.
 - **INV-CDC-002 — At-least-once application:** delivery may repeat; log, artifact, adapter, and mutation application are idempotent.
 - **INV-CDC-003 — Ordered convergence:** backpressure, batching, and UI frame coalescing preserve canonical transaction order and eventually converge to PostgreSQL.
 - **INV-CDC-004 — Explicit rebuilds:** retention gaps, epoch changes, schema incompatibility, authorization changes, integrity failures, or unaffordable catch-up cross explicit rebuild boundaries. They never silently skip history.

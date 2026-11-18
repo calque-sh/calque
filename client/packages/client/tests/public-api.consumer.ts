@@ -231,6 +231,7 @@ export async function recoverFrom(error: SyncError, client: SyncClient) {
     // as `status.state === "preparing"`; an application that sees the code
     // has already waited longer than the client's bound.
     case "ARTIFACT_PREPARING":
+    case "SCHEMA_SUSPENDED":
       return;
     case "CANCELLED":
     case "CAPACITY_EXCEEDED":
@@ -239,6 +240,7 @@ export async function recoverFrom(error: SyncError, client: SyncClient) {
     case "INVALID_RESPONSE":
     case "QUERY_FAILED":
     case "RESULT_TOO_LARGE":
+    case "SCHEMA_MISMATCH":
     case "MUTATION_CONFLICT":
     case "MUTATION_REJECTED":
     case "UNSUPPORTED_BROWSER":

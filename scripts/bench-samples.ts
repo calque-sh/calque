@@ -18,7 +18,7 @@ export const RETAKES = 3;
 const WALL_DRIFT_LIMIT_MS = 5;
 
 /** One reason a sample is `INVALID_RUN`. */
-interface Invalidity {
+export interface Invalidity {
   readonly reason: string;
   /**
    * Whether the reason speaks of the instrument alone: a dropped-frame signal

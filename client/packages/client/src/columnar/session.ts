@@ -1705,7 +1705,8 @@ export class ColumnarSession {
 
   /**
    * Requests the bootstrap plan, retrying a `NETWORK_ERROR` on
-   * `BOOTSTRAP_RETRY_DELAYS_MS` and a `503 ARTIFACT_PREPARING` on the server's
+   * `BOOTSTRAP_RETRY_DELAYS_MS` and a `503 ARTIFACT_PREPARING` or
+   * `SCHEMA_SUSPENDED` on the server's
    * `Retry-After`, up to `MAX_PREPARING_WAIT_MS` from the first such answer,
    * while the status is `preparing`. The bound is wall time, because a server
    * may hold each request open while it prepares. Any other answer is

@@ -32,6 +32,7 @@ use thiserror::Error;
 use crate::{
     enum_labels::{EnumLabelGuard, GuardError},
     ActiveLease, ActiveSourceSession, FenceAuthority, FenceError, PostgresFenceStore,
+    SchemaBoundary,
 };
 
 const MAX_BOUNDED_TRANSACTIONS: usize = 10_000;
@@ -363,6 +364,7 @@ pub struct PersistentIngestConfig {
     /// The state directory of the calque process the session serves, which
     /// the canonical log names when it refuses a log an earlier release wrote.
     state_dir: PathBuf,
+    schema_boundary: Arc<SchemaBoundary>,
 }
 
 impl PersistentIngestConfig {
@@ -374,6 +376,7 @@ impl PersistentIngestConfig {
             ends_once_current: false,
             observer: Arc::new(NoopIngestObserver),
             state_dir: state_dir.to_path_buf(),
+            schema_boundary: Arc::new(SchemaBoundary::serving(1, None)),
         }
     }
 
@@ -411,6 +414,13 @@ impl PersistentIngestConfig {
 
     pub fn with_observer(mut self, observer: Arc<dyn PersistentIngestObserver>) -> Self {
         self.observer = observer;
+        self
+    }
+
+    /// Where the source stands against its latest schema move.
+    /// Without one, the source serves generation 1 and appends everything.
+    pub fn with_schema_boundary(mut self, boundary: Arc<SchemaBoundary>) -> Self {
+        self.schema_boundary = boundary;
         self
     }
 
@@ -946,6 +956,7 @@ impl ActiveSourceSession {
                 &mut self.ingest_state.silence,
                 ingest,
                 &mut self.enum_guard,
+                &config.schema_boundary,
                 &self.authority,
                 &self.lease,
                 &observer,
@@ -998,6 +1009,7 @@ fn run_ingest_loop<A, F, N>(
     silence: &mut StreamSilence,
     ingest: &mut IngestSession<A, F, N>,
     enum_guard: &mut EnumLabelGuard,
+    schema_boundary: &SchemaBoundary,
     authority: &Arc<FenceAuthority<PostgresFenceStore>>,
     lease: &ActiveLease,
     observer: &Arc<dyn PersistentIngestObserver>,
@@ -1051,13 +1063,27 @@ where
             }
             let transactions = group.len();
             let stamps = DeliveryStamps::of(&group, stats.newest_send_postgres_micros);
-            // A label is recorded as served before the append that serves it.
-            enum_guard.verify(&group, |labels| authority.record_enum_labels(lease, labels))?;
-            let pending = ingest.ingest_group(group)?;
-            let authorized = ingest.authorize_ack(pending)?;
+            let ack_lsn = group
+                .last()
+                .map(|transaction| transaction.end_lsn.get())
+                .ok_or(PersistentIngestError::InvalidConfig)?;
+            // A transaction skipped at a schema boundary is acknowledged with
+            // the group: the cut that closes the boundary holds its effects.
+            let kept = schema_boundary.keep(group, |generation, from_lsn| {
+                authority.record_schema_generation_serving(lease, generation, from_lsn)
+            })?;
+            let mut checkpoint_is_durable = false;
+            if !kept.is_empty() {
+                // A label is recorded as served before the append that serves it.
+                enum_guard.verify(&kept, |labels| authority.record_enum_labels(lease, labels))?;
+                let pending = ingest.ingest_group(kept)?;
+                let authorized = ingest.authorize_ack(pending)?;
+                checkpoint_is_durable = authorized.checkpoint_is_durable()
+                    && u64::from(authorized.wal_end()) == ack_lsn;
+                stats.last_canonical_position = Some(authorized.canonical_position().clone());
+            }
             stamps.appended(transactions);
-            let ack_lsn: u64 = authorized.wal_end().into();
-            if !authorized.checkpoint_is_durable() {
+            if !checkpoint_is_durable {
                 observer.observe(PersistentIngestBoundary::BeforeCheckpoint);
                 authority.advance_durable_canonical_lsn(lease, ack_lsn)?;
                 observer.observe(PersistentIngestBoundary::AfterCheckpoint);
@@ -1081,7 +1107,6 @@ where
                 .committed_transactions
                 .checked_add(transactions)
                 .ok_or(PersistentIngestError::InvalidConfig)?;
-            stats.last_canonical_position = Some(authorized.canonical_position().clone());
             continue;
         }
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {

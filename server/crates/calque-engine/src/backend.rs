@@ -88,12 +88,14 @@ mod credentials;
 mod fence;
 mod log_proxy;
 mod maintenance;
+mod moving;
 #[cfg(test)]
 mod tests;
 mod writes;
 
 use self::{bootstrap::*, changes::*, credentials::*, fence::*, log_proxy::*, maintenance::*};
 pub use credentials::LocalCredentialPolicy;
+pub use moving::{BetweenGenerations, MovingBackend};
 pub use writes::{MountedCommands, MutationCommandPolicy};
 
 /// Plans whose verified scope one process keeps, unless the deployment sets
@@ -166,6 +168,9 @@ struct ServingAuthorization {
 const ARTIFACT_READY: u8 = 0;
 const ARTIFACT_PREPARING: u8 = 1;
 const ARTIFACT_FAILED: u8 = 2;
+/// The source moved to another schema generation: nothing of this
+/// one is served or published again.
+const ARTIFACT_RETIRED: u8 = 3;
 
 impl ServingAuthorization {
     fn new(policy: AuthorizationPolicy, built_scope: AuthorizedScope, artifact: u8) -> Self {
@@ -492,11 +497,33 @@ impl LocalBackend {
         Arc::clone(&self.inner.fence_lock).read_owned().await
     }
 
+    /// Retires this backend as the source moves to another schema generation.
+    /// Every change build and write in flight ends first, under
+    /// the fence lock; after it a build answers `SCHEMA_GENERATION_MISMATCH`,
+    /// a bootstrap that the artifact is preparing, a write that the server is
+    /// unavailable, and no re-cut, re-encode or fence publishes.
+    pub async fn retire(&self) {
+        {
+            let _fence = self.inner.fence_lock.write().await;
+            let _builds = self.inner.build_fence.fence().await;
+            self.serving().set_artifact(ARTIFACT_RETIRED);
+        }
+        self.cancel_reencode();
+        self.wake_builds_for_revocation();
+    }
+
+    fn retired(&self) -> bool {
+        self.serving().artifact() == ARTIFACT_RETIRED
+    }
+
     pub(crate) fn probe_operational_dependencies(&self) -> Result<(), OperationErrorClass> {
         // A fenced generation whose artifact could not be published has
         // nothing to serve, and a restart is what retries it.
         if self.serving().artifact() == ARTIFACT_FAILED {
             return Err(OperationErrorClass::ArtifactBuild);
+        }
+        if self.retired() {
+            return Err(OperationErrorClass::CanonicalLog);
         }
         {
             let log = self.inner.log.blocking_lock();

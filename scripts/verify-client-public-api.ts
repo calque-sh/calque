@@ -109,7 +109,7 @@ interface ClientGeneratedRuntime {
 // The digest of the built `@calque/react` declaration graph. It covers the
 // declarations' doc comments as well as their shapes.
 const CURRENT_REACT_DECLARATION_GRAPH_SHA256 =
-  "4614b452214fc21dcc27743c36d2fed56b49df390ff0469d0652a64a329b3f1d";
+  "8a8cfef36438ac5aed84c6f4d1f11e6a38e637b1cd5ab7173c834f1029bc4485";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const clientRoot = join(root, "client/packages/client");

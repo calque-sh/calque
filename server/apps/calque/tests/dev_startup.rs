@@ -15,9 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use calque_engine::{LocalNames, LocalState, StateStore};
-use source_control::{QualifiedTable, SourceIdentity};
-use sync_types::SourceEpoch;
+use calque_engine::StateStore;
 
 /// A loopback listener standing in for PostgreSQL. It counts the connections
 /// that open a PostgreSQL handshake and closes each one after its first
@@ -83,33 +81,6 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// A state directory an earlier dev enrolled for `tables` in `public`.
-fn enrolled_state(state: &Path, tables: &[&str]) {
-    let store = StateStore::open(state).unwrap();
-    let identity = SourceIdentity {
-        system_identifier: "7612345678901234567".to_owned(),
-        database_name: "app".to_owned(),
-        timeline_id: 1,
-        previous_timeline_id: 1,
-    };
-    let names = LocalNames::derive(store.root(), &identity).unwrap();
-    let tables = tables
-        .iter()
-        .map(|table| QualifiedTable {
-            schema: "public".to_owned(),
-            table: (*table).to_owned(),
-        })
-        .collect();
-    let state = LocalState::new(
-        identity,
-        SourceEpoch::new("dev-startup-test".to_owned()).unwrap(),
-        names,
-        tables,
-    )
-    .unwrap();
-    store.write_state(&state).unwrap();
-}
-
 /// `calque dev` for `public.issues` on `state`, reading its connection string
 /// from `database_url_env`.
 fn dev(state: &Path, database_url_env: &str) -> Command {
@@ -138,35 +109,6 @@ fn refusal(output: &Output) -> Vec<String> {
         .skip_while(|line| !line.starts_with("calque: "))
         .map(str::to_owned)
         .collect()
-}
-
-/// A state directory enrolled for other tables names the destroy command with
-/// the variable dev read, since destroy's default may point at another source.
-#[test]
-fn a_state_enrolled_for_other_tables_names_destroy_with_the_variable_dev_read() {
-    let (database_port, postgres_connections) = counting_listener();
-    let workspace = tempfile::tempdir().unwrap();
-    let state = workspace.path().join("state");
-    enrolled_state(&state, &["projects"]);
-
-    let output = dev(&state, "CALQUE_DEV_STARTUP_URL")
-        .env(
-            "CALQUE_DEV_STARTUP_URL",
-            format!("postgresql://127.0.0.1:{database_port}/app"),
-        )
-        .output()
-        .unwrap();
-
-    let state = state.display();
-    assert_eq!(
-        refusal(&output),
-        [format!(
-            "calque: {state} is enrolled for [public.projects], but dev requested [public.issues]. \
-             Calque will not change an existing enrollment in place. Rerun dev with the persisted table set, \
-             or run calque destroy --state-dir {state} --database-url-env CALQUE_DEV_STARTUP_URL --yes and then rerun dev."
-        )]
-    );
-    assert_eq!(postgres_connections.load(Ordering::SeqCst), 0);
 }
 
 /// A connection-string variable that is not set names the variable and both

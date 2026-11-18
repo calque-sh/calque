@@ -195,11 +195,20 @@ test("a dropped frame inside the hold window is still a dropped frame", () => {
   assert.equal(detector.observe(frame(1_213, expectedHash)), 1_213);
   detector.invalidate({ kind: "screencast-hidden" });
   assert.equal(detector.invalid, true);
-  // The screencast stopped showing the page: the next frame cannot qualify,
-  // so it contradicts the held match rather than confirming it.
+  // The signal is the instrument's: a later frame showing the reference
+  // contradicts nothing, and the sample stays invalid on the signal alone.
   assert.equal(detector.observe(frame(1_400, expectedHash)), null);
-  assert.equal(detector.holdWindowContradiction?.pageContractQualified, true);
+  assert.equal(detector.holdWindowContradiction, null);
   assert.deepEqual(detector.droppedFrameSignals, [
     { kind: "screencast-hidden" },
   ]);
+  // A frame that differs still speaks of the page.
+  const differs = new StableFrameDetector(expectedHash);
+  differs.observe(frame(1_213, expectedHash));
+  differs.invalidate({ kind: "screencast-hidden" });
+  assert.equal(differs.observe(frame(1_500, otherHash)), null);
+  assert.equal(
+    differs.holdWindowContradiction?.contradictingTimestampMilliseconds,
+    1_500,
+  );
 });

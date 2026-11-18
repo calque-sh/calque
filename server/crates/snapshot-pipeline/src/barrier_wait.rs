@@ -447,6 +447,7 @@ mod tests {
                 },
                 build_id: identity.build_id.clone(),
                 nonce: identity.nonce.clone(),
+                schema_generation: 1,
                 message_lsn: PgLsn::from(20_u64).to_string(),
                 commit_lsn: PgLsn::from(25_u64).to_string(),
                 commit_time_unix_micros: 1,
@@ -542,7 +543,7 @@ mod tests {
                 Duration::from_secs(30),
             )
             .unwrap();
-        let identity = CutIdentity::new("build-barrier-wait", "nonce-barrier-wait").unwrap();
+        let identity = CutIdentity::new("build-barrier-wait", "nonce-barrier-wait", 1).unwrap();
         let cut = CutObservation {
             identity,
             transaction_id: 7,
@@ -639,6 +640,7 @@ mod tests {
             },
             build_id: "build-other".to_owned(),
             nonce: "nonce-other".to_owned(),
+            schema_generation: 1,
             message_lsn: PgLsn::from(12_u64).to_string(),
             commit_lsn: PgLsn::from(13_u64).to_string(),
             commit_time_unix_micros: 1,

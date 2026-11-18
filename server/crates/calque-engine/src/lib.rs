@@ -32,8 +32,9 @@ pub(crate) mod test_support;
 
 pub use artifacts::{ArtifactError, ArtifactService, LocalArtifactResolver};
 pub use backend::{
-    LocalBackend, LocalBackendConfig, LocalBackendError, LocalCredentialPolicy, LocalMemoryPolicy,
-    MountedCommands, MutationCommandPolicy, DEFAULT_MAX_ACTIVE_PLANS,
+    BetweenGenerations, LocalBackend, LocalBackendConfig, LocalBackendError, LocalCredentialPolicy,
+    LocalMemoryPolicy, MountedCommands, MovingBackend, MutationCommandPolicy,
+    DEFAULT_MAX_ACTIVE_PLANS,
 };
 pub use columnar::LocalColumnarError;
 pub use guard::{AllowedOrigin, DatabaseUrl, GuardError, HttpBinding};
@@ -63,7 +64,10 @@ pub use revocation::{
     AuthorizationFenceError, AuthorizationFenceStore, GenerationArtifactPublisher,
     LocalRevocationConfig, RecompileAuthorization, StoredRetirement,
 };
-pub use service::{local_router, metrics_router};
+pub use service::{
+    generation_routes, local_router, metrics_router, moving_routes, switched_local_router,
+    GenerationRoutes,
+};
 pub use snapshot::{ArtifactBuilder, LocalSnapshotError, LocalSnapshotOutcome};
 /// Re-exported so the `calque` binary takes no dependency edge on
 /// `snapshot-pipeline`, whose build configuration carries a raw replication
@@ -72,9 +76,10 @@ pub use snapshot::{ArtifactBuilder, LocalSnapshotError, LocalSnapshotOutcome};
 pub use snapshot_pipeline::CanonicalHeadSignal;
 pub use source::{
     destroy_local_source, inspect_local_identity, inspect_local_source, inspect_slot_wal_bound,
-    prepare_local_source, prepare_selected_local_source, start_local_source_runtime, CdcStopRemedy,
-    Destroyed, LocalSourceError, LocalSourceHealth, LocalSourceRuntime, LocalSourceRuntimeConfig,
-    PreparedLocalSource, SelectedColumns, LOCAL_DEVELOPMENT_SUBJECT,
+    prepare_local_source, prepare_moving_local_source, prepare_selected_local_source,
+    start_local_source_runtime, CdcStopRemedy, Destroyed, LocalSourceError, LocalSourceHealth,
+    LocalSourceRuntime, LocalSourceRuntimeConfig, PreparedLocalSource, SelectedColumns,
+    LOCAL_DEVELOPMENT_SUBJECT,
 };
 pub use state::{LocalNames, LocalSecrets, LocalState, SecretToken, StateError, StateStore};
 pub use tenants::{

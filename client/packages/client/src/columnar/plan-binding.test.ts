@@ -201,7 +201,7 @@ describe("verifyColumnarBootstrapPlan", () => {
     if (!otherTable) throw new Error("fixture table missing");
     otherTable.sourceSchema = "audit";
     expect(() => verifyColumnarBootstrapPlan(schema, otherRelation)).toThrow(
-      "the generated bindings do not match what the server serves: the server does not serve public.events, and no generated collection reads audit.events; regenerate them with calque-bindings from the calque.config.json the server runs",
+      "the generated bindings do not match what the server serves: the server does not serve public.events, and no generated collection reads audit.events; this page was built from an older configuration, so load a build generated from the calque.config.json the server runs",
     );
     // A plan serving a relation no collection names is refused too.
     const extra = structuredClone(hashed);
@@ -223,7 +223,7 @@ describe("verifyColumnarBootstrapPlan", () => {
     if (!extraArtifact) throw new Error("fixture artifact missing");
     extraArtifact.tables = [wire, "table:0000:g18"];
     expect(() => verifyColumnarBootstrapPlan(schema, extra)).toThrow(
-      /: no generated collection reads public\.audits; regenerate them with calque-bindings /u,
+      /: no generated collection reads public\.audits; this page was built from an older configuration/u,
     );
   });
 
@@ -247,8 +247,48 @@ describe("verifyColumnarBootstrapPlan", () => {
     if (!level) throw new Error("fixture column missing");
     level.type = "f64";
     expect(() => verifyColumnarBootstrapPlan(schema, drifted)).toThrow(
-      /: events\.level is served as f64, not text; regenerate/u,
+      /: events\.level is served as f64, not text; this page was built/u,
     );
+  });
+
+  it("reports SCHEMA_MISMATCH with recovery none, naming the table and column, for bindings the plan does not bind", () => {
+    const missing = plan();
+    const runtime = (
+      missing.artifacts as { runtime: Record<string, unknown> }[]
+    )[0]?.runtime;
+    const schemaValue = runtime?.schema as {
+      tables: { columns: { name: string }[] }[];
+    };
+    const level = schemaValue.tables[0]?.columns[1];
+    if (!level) throw new Error("fixture column missing");
+    level.name = "severity";
+    let caught: unknown;
+    try {
+      verifyColumnarBootstrapPlan(schema, missing);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({
+      code: "SCHEMA_MISMATCH",
+      recovery: "none",
+      message: expect.stringContaining("no column events.level"),
+    });
+  });
+
+  it("ignores a served column the generated bindings do not name", () => {
+    const wider = plan();
+    const runtime = (
+      wider.artifacts as { runtime: Record<string, unknown> }[]
+    )[0]?.runtime;
+    const schemaValue = runtime?.schema as {
+      tables: { columns: Record<string, unknown>[] }[];
+    };
+    schemaValue.tables[0]?.columns.push({
+      name: "region",
+      type: "utf8",
+      nullable: true,
+    });
+    expect(() => verifyColumnarBootstrapPlan(schema, wider)).not.toThrow();
   });
 
   it("binds an int32 column to the int64 column the server serves for it, and to nothing else", () => {
@@ -275,7 +315,7 @@ describe("verifyColumnarBootstrapPlan", () => {
       verifyColumnarBootstrapPlan(int32, served("int64")),
     ).not.toThrow();
     expect(() => verifyColumnarBootstrapPlan(int32, served("f64"))).toThrow(
-      /: events\.level is served as f64, not int32; regenerate/u,
+      /: events\.level is served as f64, not int32; this page was built/u,
     );
   });
 
@@ -288,7 +328,7 @@ describe("verifyColumnarBootstrapPlan", () => {
     if (!events) throw new Error("fixture table missing");
     events.primaryKey = ["level"];
     expect(() => verifyColumnarBootstrapPlan(schema, keyed)).toThrow(
-      /: events is keyed by level, not id; regenerate/u,
+      /: events is keyed by level, not id; this page was built/u,
     );
   });
 

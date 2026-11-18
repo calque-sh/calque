@@ -997,8 +997,10 @@ impl SnapshotBuildSupervisor {
             on_stage(SnapshotBuildStage::RollingForward);
             ensure_active(cancellation)?;
             observe_watchdog(watchdog, pressure_revision, journal)?;
-            let generated = CutIdentity::generate();
-            let cut_identity = CutIdentity::new(self.config.build_id.as_str(), generated.nonce)?;
+            let generation = registry.schema_generation();
+            let generated = CutIdentity::generate(generation);
+            let cut_identity =
+                CutIdentity::new(self.config.build_id.as_str(), generated.nonce, generation)?;
             let emission =
                 await_operation(emit_cut_marker(control, cut_identity), cancellation).await?;
             let stats = build

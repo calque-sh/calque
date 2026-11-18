@@ -112,7 +112,7 @@ const PUBLICATION_QUIET_MS = 2_000;
 const DRAIN_TIMEOUT_MS = 60_000;
 
 /** The background writer: `transactionsPerSecond` over two sessions. */
-class LoadWriter {
+export class LoadWriter {
   readonly #sessions: PsqlSession[];
   readonly #transactionsPerSecond: number;
   #issued = 0;

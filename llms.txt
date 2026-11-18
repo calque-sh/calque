@@ -71,7 +71,7 @@ calque dev --public-base-url http://127.0.0.1:5173/_calque/ \
   --acknowledge-disposable-source
 ```
 
-It allows the origin `http://127.0.0.1:5173` unless `--allow-origin` names another, and `--public-base-url` is the Vite proxy's address, which every URL it hands the page names. `calque destroy --state-dir .calque-dev --yes` removes what it created; run it after editing a collection's `columns`, and the next `calque dev` prepares the tables with the new ones.
+It allows the origin `http://127.0.0.1:5173` unless `--allow-origin` names another, and `--public-base-url` is the Vite proxy's address, which every URL it hands the page names. Saving an edit to a collection's `columns` while it runs moves the source to its next schema generation, and open pages rebuild with the new columns. `calque destroy --state-dir .calque-dev --yes` removes what it created.
 
 ## 6. The page
 

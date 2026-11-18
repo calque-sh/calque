@@ -165,19 +165,21 @@ verdict.
 | `--no-stored-rows` | Start calque with `--no-stored-rows`, so its plans carry no key and no page keeps its rows between visits. |
 | `--returning` | Make every warm-up, judged and traced sample a returning visit; see below. |
 | `--between-visits <transactions>` | With `--returning`: commit that many write transactions, an even number, between each sample's two visits; see below. |
+| `--schema-change <config-add\|rewrite-whole\|rename-suspend>` | Make every warm-up, judged and traced sample a schema sample, in which a live page goes through that schema change under the write load; see below. |
 | `--hold-until-logged <text>` | Hold the reference pass and every sample after it until calque logs a line containing `text`, or for 300 s, in place of the wait for the artifact's publication. The run goes on whether or not the line came, and the summary's `hold` records how long it held. |
 | `--postgres-bin <dir>` | Run PostgreSQL 18 from the binaries in `dir`, in a temporary cluster with the container's superuser, database, flags and `docker/postgres-init`, for a host whose Docker does not answer. |
 
 A run under `--diagnostic`, `--network shaped:…`, `--realtime-only`,
 `--postgres-bin`, `--no-edge`, `--background-clients`, `--background-qos`,
 `--load-rate`, `--tail`, `--recut-tail-ratio`, `--recut-min-interval`,
-`--recut-keep-ratio`, `--no-stored-rows`, `--returning` or `--between-visits`
-is never judged: its `passes` is false whatever its rows say, its summary is
-labeled directional with the reasons, and its run id carries a suffix for
-each (`-diagnostic`, `-shaped`, `-realtime`, `-native-postgres`, `-no-edge`,
-`-background-<n>`, `-utility`, `-load-<tx/s>`, `-tail-<transactions>`,
-`-recut-ratio-<ratio>`, `-recut-interval-<seconds>`, `-keep-ratio-<ratio>`,
-`-no-stored-rows`, `-returning`, `-between-<transactions>`).
+`--recut-keep-ratio`, `--no-stored-rows`, `--returning`, `--between-visits`
+or `--schema-change` is never judged: its `passes` is false whatever its rows
+say, its summary is labeled directional with the reasons, and its run id
+carries a suffix for each (`-diagnostic`, `-shaped`, `-realtime`,
+`-native-postgres`, `-no-edge`, `-background-<n>`, `-utility`,
+`-load-<tx/s>`, `-tail-<transactions>`, `-recut-ratio-<ratio>`,
+`-recut-interval-<seconds>`, `-keep-ratio-<ratio>`, `-no-stored-rows`,
+`-returning`, `-between-<transactions>`, `-schema-<case>`).
 
 ## Returning visits
 
@@ -210,6 +212,43 @@ re-cut at least once, and stopped re-cutting as `--tail` waits, asks for a
 plan again so its object is judged against the newest cut, and keeps
 `betweenVisits` in its record: the writes, the re-cuts, the tail past the
 newest cut, the entries calque's log retains, and the state directory's size.
+
+## Schema samples
+
+`--schema-change <case>` takes a live page through one of three schema
+changes. calque dev reads a copy of the incidents configuration in the run's
+directory.
+Before calque dev enrolls the source, `config-add` adds a nullable
+`incidents.issues.triage_note` that the configuration does not name, and
+`rewrite-whole` sets `incidents.memberships` to `REPLICA IDENTITY FULL`.
+
+Each sample loads a fresh page to a settled paint whose grid matches the
+reference, runs the realtime write load for 10 s, then makes the change while
+the load runs. `config-add` renames over calque's a configuration that names
+`triage_note` in the collection and in the writable columns of the command
+that inserts into it. `rewrite-whole` runs `ALTER TABLE incidents.memberships
+ALTER COLUMN role TYPE text USING upper(role)`. `rename-suspend` renames
+`incidents.issues.priority` and renames it back 10 s later. The sample ends at
+the grid's stable paint of the reference picture after the client's last
+return to `ready`, the frame on screen at that return counting as presented
+then, within 120 s of the change (of the second rename). Its `recovery_ms`
+runs from the change to that paint. The load then stops, the page drains, and
+the oracle compares it with PostgreSQL. A judged sample that is `INVALID_RUN`
+for the instrument's reasons alone is taken again, as a cold sample is. It
+keeps its record with `retaken` true and `reached_ms`: from the change to its
+match, or, when a dropped-frame signal stopped the match, to the earliest
+frame showing PostgreSQL's state. The summary's `schema.secondReading` counts
+each slot such a sample left at that value.
+
+The record keeps the client's status log, calque's log from the change on
+with the move's times read from it, the engagement the experiment gates on,
+the page's `/v1/bootstrap` answers with the schema generation each plan
+names, and in `load_before` how many of the load's transactions PostgreSQL
+committed in the 10 s before the change. The page reads each answer from a copy of its body, since Chrome may
+drop a body before DevTools asks for it. `config-add` and `rewrite-whole` are
+then undone, and the next sample starts once calque serves the generation
+after. After the last sample the run takes a second reference pass for the
+realtime session, since the load has moved the issue panel.
 
 ## Replaying a long tail
 

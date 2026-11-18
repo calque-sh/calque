@@ -101,26 +101,38 @@ impl ExportedSnapshot {
 pub struct CutIdentity {
     pub build_id: String,
     pub nonce: String,
+    /// The schema generation the cut is built at. The persistent stream ends
+    /// a move's boundary at the first cut of the generation it moved to.
+    pub schema_generation: u64,
 }
 
 impl CutIdentity {
     /// Mints a random build id and nonce from OS-backed randomness.
-    pub fn generate() -> Self {
+    pub fn generate(schema_generation: u64) -> Self {
         Self {
             build_id: Uuid::new_v4().to_string(),
             nonce: Uuid::new_v4().simple().to_string(),
+            schema_generation,
         }
     }
 
     /// An identity from a given build id and nonce, each 1 to 64 bytes of ASCII
-    /// letters, digits, `-` and `_`. A snapshot build pairs its own build id
-    /// with a generated nonce.
-    pub fn new(build_id: impl Into<String>, nonce: impl Into<String>) -> Result<Self> {
+    /// letters, digits, `-` and `_`, at a nonzero schema generation. A
+    /// snapshot build pairs its own build id with a generated nonce.
+    pub fn new(
+        build_id: impl Into<String>,
+        nonce: impl Into<String>,
+        schema_generation: u64,
+    ) -> Result<Self> {
         let identity = Self {
             build_id: build_id.into(),
             nonce: nonce.into(),
+            schema_generation,
         };
-        if !valid_cut_component(&identity.build_id) || !valid_cut_component(&identity.nonce) {
+        if !valid_cut_component(&identity.build_id)
+            || !valid_cut_component(&identity.nonce)
+            || schema_generation == 0
+        {
             return Err(CoordinatorError::InvalidCutIdentity);
         }
         Ok(identity)
@@ -285,6 +297,11 @@ pub fn prove_persistent_cut(
     }
     if barrier.nonce != observation.identity.nonce {
         return Err(CoordinatorError::PersistentBarrierMismatch("nonce"));
+    }
+    if barrier.schema_generation != observation.identity.schema_generation {
+        return Err(CoordinatorError::PersistentBarrierMismatch(
+            "schema_generation",
+        ));
     }
     if barrier.key.postgres_xid != observation.transaction_id {
         return Err(CoordinatorError::PersistentBarrierMismatch("postgres_xid"));
@@ -1695,7 +1712,7 @@ mod tests {
 
     fn emission() -> CutEmission {
         CutEmission {
-            identity: CutIdentity::new("build-1", "nonce-1").unwrap(),
+            identity: CutIdentity::new("build-1", "nonce-1", 1).unwrap(),
             message_lsn: PgLsn::from(20),
         }
     }
@@ -1729,6 +1746,7 @@ mod tests {
                 },
                 build_id: "build-1".to_owned(),
                 nonce: "nonce-1".to_owned(),
+                schema_generation: 1,
                 message_lsn: PgLsn::from(20).to_string(),
                 commit_lsn: PgLsn::from(21).to_string(),
                 commit_time_unix_micros: 1,
@@ -1763,22 +1781,26 @@ mod tests {
         assert_eq!(CUT_MARKER_PREFIX, "sync.snapshot_cut.v1");
         assert_eq!(
             emission().identity.bytes().unwrap(),
-            br#"{"build_id":"build-1","nonce":"nonce-1"}"#
+            br#"{"build_id":"build-1","nonce":"nonce-1","schema_generation":1}"#
         );
     }
 
     #[test]
     fn production_cut_identity_is_random_and_fixture_components_are_bounded() {
-        let first = CutIdentity::generate();
-        let second = CutIdentity::generate();
+        let first = CutIdentity::generate(1);
+        let second = CutIdentity::generate(1);
         assert_ne!(first, second);
-        assert!(CutIdentity::new("a".repeat(64), "b_1").is_ok());
+        assert!(CutIdentity::new("a".repeat(64), "b_1", 1).is_ok());
         assert!(matches!(
-            CutIdentity::new("a".repeat(65), "b"),
+            CutIdentity::new("a".repeat(65), "b", 1),
             Err(CoordinatorError::InvalidCutIdentity)
         ));
         assert!(matches!(
-            CutIdentity::new("contains space", "b"),
+            CutIdentity::new("contains space", "b", 1),
+            Err(CoordinatorError::InvalidCutIdentity)
+        ));
+        assert!(matches!(
+            CutIdentity::new("a", "b", 0),
             Err(CoordinatorError::InvalidCutIdentity)
         ));
     }
@@ -1867,6 +1889,7 @@ mod tests {
         for field in [
             "build_id",
             "nonce",
+            "schema_generation",
             "postgres_xid",
             "message_lsn",
             "commit_lsn",
@@ -1879,6 +1902,7 @@ mod tests {
             match field {
                 "build_id" => barrier.build_id = "wrong-build".to_owned(),
                 "nonce" => barrier.nonce = "wrong-nonce".to_owned(),
+                "schema_generation" => barrier.schema_generation = 2,
                 "postgres_xid" => barrier.key.postgres_xid = 9,
                 "message_lsn" => barrier.message_lsn = PgLsn::from(30).to_string(),
                 "commit_lsn" => barrier.commit_lsn = PgLsn::from(31).to_string(),
@@ -1980,7 +2004,7 @@ mod tests {
     #[test]
     fn tracker_fails_closed_on_partial_marker_identity_collision() {
         let expected = emission();
-        let colliding = CutIdentity::new(&expected.identity.build_id, "other-nonce").unwrap();
+        let colliding = CutIdentity::new(&expected.identity.build_id, "other-nonce", 1).unwrap();
         let transaction = decoded_transaction(8, vec![marker_change(&colliding, 20)]);
         let tracker = DecodedCutTracker::new(expected).unwrap();
         assert!(matches!(
@@ -2010,7 +2034,8 @@ mod tests {
         let DecodedChange::LogicalMessage(message) = &mut reencoded else {
             unreachable!();
         };
-        message.content = br#"{"nonce":"nonce-1","build_id":"build-1"}"#.to_vec();
+        message.content =
+            br#"{"nonce":"nonce-1","schema_generation":1,"build_id":"build-1"}"#.to_vec();
         assert!(matches!(
             tracker.classify(&decoded_transaction(8, vec![reencoded])),
             Err(CoordinatorError::NonCanonicalCutMarker)

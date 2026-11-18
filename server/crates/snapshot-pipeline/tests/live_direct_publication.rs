@@ -841,6 +841,7 @@ async fn mirror_cut_to_file_log(
                         },
                         build_id: identity.build_id,
                         nonce: identity.nonce,
+                        schema_generation: 1,
                         message_lsn: tokio_postgres::types::PgLsn::from(message.message_lsn.get())
                             .to_string(),
                         commit_lsn: tokio_postgres::types::PgLsn::from(

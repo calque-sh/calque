@@ -18,11 +18,21 @@ pub(crate) trait CommandError: From<LocalSourceError> + Send + Sized + 'static {
     fn names_its_remedy(&self) -> bool;
     /// Whether this is a refusal only `calque destroy` gets past.
     fn requires_destroying_state(&self) -> bool;
+    /// Whether this refusal holds until the source's schema or the
+    /// configuration binds again, which the process waits out serving
+    /// nothing.
+    fn suspends_schema(&self) -> bool;
+    /// Whether this is a stop on a schema change, which moves the source to
+    /// its next schema generation.
+    fn moves_schema(&self) -> bool;
+    /// What the CDC loop stopped on, when this is the error of a runtime
+    /// whose loop stopped before readiness.
+    fn stopped_on(&self) -> Option<&str>;
     fn runtime_cleanup(startup: Self, cleanup: Self) -> Self;
     fn into_runtime_cleanup(self) -> Result<(Self, Self), Self>;
     fn state_must_be_destroyed(refusal: Self, state_dir: &Path, database_url_env: &str) -> Self;
     fn source_changed(refusal: Self, state_dir: &Path, database_url_env: &str) -> Self;
-    fn publication_drifted(refusal: Self, state_dir: &Path, database_url_env: &str) -> Self;
+    fn publication_drifted(refusal: Self) -> Self;
 }
 
 /// Whether this is the engine's refusal of a drifted publication.
@@ -126,11 +136,7 @@ pub(crate) fn with_state_remedy<E: CommandError>(
                     database_url_env,
                 )
             } else if drifted(&cleanup) {
-                E::publication_drifted(
-                    E::runtime_cleanup(startup, cleanup),
-                    state_dir,
-                    database_url_env,
-                )
+                E::publication_drifted(E::runtime_cleanup(startup, cleanup))
             } else {
                 E::runtime_cleanup(startup, cleanup)
             };
@@ -143,7 +149,7 @@ pub(crate) fn with_state_remedy<E: CommandError>(
     ) {
         E::source_changed(error, state_dir, database_url_env)
     } else if drifted(&error) {
-        E::publication_drifted(error, state_dir, database_url_env)
+        E::publication_drifted(error)
     } else if error.requires_destroying_state() {
         E::state_must_be_destroyed(error, state_dir, database_url_env)
     } else {

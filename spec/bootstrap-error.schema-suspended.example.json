@@ -1,0 +1,5 @@
+{
+  "code": "SCHEMA_SUSPENDED",
+  "message": "the source's schema no longer matches the server's configuration",
+  "resnapshotRequired": false
+}

@@ -1256,6 +1256,23 @@ pub(crate) mod tests {
         }
     }
 
+    /// A tenant's published cut is found by the catalog query of the
+    /// scope the backend prepared. After a move the query names the next
+    /// schema generation, so no cut of the old one is served.
+    #[test]
+    fn the_published_cut_query_names_its_schema_generation() {
+        let epoch = SourceEpoch::new("query-epoch").unwrap();
+        let at = |generation| {
+            published_query_for(&prepared_source_for(
+                epoch.clone(),
+                crate::test_support::tasks_registry_at(generation),
+            ))
+            .unwrap()
+        };
+        assert_eq!(at(1).cache_key.schema_generation, 1);
+        assert_eq!(at(2).cache_key.schema_generation, 2);
+    }
+
     #[test]
     fn every_snapshot_connection_bounds_its_replies_and_only_copy_may_run_long() {
         let database = DatabaseUrl::parse("postgresql:///calque?host=%2Ftmp").unwrap();

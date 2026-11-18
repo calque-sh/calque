@@ -84,6 +84,8 @@ struct StoredBarrier {
     commit_lsn: String,
     #[prost(uint64, tag = "6")]
     commit_time_unix_micros: u64,
+    #[prost(uint64, tag = "7")]
+    schema_generation: u64,
 }
 
 impl CanonicalEntry {
@@ -116,6 +118,7 @@ impl CanonicalEntry {
                 message_lsn: barrier.message_lsn.clone(),
                 commit_lsn: barrier.commit_lsn.clone(),
                 commit_time_unix_micros: barrier.commit_time_unix_micros,
+                schema_generation: barrier.schema_generation,
             }),
         };
         StoredEntry {
@@ -156,6 +159,7 @@ impl CanonicalEntry {
                 message_lsn: barrier.message_lsn,
                 commit_lsn: barrier.commit_lsn,
                 commit_time_unix_micros: barrier.commit_time_unix_micros,
+                schema_generation: barrier.schema_generation,
             })),
             None => Err(EntryDecodeError::Invalid("entry holds no record")),
         }
@@ -424,6 +428,7 @@ mod tests {
                 key: key(),
                 build_id: "build-1".to_owned(),
                 nonce: "nonce-1".to_owned(),
+                schema_generation: 1,
                 message_lsn: "0/1".to_owned(),
                 commit_lsn: "0/2".to_owned(),
                 commit_time_unix_micros: 1,

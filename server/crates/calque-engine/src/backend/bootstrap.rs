@@ -172,6 +172,13 @@ impl Plans {
         let table_starts =
             request_table_starts(request).ok_or(ChangeBatchError::InvalidTableSet)?;
         claims.check_tables(&table_starts, request.through_cursor_inclusive.is_none())?;
+        let generation = self.activated.registry_binding().schema_generation();
+        if table_starts
+            .keys()
+            .any(|table| of_another_schema_generation(table, generation))
+        {
+            return Err(ChangeBatchError::SchemaGenerationMismatch);
+        }
         let scope_hash = claims
             .scope_hash()
             .ok_or(ChangeBatchError::InvalidPlanBinding)?;
@@ -316,6 +323,36 @@ pub(super) fn delivery_expiry_matches_plan(
     delivery_expiry == Some(plan_expiry)
 }
 
+/// Whether `table` is a wire id of a schema generation other than
+/// `generation`: every id ends with the generation it was compiled at.
+pub(super) fn of_another_schema_generation(table: &TableId, generation: u64) -> bool {
+    table
+        .as_str()
+        .rsplit_once(":g")
+        .and_then(|(_, compiled)| compiled.parse::<u64>().ok())
+        .is_some_and(|compiled| compiled != generation)
+}
+
+/// Why a bootstrap that names `resident_tables` is refused, if it is. A page
+/// of another schema generation renews with tables that generation named,
+/// and is asked to rebuild.
+pub(super) fn resident_tables_refusal(
+    resident_tables: &BTreeSet<TableId>,
+    complete_tables: &BTreeSet<TableId>,
+    generation: u64,
+) -> Option<BootstrapHttpError> {
+    if resident_tables_are_authorized(resident_tables, complete_tables) {
+        None
+    } else if resident_tables
+        .iter()
+        .any(|table| of_another_schema_generation(table, generation))
+    {
+        Some(BootstrapHttpError::ResnapshotRequired)
+    } else {
+        Some(BootstrapHttpError::InvalidRequest)
+    }
+}
+
 pub(super) fn resident_tables_are_authorized(
     resident_tables: &BTreeSet<TableId>,
     complete_tables: &BTreeSet<TableId>,
@@ -438,15 +475,19 @@ impl LocalBackend {
         // learns nothing from it; before any catalog read.
         match serving.artifact() {
             ARTIFACT_READY => {}
-            ARTIFACT_PREPARING => {
+            ARTIFACT_PREPARING | ARTIFACT_RETIRED => {
                 return Err(BootstrapHttpError::ArtifactPreparing {
                     retry_after_seconds: FENCED_ARTIFACT_RETRY_AFTER_SECONDS,
                 })
             }
             _ => return Err(BootstrapHttpError::Unavailable),
         }
-        if !resident_tables_are_authorized(&request.resident_tables, &self.inner.complete_tables) {
-            return Err(BootstrapHttpError::InvalidRequest);
+        if let Some(refusal) = resident_tables_refusal(
+            &request.resident_tables,
+            &self.inner.complete_tables,
+            self.inner.activated.registry_binding().schema_generation(),
+        ) {
+            return Err(refusal);
         }
         let required_tables = resolve_required_tables(
             &request.required_tables,

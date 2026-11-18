@@ -99,7 +99,10 @@ const TRACE_CATEGORIES = ["devtools.timeline", "v8", "toplevel"];
  * An unmeasured load whose settled frame, once the oracle has verified the
  * page behind it, becomes the run's reference.
  */
-export async function referencePass(run: Run): Promise<void> {
+export async function referencePass(
+  run: Run,
+  record = "reference",
+): Promise<void> {
   const source = run.source;
   if (!source) throw new Error("the reference pass needs the source state");
   const before = readEnvironment(run.postgres);
@@ -165,7 +168,7 @@ export async function referencePass(run: Run): Promise<void> {
       problems.push("the chart differs from GROUP BY status, priority");
     const after = readEnvironment(run.postgres);
     run.readings.push(before, after);
-    writeRecord(run, "reference-0", {
+    writeRecord(run, `${record}-0`, {
       kind: "reference",
       browser: {
         version: session.browser.version(),
@@ -196,7 +199,7 @@ export async function referencePass(run: Run): Promise<void> {
       reference: null,
       sessionClockPassed: true,
     });
-    writeRecord(run, "reference-query", {
+    writeRecord(run, `${record}-query`, {
       kind: "reference-query",
       ...queried.record,
     });

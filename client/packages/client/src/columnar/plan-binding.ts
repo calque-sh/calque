@@ -24,8 +24,8 @@ import {
  * Binds one parsed bootstrap plan to the collections a generated schema
  * declares, before any byte reaches the engine. A plan that does not describe
  * exactly one direct-columnar artifact covering every collection, as when the
- * generated file predates the served schema, fails with `INVALID_RESPONSE`
- * and recovery `reset`.
+ * generated file predates the served schema, fails with `SCHEMA_MISMATCH` and
+ * recovery `none`; one that contradicts itself fails with `INVALID_RESPONSE`.
  *
  * Collections and plan tables meet on the source relation, `schema.table`.
  * The wire `tableId` is hashed over one source's identity and schema
@@ -103,17 +103,19 @@ function checkCollections(
   runtime: PlanArtifactColumnarRuntime,
 ): void {
   const drift = (detail: string): SyncError =>
-    invalid(
-      `the generated bindings do not match what the server serves: ${detail}; regenerate them with calque-bindings from the calque.config.json the server runs`,
+    new SyncError(
+      "SCHEMA_MISMATCH",
+      "sync",
+      "none",
+      `the generated bindings do not match what the server serves: ${detail}; this page was built from an older configuration, so load a build generated from the calque.config.json the server runs`,
     );
   const served = new Map(
     runtime.tables.map((table) => [relationOf(table), table] as const),
   );
   const generated = collectionRelations(collections);
-  if (
-    served.size !== runtime.tables.length ||
-    !sameSet([...served.keys()], generated)
-  ) {
+  if (served.size !== runtime.tables.length)
+    throw invalid("the plan serves one relation twice");
+  if (!sameSet([...served.keys()], generated)) {
     const unserved = generated.filter((relation) => !served.has(relation));
     const ungenerated = [...served.keys()]
       .filter((relation) => !generated.includes(relation))
@@ -126,9 +128,6 @@ function checkCollections(
         ...(ungenerated.length === 0
           ? []
           : [`no generated collection reads ${ungenerated.join(", ")}`]),
-        ...(unserved.length + ungenerated.length === 0
-          ? ["the plan serves one relation twice"]
-          : []),
       ].join(", and "),
     );
   }

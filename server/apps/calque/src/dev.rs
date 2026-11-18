@@ -20,12 +20,13 @@ use authz::{
 };
 use blob_store::LocalFilesystemBlobStore;
 use calque_engine::{
-    check_postgres_capacity, destroy_local_source, inspect_local_identity, local_router,
-    metrics_router, prepare_local_source, prepare_selected_local_source,
-    start_local_source_runtime, ArtifactBuilder, CanonicalHeadSignal, GenerationArtifactPublisher,
-    HttpBinding, LocalArtifactResolver, LocalBackend, LocalBackendConfig, LocalCredentialPolicy,
-    LocalMemoryPolicy, LocalMutationBackend, LocalMutationSupport, LocalNames, LocalSourceHealth,
-    LocalSourceRuntimeConfig, LocalState, MutationCommandPolicy, OperationsMetrics,
+    check_postgres_capacity, destroy_local_source, generation_routes, inspect_local_identity,
+    metrics_router, moving_routes, prepare_moving_local_source, start_local_source_runtime,
+    switched_local_router, ArtifactBuilder, BetweenGenerations, CanonicalHeadSignal, CdcStopRemedy,
+    DatabaseUrl, GenerationArtifactPublisher, GenerationRoutes, HttpBinding, LocalArtifactResolver,
+    LocalBackend, LocalBackendConfig, LocalCredentialPolicy, LocalMemoryPolicy,
+    LocalMutationBackend, LocalMutationSupport, LocalNames, LocalSecrets, LocalSourceHealth,
+    LocalSourceRuntimeConfig, LocalState, MovingBackend, MutationCommandPolicy, OperationsMetrics,
     PreparedLocalSource, RecutConfig, ReencodeConfig, SelectedColumns, StateStore, TenantSettings,
     Tenants, TenantsConfig, LOCAL_ACTIVE_ARTIFACT_CAPACITY_BYTES, LOCAL_DEVELOPMENT_SUBJECT,
     MAX_LOCAL_ARTIFACT_BYTES,
@@ -37,9 +38,12 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::cli::{DestroyCommand, DevCommand};
+use crate::generations::{
+    first_generation, serve_generations, stop_serving, FirstGeneration, Generation,
+    GenerationSource,
+};
 use crate::lifecycle::{
-    bounded_stop, run_blocking, shutdown_after, shutdown_runtime, shutdown_signal,
-    with_state_remedy, CommandError,
+    run_blocking, shutdown_after, shutdown_signal, with_state_remedy, CommandError,
 };
 use crate::listen::{spawn_metrics_server, stop_metrics_server, ListenError, ReservedListener};
 use crate::log_sink::print_line;
@@ -261,6 +265,342 @@ pub async fn run_dev(command: DevCommand) -> Result<(), DevError> {
         .map_err(|error| with_state_remedy(error, &state_dir, &database_url_env))
 }
 
+/// What dev keeps across the schema generations it serves.
+struct DevSource {
+    command: DevCommand,
+    database_url: DatabaseUrl,
+    state_store: StateStore,
+    state: LocalState,
+    /// Whether `state`'s tables differ from the state file's, which is
+    /// written once the next generation's preparation took them.
+    tables_changed: bool,
+    secrets: LocalSecrets,
+    store: std::sync::Arc<dyn blob_store::ManagedBlobStore>,
+    metrics: OperationsMetrics,
+    artifact_resolver: LocalArtifactResolver,
+    change_endpoint: String,
+    connections: ConnectionBounds,
+    /// The manifest dev reads, when it reads one, and the columns it named
+    /// when last read.
+    manifest: Option<(PathBuf, SelectedColumns)>,
+    /// Why the manifest was last not applied, so it is logged once.
+    manifest_refusal: Option<String>,
+}
+
+impl GenerationSource for DevSource {
+    type Error = DevError;
+
+    async fn start_generation(&mut self, force_move: bool) -> Result<Generation, DevError> {
+        let state_store = &self.state_store;
+        let persisted_registry = if state_store.registry_path().exists() {
+            Some(state_store.read_registry()?)
+        } else {
+            None
+        };
+        let persisted_generation = persisted_registry
+            .as_ref()
+            .map(source_control::SchemaRegistry::schema_generation);
+        let prepared_database_url = self.database_url.clone();
+        let prepared_state = self.state.clone();
+        let prepared_secrets = self.secrets.clone();
+        let selected = self.manifest.as_ref().map(|(_, columns)| columns.clone());
+        let started = Instant::now();
+        let prepared = run_blocking(move || {
+            prepare_moving_local_source(
+                &prepared_database_url,
+                &prepared_state,
+                &prepared_secrets,
+                persisted_registry,
+                selected.as_ref(),
+                force_move,
+            )
+            .map_err(DevError::from)
+        })
+        .await?;
+        startup_phase_finished("enrollment", started);
+        if self.tables_changed {
+            state_store.write_state(&self.state)?;
+            self.tables_changed = false;
+        }
+        let schema_generation = prepared.registry.schema_generation();
+        if persisted_generation != Some(schema_generation) {
+            state_store.write_registry(&prepared.registry)?;
+        }
+        let command = &self.command;
+        let prepared = match &command.tenant_column {
+            Some(column) => partitioned_by(prepared, column)?,
+            None => prepared,
+        };
+        let principal = shared_principal(&prepared, command.tenant.as_deref())?;
+        let partitioned = prepared.policy.partition().is_some();
+        let tenant_settings = TenantSettings {
+            refresh: command.recut.policy(),
+            ..TenantSettings::default()
+        };
+
+        let mut catalog = SqliteArtifactCatalog::open(state_store.root().join("catalog.sqlite3"))?;
+        let metrics = self.metrics.clone();
+        let head_signal = CanonicalHeadSignal::new();
+        let runtime_database_url = self.database_url.clone();
+        let runtime_state = self.state.clone();
+        let runtime_prepared = prepared.clone();
+        let runtime_head_signal = head_signal.clone();
+        let runtime_metrics = metrics.clone();
+        let runtime_owner = format!("local-runtime-{}", Uuid::new_v4().simple());
+        let runtime_state_dir = state_store.root().to_path_buf();
+        let runtime_database_url_env = command.database.database_url_env.clone();
+        let started = Instant::now();
+        let runtime = run_blocking(move || {
+            start_local_source_runtime(
+                runtime_prepared,
+                LocalSourceRuntimeConfig::new(
+                    &runtime_database_url,
+                    &runtime_state,
+                    &runtime_state_dir,
+                    runtime_owner,
+                )
+                .with_metrics(runtime_metrics)
+                .with_database_url_env(runtime_database_url_env),
+                runtime_head_signal,
+            )
+            .map_err(DevError::from)
+        })
+        .await?;
+        startup_phase_finished("cdc_runtime_start", started);
+        let cancellation = CancellationToken::new();
+        let builder = ArtifactBuilder {
+            database_url: self.database_url.clone(),
+            state_root: state_store.root().to_path_buf(),
+            catalog_path: state_store.root().join("catalog.sqlite3"),
+            store: std::sync::Arc::clone(&self.store),
+            barrier_provider: runtime.barrier_provider(),
+            head_signal: head_signal.clone(),
+            cancellation: cancellation.clone(),
+            metrics: metrics.clone(),
+        };
+        let started = Instant::now();
+        // A partitioned scope has no source-wide artifact: each tenant's is
+        // built on its first request.
+        let tenants = if partitioned {
+            let opened = Tenants::open(
+                TenantsConfig {
+                    settings: tenant_settings,
+                    builder: builder.clone(),
+                    log_readers: runtime.log_readers(),
+                },
+                &prepared,
+            )
+            .await;
+            match opened {
+                Ok(tenants) => Some(tenants),
+                Err(error) => return Err(shutdown_after(runtime, error.into()).await),
+            }
+        } else {
+            if let Err(error) = builder
+                .recover_interrupted_recuts(&prepared, &mut catalog)
+                .await
+            {
+                return Err(shutdown_after(runtime, error.into()).await);
+            }
+            if let Err(error) = builder
+                .ensure_initial_snapshot(&prepared, &mut catalog)
+                .await
+            {
+                return Err(shutdown_after(runtime, error.into()).await);
+            }
+            startup_phase_finished("initial_snapshot", started);
+            None
+        };
+        let started = Instant::now();
+        match await_current_cdc(
+            &runtime.health(),
+            DEV_READY_CATCH_UP_TIMEOUT,
+            DEV_READY_POLL_INTERVAL,
+        )
+        .await
+        {
+            CdcReadiness::Current => {}
+            CdcReadiness::Stopped => {
+                let error = DevError::RuntimeUnhealthy {
+                    state_dir: command.state_dir.clone(),
+                    database_url_env: command.database.database_url_env.clone(),
+                    failure: runtime
+                        .failure()
+                        .unwrap_or_else(|| "persistent CDC stopped".to_owned()),
+                    remedy: runtime.failure_remedy(),
+                };
+                return Err(shutdown_after(runtime, error).await);
+            }
+            CdcReadiness::TimedOut => {
+                let error = DevError::RuntimeCatchUpTimeout {
+                    state_dir: command.state_dir.clone(),
+                    database_url_env: command.database.database_url_env.clone(),
+                    seconds: DEV_READY_CATCH_UP_TIMEOUT.as_secs(),
+                };
+                return Err(shutdown_after(runtime, error).await);
+            }
+        }
+        startup_phase_finished("cdc_catch_up", started);
+
+        // The mutation route's receipt metadata is installed before the
+        // routes are served, so no request can reach the route ahead of the
+        // relations it needs.
+        let started = Instant::now();
+        let mutation_database_url = self.database_url.clone();
+        let mutation_prepared = prepared.clone();
+        let mutation_support = match run_blocking(move || {
+            LocalMutationSupport::open(&mutation_database_url, &mutation_prepared)
+                .map_err(DevError::from)
+        })
+        .await
+        {
+            Ok(support) => support,
+            Err(error) => return Err(shutdown_after(runtime, error).await),
+        };
+        startup_phase_finished("mutation_support", started);
+        let reencode_prepared = prepared.clone();
+        let backend = match LocalBackend::new(LocalBackendConfig {
+            source_id: self.state.names.source_id.clone(),
+            prepared,
+            // Every artifact here was built for this principal's scope, so
+            // per-request authorization reaches the scope this process
+            // precomputed, or under a partitioned scope its one tenant's.
+            credential: LocalCredentialPolicy::DevelopmentSharedBearer {
+                token: *self.secrets.bearer_token.as_bytes(),
+                principal,
+            },
+            // The shared bearer holds the whole registered surface. One shared
+            // secret cannot tell two writers apart, so `dev` is meant for
+            // loopback only: a non-loopback bind address is for a container
+            // whose port the host publishes on loopback.
+            command_policy: MutationCommandPolicy::SharedBearer(
+                mutation_support.registered_capability(),
+            ),
+            proof_secret: self.secrets.proof_secret.clone(),
+            plan_secret: self.secrets.plan_secret.clone(),
+            catalog,
+            store: std::sync::Arc::clone(&self.store),
+            log: runtime.provider(),
+            log_readers: runtime.log_readers(),
+            head_signal,
+            artifact_resolver: self.artifact_resolver.clone(),
+            change_endpoint: self.change_endpoint.clone(),
+            plan_ttl: Duration::from_secs(60 * 60),
+            max_active_plans: command.max_active_plans,
+            max_open_streams: self.connections.max_open_streams,
+            change_tail_bytes: command.change_tail_bytes,
+            max_change_batch_bytes: 8 * 1024 * 1024,
+            stored_rows: !command.no_stored_rows,
+            memory: dev_memory_policy(),
+            metrics: metrics.clone(),
+            // One shared bearer is one principal: there is nothing to narrow
+            // short of stopping the process.
+            revocation: None,
+            // Each tenant's artifact is compressed by its own background stage.
+            reencode: (!partitioned).then(|| ReencodeConfig {
+                state_root: state_store.root().to_path_buf(),
+                catalog_path: state_store.root().join("catalog.sqlite3"),
+                cancellation: cancellation.clone(),
+            }),
+            recut: Some(RecutConfig {
+                publisher: std::sync::Arc::new(GenerationArtifactPublisher::new(builder)),
+                policy: command.recut.policy(),
+                cancellation: cancellation.clone(),
+            }),
+            tenants: tenants.clone(),
+        }) {
+            Ok(backend) => backend,
+            Err(error) => return Err(shutdown_after(runtime, error.into()).await),
+        };
+        backend.spawn_reencode(&reencode_prepared);
+        backend.spawn_recut();
+        if let Some(tenants) = &tenants {
+            tenants.start();
+        }
+        let mutations = match LocalMutationBackend::new(backend.clone(), mutation_support) {
+            Ok(mutations) => mutations,
+            Err(error) => return Err(shutdown_after(runtime, error.into()).await),
+        };
+        let routes = generation_routes(
+            backend.clone(),
+            mutations,
+            backend.artifact_service(),
+            runtime.health(),
+            metrics,
+        );
+        Ok(Generation {
+            runtime,
+            backend,
+            cancellation,
+            routes,
+            schema_generation,
+        })
+    }
+
+    fn between_generations(&self, state: BetweenGenerations) -> axum::Router {
+        // The bearer is checked and nothing is resolved for it, so the
+        // principal does not need the tenant a generation's carries.
+        let principal = Principal::new(LOCAL_DEVELOPMENT_SUBJECT, BTreeMap::new())
+            .expect("the development subject is a valid principal");
+        moving_routes(MovingBackend::new(
+            LocalCredentialPolicy::DevelopmentSharedBearer {
+                token: *self.secrets.bearer_token.as_bytes(),
+                principal,
+            },
+            1,
+            state,
+        ))
+    }
+
+    /// Reads the manifest again. One that cannot be read or names other
+    /// tables than `--table` is logged, once until it changes, and dev keeps
+    /// serving what it serves.
+    fn configuration_changed(&mut self) -> bool {
+        let Some((path, columns)) = &self.manifest else {
+            return false;
+        };
+        let (tables, read_columns) = match served(&self.command, path) {
+            Ok(Served {
+                tables,
+                manifest: Some((_, read_columns)),
+            }) => (tables, read_columns),
+            Ok(Served { manifest: None, .. }) => return false,
+            Err(error) => {
+                let message = error.to_string();
+                if self.manifest_refusal.as_deref() != Some(message.as_str()) {
+                    print_line(format_args!(
+                        "Configuration not applied, still serving the last one: {message}"
+                    ));
+                    self.manifest_refusal = Some(message);
+                }
+                return false;
+            }
+        };
+        self.manifest_refusal = None;
+        if &read_columns == columns && tables == self.state.tables {
+            return false;
+        }
+        if tables != self.state.tables {
+            self.state.tables = tables;
+            self.tables_changed = true;
+        }
+        self.manifest = Some((path.clone(), read_columns));
+        true
+    }
+
+    fn state_store(&self) -> &StateStore {
+        &self.state_store
+    }
+
+    fn state_dir(&self) -> &Path {
+        &self.command.state_dir
+    }
+
+    fn database_url_env(&self) -> &str {
+        &self.command.database.database_url_env
+    }
+}
+
 async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
     command.validate()?;
     let Served {
@@ -305,16 +645,9 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
         .transpose()?;
     let state_store = StateStore::open(&command.state_dir)?;
     tracing::info!(state_dir = %state_store.root().display(), "using state directory");
+    let mut tables_changed = false;
     let state = if state_store.state_path().exists() {
-        let state = state_store.read_state()?;
-        if state.tables != requested_tables {
-            return Err(DevError::PersistedTableSetMismatch {
-                state_dir: command.state_dir.clone(),
-                database_url_env: command.database.database_url_env.clone(),
-                persisted: display_tables(&state.tables),
-                requested: display_tables(&requested_tables),
-            });
-        }
+        let mut state = state_store.read_state()?;
         let identity_database_url = database_url.clone();
         let connected = run_blocking(move || {
             inspect_local_identity(&identity_database_url).map_err(DevError::from)
@@ -327,6 +660,11 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
                 persisted: describe_source_identity(&state.source_identity),
                 connected: describe_source_identity(&connected),
             });
+        }
+        // Other tables move the source to its next schema generation.
+        if state.tables != requested_tables {
+            state.tables = requested_tables;
+            tables_changed = true;
         }
         state
     } else {
@@ -346,73 +684,11 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
         state
     };
     let secrets = state_store.load_or_create_secrets()?;
-    let had_registry = state_store.registry_path().exists();
-    let persisted_registry = if had_registry {
-        Some(state_store.read_registry()?)
-    } else {
-        None
-    };
-    let prepared_database_url = database_url.clone();
-    let prepared_state = state.clone();
-    let prepared_secrets = secrets.clone();
-    let started = Instant::now();
-    let selected = manifest.as_ref().map(|(_, columns)| columns.clone());
-    let prepared = run_blocking(move || {
-        match &selected {
-            Some(columns) => prepare_selected_local_source(
-                &prepared_database_url,
-                &prepared_state,
-                &prepared_secrets,
-                persisted_registry,
-                columns,
-            ),
-            None => prepare_local_source(
-                &prepared_database_url,
-                &prepared_state,
-                &prepared_secrets,
-                persisted_registry,
-            ),
-        }
-        .map_err(DevError::from)
-    })
-    .await
-    .map_err(|error| match (error, &manifest) {
-        (
-            DevError::Source(calque_engine::LocalSourceError::PublishedColumnsDiffer {
-                table,
-                published,
-                selected,
-                ..
-            }),
-            Some((config, _)),
-        ) => DevError::ConfigColumnsChanged(Box::new(ConfigColumnsChanged {
-            config: config.clone(),
-            table,
-            published: published.join(", "),
-            selected: selected.join(", "),
-            state_dir: command.state_dir.clone(),
-            database_url_env: command.database.database_url_env.clone(),
-        })),
-        (error, _) => error,
-    })?;
-    startup_phase_finished("enrollment", started);
-    if !had_registry {
-        state_store.write_registry(&prepared.registry)?;
-    }
-    let prepared = match &command.tenant_column {
-        Some(column) => partitioned_by(prepared, column)?,
-        None => prepared,
-    };
-    let principal = shared_principal(&prepared, command.tenant.as_deref())?;
-    let partitioned = prepared.policy.partition().is_some();
-    let tenant_settings = TenantSettings {
-        refresh: command.recut.policy(),
-        ..TenantSettings::default()
-    };
+    let partitioned = command.tenant_column.is_some();
     check_postgres_capacity(
         &database_url,
         if partitioned {
-            tenant_settings.max_builds
+            TenantSettings::default().max_builds
         } else {
             1
         },
@@ -420,217 +696,51 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
     )
     .await?;
     state_store.write_client_env(&binding, &secrets.bearer_token)?;
-
-    let mut catalog = SqliteArtifactCatalog::open(state_store.root().join("catalog.sqlite3"))?;
     let store: std::sync::Arc<dyn blob_store::ManagedBlobStore> =
         std::sync::Arc::new(LocalFilesystemBlobStore::open(
             state_store.root().join("objects"),
             MAX_LOCAL_ARTIFACT_BYTES,
         )?);
     let metrics = OperationsMetrics::new();
-    let head_signal = CanonicalHeadSignal::new();
-    let runtime_database_url = database_url.clone();
-    let runtime_state = state.clone();
-    let runtime_prepared = prepared.clone();
-    let runtime_head_signal = head_signal.clone();
-    let runtime_metrics = metrics.clone();
-    let runtime_owner = format!("local-runtime-{}", Uuid::new_v4().simple());
-    let runtime_state_dir = state_store.root().to_path_buf();
-    let runtime_database_url_env = command.database.database_url_env.clone();
-    let started = Instant::now();
-    let runtime = run_blocking(move || {
-        start_local_source_runtime(
-            runtime_prepared,
-            LocalSourceRuntimeConfig::new(
-                &runtime_database_url,
-                &runtime_state,
-                &runtime_state_dir,
-                runtime_owner,
-            )
-            .with_metrics(runtime_metrics)
-            .with_database_url_env(runtime_database_url_env),
-            runtime_head_signal,
-        )
-        .map_err(DevError::from)
-    })
-    .await?;
-    startup_phase_finished("cdc_runtime_start", started);
-    let cancellation = CancellationToken::new();
-    let builder = ArtifactBuilder {
-        database_url: database_url.clone(),
-        state_root: state_store.root().to_path_buf(),
-        catalog_path: state_store.root().join("catalog.sqlite3"),
-        store: std::sync::Arc::clone(&store),
-        barrier_provider: runtime.barrier_provider(),
-        head_signal: head_signal.clone(),
-        cancellation: cancellation.clone(),
+    let allowed_origins = command.allowed_origins.clone();
+    let mut source = DevSource {
+        command,
+        database_url,
+        state_store,
+        state,
+        tables_changed,
+        secrets,
+        store,
         metrics: metrics.clone(),
+        artifact_resolver,
+        change_endpoint,
+        connections,
+        manifest,
+        manifest_refusal: None,
     };
-    let started = Instant::now();
-    // A partitioned scope has no source-wide artifact: each tenant's is built
-    // on its first request.
-    let tenants = if partitioned {
-        let opened = Tenants::open(
-            TenantsConfig {
-                settings: tenant_settings,
-                builder: builder.clone(),
-                log_readers: runtime.log_readers(),
-            },
-            &prepared,
-        )
-        .await;
-        match opened {
-            Ok(tenants) => Some(tenants),
-            Err(error) => return Err(shutdown_after(runtime, error.into()).await),
-        }
-    } else {
-        if let Err(error) = builder
-            .recover_interrupted_recuts(&prepared, &mut catalog)
-            .await
-        {
-            return Err(shutdown_after(runtime, error.into()).await);
-        }
-        if let Err(error) = builder
-            .ensure_initial_snapshot(&prepared, &mut catalog)
-            .await
-        {
-            return Err(shutdown_after(runtime, error.into()).await);
-        }
-        startup_phase_finished("initial_snapshot", started);
-        None
-    };
-    let started = Instant::now();
-    match await_current_cdc(
-        &runtime.health(),
-        DEV_READY_CATCH_UP_TIMEOUT,
-        DEV_READY_POLL_INTERVAL,
-    )
-    .await
-    {
-        CdcReadiness::Current => {}
-        CdcReadiness::Stopped => {
-            let error = DevError::RuntimeUnhealthy {
-                state_dir: command.state_dir.clone(),
-                database_url_env: command.database.database_url_env.clone(),
-                failure: runtime
-                    .failure()
-                    .unwrap_or_else(|| "persistent CDC stopped".to_owned()),
-                remedy: runtime.failure_remedy(),
-            };
-            return Err(shutdown_after(runtime, error).await);
-        }
-        CdcReadiness::TimedOut => {
-            let error = DevError::RuntimeCatchUpTimeout {
-                state_dir: command.state_dir.clone(),
-                database_url_env: command.database.database_url_env.clone(),
-                seconds: DEV_READY_CATCH_UP_TIMEOUT.as_secs(),
-            };
-            return Err(shutdown_after(runtime, error).await);
-        }
-    }
+    // A source enrolled before waits out a schema the manifest does not bind;
+    // a first enrollment is refused, since nothing was ever served.
+    let enrolled = source.state_store.registry_path().exists();
+    let first = first_generation(&mut source, enrolled).await?;
+    let command = &source.command;
 
-    startup_phase_finished("cdc_catch_up", started);
-
-    // The mutation route's receipt metadata is installed before the listener
-    // listens, so no request can reach the route ahead of the relations it
-    // needs.
-    let started = Instant::now();
-    let mutation_database_url = database_url.clone();
-    let mutation_prepared = prepared.clone();
-    let mutation_support = match run_blocking(move || {
-        LocalMutationSupport::open(&mutation_database_url, &mutation_prepared)
-            .map_err(DevError::from)
-    })
-    .await
-    {
-        Ok(support) => support,
-        Err(error) => return Err(shutdown_after(runtime, error).await),
-    };
-    startup_phase_finished("mutation_support", started);
     let listener = match reserved_listener.listen() {
         Ok(listener) => listener,
-        Err(error) => return Err(shutdown_after(runtime, error.into()).await),
+        Err(error) => return Err(first.stop_after(error.into()).await),
     };
     let metrics_listener = match reserved_metrics_listener
         .map(ReservedListener::listen)
         .transpose()
     {
         Ok(listener) => listener,
-        Err(error) => return Err(shutdown_after(runtime, error.into()).await),
+        Err(error) => return Err(first.stop_after(error.into()).await),
     };
-    let reencode_prepared = prepared.clone();
-    let backend = match LocalBackend::new(LocalBackendConfig {
-        source_id: state.names.source_id.clone(),
-        prepared,
-        // Every artifact here was built for this principal's scope, so
-        // per-request authorization reaches the scope this process
-        // precomputed, or under a partitioned scope its one tenant's.
-        credential: LocalCredentialPolicy::DevelopmentSharedBearer {
-            token: *secrets.bearer_token.as_bytes(),
-            principal,
-        },
-        // The shared bearer holds the whole registered surface. One shared
-        // secret cannot tell two writers apart, so `dev` is meant for loopback
-        // only: a non-loopback bind address is for a container whose port the
-        // host publishes on loopback.
-        command_policy: MutationCommandPolicy::SharedBearer(
-            mutation_support.registered_capability(),
-        ),
-        proof_secret: secrets.proof_secret.clone(),
-        plan_secret: secrets.plan_secret.clone(),
-        catalog,
-        store: std::sync::Arc::clone(&store),
-        log: runtime.provider(),
-        log_readers: runtime.log_readers(),
-        head_signal: head_signal.clone(),
-        artifact_resolver,
-        change_endpoint,
-        plan_ttl: Duration::from_secs(60 * 60),
-        max_active_plans: command.max_active_plans,
-        max_open_streams: connections.max_open_streams,
-        change_tail_bytes: command.change_tail_bytes,
-        max_change_batch_bytes: 8 * 1024 * 1024,
-        stored_rows: !command.no_stored_rows,
-        memory: dev_memory_policy(),
-        metrics: metrics.clone(),
-        // One shared bearer is one principal: there is nothing to narrow
-        // short of stopping the process.
-        revocation: None,
-        // Each tenant's artifact is compressed by its own background stage.
-        reencode: (!partitioned).then(|| ReencodeConfig {
-            state_root: state_store.root().to_path_buf(),
-            catalog_path: state_store.root().join("catalog.sqlite3"),
-            cancellation: cancellation.clone(),
-        }),
-        recut: Some(RecutConfig {
-            publisher: std::sync::Arc::new(GenerationArtifactPublisher::new(builder)),
-            policy: command.recut.policy(),
-            cancellation: cancellation.clone(),
-        }),
-        tenants: tenants.clone(),
-    }) {
-        Ok(backend) => backend,
-        Err(error) => return Err(shutdown_after(runtime, error.into()).await),
-    };
-    backend.spawn_reencode(&reencode_prepared);
-    backend.spawn_recut();
-    if let Some(tenants) = &tenants {
-        tenants.start();
-    }
-    let mutations = match LocalMutationBackend::new(backend.clone(), mutation_support) {
-        Ok(mutations) => mutations,
-        Err(error) => return Err(shutdown_after(runtime, error.into()).await),
-    };
-    let artifacts = backend.artifact_service();
-    let router = local_router(
-        backend,
-        mutations,
-        artifacts,
-        runtime.health(),
-        metrics.clone(),
+    let routes = GenerationRoutes::new(first.routes(&source));
+    let router = switched_local_router(
+        routes.clone(),
         binding,
-        command.allowed_origins,
-        connections.max_inflight_requests,
+        allowed_origins,
+        source.connections.max_inflight_requests,
     );
     match &metrics_binding {
         None => print_line("Metrics: off; pass --metrics-port to serve them"),
@@ -644,27 +754,34 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
             "Scope: partitioned by {column}; the bearer reads tenant {tenant}"
         ));
     }
-    match &manifest {
-        Some((config, _)) => {
-            print_line(format_args!("Columns: the ones {} names", config.display()))
-        }
+    match &source.manifest {
+        Some((config, _)) => print_line(format_args!(
+            "Columns: the ones {} names; dev serves its edits as they are saved",
+            config.display()
+        )),
         None => print_line("Columns: every column of each --table"),
     }
     let stop = dev_stop_signal();
     print_line(format_args!("Calque dev is ready at {base_url}"));
     print_line(format_args!(
         "State directory: {}",
-        state_store.root().display()
+        source.state_store.root().display()
     ));
     print_line(format_args!(
         "Client settings: {}",
-        state_store.client_env_path().display()
+        source.state_store.client_env_path().display()
     ));
     if bind_ip.is_loopback() {
         print_line("This is a development-only loopback server, not a production one.");
     } else {
         print_line(format_args!(
             "This is a development-only server bound to {bind_ip}, not a production one: only a container whose port the host publishes on loopback should run it."
+        ));
+    }
+    if let FirstGeneration::Serving(generation) = &first {
+        print_line(format_args!(
+            "Schema generation {}: serving",
+            generation.schema_generation
         ));
     }
     let metrics_stop = CancellationToken::new();
@@ -677,12 +794,13 @@ async fn prepare_and_serve(command: DevCommand) -> Result<(), DevError> {
                 metrics_stop.clone(),
             )
         });
-    let serve_result = axum::serve(listener, router)
-        .with_graceful_shutdown(bounded_stop(stop))
-        .await;
+    let (serve_result, serving) =
+        serve_generations(&mut source, first, &routes, listener, router, stop).await;
     let metrics_result = stop_metrics_server(metrics_server, &metrics_stop).await;
-    cancellation.cancel();
-    let shutdown_result = shutdown_runtime::<DevError>(runtime).await;
+    let shutdown_result = match serving {
+        Some(generation) => stop_serving(&source, generation).await,
+        None => Ok(()),
+    };
     tracing::info!("stopped");
     serve_result?;
     metrics_result?;
@@ -913,19 +1031,6 @@ async fn await_current_cdc_with(
     }
 }
 
-/// A manifest that names other columns of a table than the ones the state
-/// directory was prepared with.
-#[derive(Debug, Error)]
-#[error("{} names columns {selected} of {table}, but {} serves {published}, the columns it was prepared with. Calque will not change an existing enrollment in place. Run {destroy} and then rerun dev.", config.display(), state_dir.display(), destroy = Destroy::reading(state_dir, database_url_env))]
-pub struct ConfigColumnsChanged {
-    config: PathBuf,
-    table: String,
-    published: String,
-    selected: String,
-    state_dir: PathBuf,
-    database_url_env: String,
-}
-
 #[derive(Debug, Error)]
 pub enum DevError {
     #[error("calque dev creates a publication, a replication slot and the calque_control schema in the database it connects to; pass --acknowledge-disposable-source to confirm that database is disposable")]
@@ -960,8 +1065,6 @@ pub enum DevError {
         configured: String,
         requested: String,
     },
-    #[error(transparent)]
-    ConfigColumnsChanged(Box<ConfigColumnsChanged>),
     #[error("at most 16 --allow-origin values are allowed")]
     TooManyOrigins,
     #[error("table {table} has a {column} column, but its primary key does not lead with it; a tenant's table leads its primary key with the tenant column, so make {column} the key's first column, or rename the column if every tenant shares the table")]
@@ -1002,13 +1105,6 @@ pub enum DevError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Listen(#[from] ListenError),
-    #[error("{state_dir} is enrolled for [{persisted}], but dev requested [{requested}]. Calque will not change an existing enrollment in place. Rerun dev with the persisted table set, or run {destroy} and then rerun dev.", destroy = Destroy::reading(state_dir, database_url_env))]
-    PersistedTableSetMismatch {
-        state_dir: PathBuf,
-        database_url_env: String,
-        persisted: String,
-        requested: String,
-    },
     #[error("connected {connected}, but {state_dir} belongs to {persisted}. Calque cannot reuse state from another PostgreSQL source. {remedy}", remedy = reconnect_or_forget(state_dir, database_url_env, "dev"))]
     DevSourceIdentityMismatch {
         state_dir: PathBuf,
@@ -1080,12 +1176,8 @@ pub enum DevError {
     /// The engine's refusal of a publication that no longer has its enrolled
     /// definition, which enrollment and a CDC reconnect raise alike. See
     /// `remedy::restore_publication`.
-    #[error("{refusal} {remedy}", remedy = restore_publication(Destroy::reading(state_dir, database_url_env), "dev"))]
-    PublicationDrifted {
-        refusal: Box<DevError>,
-        state_dir: PathBuf,
-        database_url_env: String,
-    },
+    #[error("{refusal} {remedy}", remedy = restore_publication("dev"))]
+    PublicationDrifted { refusal: Box<DevError> },
     #[error("a blocking operation did not complete: {0}")]
     BlockingTask(String),
 }
@@ -1129,6 +1221,30 @@ impl CommandError for DevError {
         }
     }
 
+    fn suspends_schema(&self) -> bool {
+        match self {
+            Self::Source(error) => error.suspends_schema(),
+            Self::RuntimeCleanup { startup, .. } => startup.suspends_schema(),
+            _ => false,
+        }
+    }
+
+    fn moves_schema(&self) -> bool {
+        match self {
+            Self::Source(error) => error.moves_schema(),
+            Self::RuntimeUnhealthy { remedy, .. } => *remedy == CdcStopRemedy::MoveSchema,
+            Self::RuntimeCleanup { startup, .. } => startup.moves_schema(),
+            _ => false,
+        }
+    }
+
+    fn stopped_on(&self) -> Option<&str> {
+        match self {
+            Self::RuntimeUnhealthy { failure, .. } => Some(failure),
+            _ => None,
+        }
+    }
+
     fn runtime_cleanup(startup: Self, cleanup: Self) -> Self {
         Self::RuntimeCleanup {
             startup: Box::new(startup),
@@ -1159,11 +1275,9 @@ impl CommandError for DevError {
         }
     }
 
-    fn publication_drifted(refusal: Self, state_dir: &Path, database_url_env: &str) -> Self {
+    fn publication_drifted(refusal: Self) -> Self {
         Self::PublicationDrifted {
             refusal: Box::new(refusal),
-            state_dir: state_dir.to_path_buf(),
-            database_url_env: database_url_env.to_owned(),
         }
     }
 }
@@ -1527,20 +1641,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn table_set_mismatch_names_the_state_and_destroy_recovery() {
-        let error = DevError::PersistedTableSetMismatch {
-            state_dir: ".calque-dev".into(),
-            database_url_env: "CALQUE_DEV_SOURCE_URL".to_owned(),
-            persisted: "public.projects, public.tasks".to_owned(),
-            requested: "public.issues".to_owned(),
-        };
-        assert_eq!(
-            error.to_string(),
-            ".calque-dev is enrolled for [public.projects, public.tasks], but dev requested [public.issues]. Calque will not change an existing enrollment in place. Rerun dev with the persisted table set, or run calque destroy --state-dir .calque-dev --database-url-env CALQUE_DEV_SOURCE_URL --yes and then rerun dev."
-        );
-    }
-
     /// A runtime that stopped before readiness names the destroy command with
     /// the variable dev read, since destroy's default may name another source.
     #[test]
@@ -1721,7 +1821,7 @@ mod tests {
     const EARLIER_LOG: &str = ".calque-dev serves a canonical log an earlier release of calque wrote, and calque does not migrate it.";
     const FOREIGN_BUILD: &str = ".calque-dev holds an interrupted build of local-artifact-earlier-release, an artifact this build of calque does not make, and calque does not migrate it.";
     const DESTROY_THEN_DEV: &str = "Run calque destroy --state-dir .calque-dev --database-url-env CALQUE_DEV_SOURCE_URL --yes, then rerun dev to prepare the working set anew.";
-    const RESTORE_THEN_DEV: &str = "Restore the publication's definition if it was altered, then run calque destroy --state-dir .calque-dev --database-url-env CALQUE_DEV_SOURCE_URL --yes and rerun dev to prepare the working set anew, since the one it holds may no longer match PostgreSQL.";
+    const RESTORE_THEN_DEV: &str = "Restore the publication's definition as its owner, or make Calque's role its owner, then rerun dev: it moves the source to its next schema generation and prepares the working set anew, since the one it holds may no longer match PostgreSQL.";
 
     /// The refusal of a canonical log an earlier release wrote, as the CDC
     /// loop stops on it and the stop that joins the loop returns it.
@@ -1874,25 +1974,6 @@ mod tests {
         );
     }
 
-    /// A manifest whose columns differ from the ones the state directory was
-    /// prepared with names the manifest, both sets and the destroy.
-    #[test]
-    fn a_manifest_with_other_columns_names_the_destroy() {
-        assert_eq!(
-            printed(DevError::ConfigColumnsChanged(Box::new(
-                ConfigColumnsChanged {
-                    config: PathBuf::from("calque.config.json"),
-                    table: "public.tasks".to_owned(),
-                    published: "id, title, secret".to_owned(),
-                    selected: "id, title".to_owned(),
-                    state_dir: PathBuf::from(".calque-dev"),
-                    database_url_env: "CALQUE_DEV_SOURCE_URL".to_owned(),
-                }
-            ))),
-            "calque.config.json names columns id, title of public.tasks, but .calque-dev serves id, title, secret, the columns it was prepared with. Calque will not change an existing enrollment in place. Run calque destroy --state-dir .calque-dev --database-url-env CALQUE_DEV_SOURCE_URL --yes and then rerun dev."
-        );
-    }
-
     /// A refusal only `calque destroy` gets past ends with that command and
     /// the variable dev read, whichever library raised it.
     #[test]
@@ -1950,7 +2031,7 @@ mod tests {
                     publication: "calque_0123456789abcdef01234567".to_owned(),
                 }
             )),
-            "the PostgreSQL publication calque_0123456789abcdef01234567 was altered: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists it had at enrollment. Restore the publication's definition if it was altered, then run calque destroy --state-dir .calque-dev --database-url-env CALQUE_DEV_SOURCE_URL --yes and rerun dev to prepare the working set anew, since the one it holds may no longer match PostgreSQL."
+            "the PostgreSQL publication calque_0123456789abcdef01234567 was altered: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists it had at enrollment. Restore the publication's definition as its owner, or make Calque's role its owner, then rerun dev: it moves the source to its next schema generation and prepares the working set anew, since the one it holds may no longer match PostgreSQL."
         );
         assert_eq!(
             printed(DevError::Source(
@@ -2082,31 +2163,26 @@ mod tests {
         );
     }
 
-    /// The remedy is restoring the publication, which destroy refuses to drop
-    /// otherwise, then destroy, since the working set may miss changes.
+    /// A publication altered while the runtime streams is a schema change:
+    /// the remedy is the rerun that moves the source on, named once.
     #[tokio::test]
-    async fn a_runtime_stopped_on_a_drifted_publication_names_restoring_it_once() {
+    async fn a_runtime_stopped_on_a_drifted_publication_names_the_move_once() {
         let error = stop_after(
             || Err(drift()),
             DevError::RuntimeUnhealthy {
                 state_dir: ".calque-dev".into(),
                 database_url_env: "CALQUE_DEV_SOURCE_URL".to_owned(),
                 failure: format!("persistent CDC failed: {DRIFT}"),
-                remedy: calque_engine::CdcStopRemedy::RestorePublication,
+                remedy: calque_engine::CdcStopRemedy::MoveSchema,
             },
         )
         .await;
         let printed = printed(error);
         assert_eq!(
             printed,
-            format!("persistent CDC stopped before the HTTP service became ready: persistent CDC failed: {DRIFT} No incomplete browser state was served. {RESTORE_THEN_DEV}")
+            format!("persistent CDC stopped before the HTTP service became ready: persistent CDC failed: {DRIFT} No incomplete browser state was served. Rerun dev: it prepares the source again at its next schema generation.")
         );
-        assert_eq!(
-            printed
-                .matches("Restore the publication's definition")
-                .count(),
-            1
-        );
+        assert_eq!(printed.matches("Rerun dev:").count(), 1);
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ import { describe, expect, it, vi } from "vitest";
 import { MAX_ARTIFACT_CHUNK_BYTES } from "./limits.js";
 import { parseBootstrapPlan } from "./plan.js";
 import {
+  ArtifactPreparingError,
   artifactTransportProfile,
   exactResponseBuffers,
   exactResponsePieces,
@@ -159,6 +160,42 @@ describe("requestBootstrapPlan", () => {
         ),
       ),
     ).rejects.toMatchObject({ code: "SERVER_ERROR", recovery: "retry" });
+  });
+
+  it("waits out SCHEMA_SUSPENDED on the same clamped schedule", async () => {
+    const suspended = (retryAfter: string) =>
+      vi.fn<typeof fetch>(
+        async () =>
+          new Response(
+            JSON.stringify({
+              code: "SCHEMA_SUSPENDED",
+              message: "the source's live schema does not bind the manifest",
+              resnapshotRequired: false,
+            }),
+            {
+              status: 503,
+              headers: {
+                "content-type": "application/json",
+                "retry-after": retryAfter,
+              },
+            },
+          ),
+      );
+    for (const [header, expected] of [
+      ["5", 5_000],
+      ["0", 1_000],
+      ["100000", 300_000],
+    ] as const) {
+      const error: unknown = await requestBootstrapPlan(
+        request(suspended(header)),
+      ).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(ArtifactPreparingError);
+      expect(error).toMatchObject({
+        code: "SCHEMA_SUSPENDED",
+        recovery: "retry",
+        retryAfterMs: expected,
+      });
+    }
   });
 
   it("maps a refusal by its status and the code its body names", async () => {

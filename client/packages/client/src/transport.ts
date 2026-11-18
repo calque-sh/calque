@@ -310,16 +310,22 @@ export class ArtifactCapabilityError extends SyncError {
 }
 
 /**
- * A `503 ARTIFACT_PREPARING` refusal: the server is publishing the artifact
- * of a new authorization generation, as after a revocation, or a tenant's
- * first working set, and names when to ask again in `Retry-After`. The client
- * follows that schedule rather than a backoff of its own.
+ * A `503 ARTIFACT_PREPARING` or `503 SCHEMA_SUSPENDED` refusal: the server is
+ * publishing the artifact of a new authorization or schema generation, as
+ * after a revocation, or a tenant's first working set, or its source's live
+ * schema does not bind its configuration yet. It names when to ask again in
+ * `Retry-After`. The client follows that schedule rather than a backoff of
+ * its own.
  */
 export class ArtifactPreparingError extends SyncError {
   readonly retryAfterMs: number;
 
-  constructor(message: string, retryAfterMs: number) {
-    super("ARTIFACT_PREPARING", "sync", "retry", message);
+  constructor(
+    message: string,
+    retryAfterMs: number,
+    code: "ARTIFACT_PREPARING" | "SCHEMA_SUSPENDED" = "ARTIFACT_PREPARING",
+  ) {
+    super(code, "sync", "retry", message);
     this.name = "ArtifactPreparingError";
     this.retryAfterMs = retryAfterMs;
   }
@@ -327,8 +333,8 @@ export class ArtifactPreparingError extends SyncError {
 
 /**
  * How long the bootstrap follows the server's preparing schedule before
- * reporting `ARTIFACT_PREPARING`, so a server that never finishes publishing
- * still fails closed.
+ * reporting `ARTIFACT_PREPARING` or `SCHEMA_SUSPENDED`, so a server that never
+ * finishes publishing still fails closed.
  */
 export const MAX_PREPARING_WAIT_MS = 120_000;
 
@@ -348,6 +354,12 @@ async function bootstrapRefusal(response: Response): Promise<SyncError> {
     return new ArtifactPreparingError(
       "the server has not published this grant's artifact yet",
       retryAfterMs(response.headers.get("retry-after")),
+    );
+  if (status === 503 && code === "SCHEMA_SUSPENDED")
+    return new ArtifactPreparingError(
+      "the source's live schema does not bind the server's configuration yet",
+      retryAfterMs(response.headers.get("retry-after")),
+      "SCHEMA_SUSPENDED",
     );
   if (status === 422 && code === "CAPACITY_EXCEEDED")
     return new SyncError(

@@ -28,8 +28,9 @@ use crate::{
     inspect_owned_publication,
     publication::changed_column,
     ActivationEvidence, ActiveLease, EnumLabelDrift, FenceAuthority, FenceError, OwnedPublication,
-    PostgresFenceStore, PostgresRefusal, ProvisionalLease, RenewalClock, SeenEnumVersion,
-    ServedEnumLabel, PUBLICATION_CHECK_INTERVAL,
+    PostgresFenceStore, PostgresRefusal, ProvisionalLease, RecordedSchemaGeneration, RenewalClock,
+    SchemaBoundary, SchemaMoveBaseline, SeenEnumVersion, ServedEnumLabel,
+    PUBLICATION_CHECK_INTERVAL,
 };
 
 const SLOT_INACTIVE_POLL_ATTEMPTS: usize = 100;
@@ -381,6 +382,72 @@ pub fn provision_persistent_slot(
     };
     authority.record_slot_enrollment(provisional, &enrollment)?;
     Ok(enrollment)
+}
+
+/// Where the source stands against its schema moves as a runtime serving
+/// `activated_source`'s registry starts, under the lease it will stream with.
+/// A registry of a later generation than the one recorded is a
+/// move: it is recorded, with the shape sessions are checked against read
+/// from the source now, before the stream acknowledges anything, and the
+/// boundary it opens stays open until that generation's first cut.
+pub fn start_schema_generation(
+    authority: &FenceAuthority<PostgresFenceStore>,
+    provisional: &ProvisionalLease,
+    source_connection: &str,
+    activated_source: &ActivatedSource,
+) -> Result<SchemaBoundary, SourceRuntimeError> {
+    validate_activated_lease(provisional, activated_source)?;
+    let binding = activated_source.registry_binding();
+    let generation = binding.schema_generation();
+    let recorded = authority.load_schema_generation(provisional)?;
+    let recorded_generation = recorded.map_or(1, |recorded| recorded.generation);
+    if generation < recorded_generation {
+        return Err(SourceRuntimeError::SchemaGenerationBehind {
+            registry: generation,
+            recorded: recorded_generation,
+        });
+    }
+    if generation == recorded_generation {
+        return Ok(match recorded {
+            Some(RecordedSchemaGeneration {
+                serving_from_lsn: None,
+                ..
+            }) => SchemaBoundary::open(generation),
+            Some(recorded) => SchemaBoundary::serving(generation, recorded.serving_from_lsn),
+            None => SchemaBoundary::serving(generation, None),
+        });
+    }
+    let mut controller =
+        connect_source_controller(source_connection, CONTROLLER_STATEMENT_TIMEOUT)?;
+    verify_regular_source(&mut controller, binding.source_identity())?;
+    let publication = verify_publication(&mut controller, binding)?;
+    if let Some(column) =
+        changed_column(&mut controller, binding.columns()).map_err(source_error)?
+    {
+        return Err(column_changed(column));
+    }
+    let mut enum_types: Vec<u32> =
+        published_enum_types(&mut controller, &binding.publication().name)
+            .map_err(source_error)?
+            .into_values()
+            .collect();
+    enum_types.sort_unstable();
+    enum_types.dedup();
+    let column_versions =
+        read_column_versions(&mut controller, binding.columns()).map_err(source_error)?;
+    let reading = read_enum_values(&mut controller, &enum_types).map_err(enum_reading_error)?;
+    let baseline = SchemaMoveBaseline {
+        publication_fingerprint: publication.fingerprint,
+        enum_labels_from_lsn: reading.bound,
+        enum_labels: enrolled_labels(&reading, &reading),
+        column_versions,
+    };
+    authority.record_schema_move(provisional, generation, &baseline)?;
+    tracing::info!(
+        schema_generation = generation,
+        "the stream skips every transaction until the first cut of schema generation {generation}"
+    );
+    Ok(SchemaBoundary::open(generation))
 }
 
 /// Takes ownership of the persistent source's slot for this process.
@@ -1650,6 +1717,8 @@ pub enum SourceRuntimeError {
     SlotEnrollmentBindingMismatch,
     #[error("persistent slot lifecycle is not initialized for this source epoch")]
     SlotLifecycleNotInitialized,
+    #[error("the schema registry is of generation {registry}, but this source already moved to generation {recorded}: the registry file is older than the source's state")]
+    SchemaGenerationBehind { registry: u64, recorded: u64 },
     #[error(
         "replication slot {slot_name} already exists on the source, but this state has no record of creating it, typically because an earlier start stopped before recording it or its state directory was deleted without `calque destroy`; \
          if nothing reads it any more, drop it with SELECT pg_drop_replication_slot('{slot_name}') and rerun"

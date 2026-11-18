@@ -269,6 +269,9 @@ impl LocalBackend {
             .map_err(|_| RevocationError::Unauthorized)?;
         let _fence = self.inner.fence_lock.write().await;
         let _builds = self.inner.build_fence.fence().await;
+        if self.retired() {
+            return Err(RevocationError::Unavailable);
+        }
         let current = self.serving().generation();
         let now = now_unix_micros().map_err(|_| RevocationError::Unavailable)?;
         if order.effective_generation == current {
