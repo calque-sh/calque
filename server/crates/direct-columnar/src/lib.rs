@@ -34,6 +34,9 @@
 //! such a table is damaged or forged.
 
 pub mod pack;
+mod subset;
+
+pub use subset::write_subset;
 
 // The packer's unit tests share `tests/support` with the integration tests,
 // which name this crate from outside.
@@ -90,7 +93,7 @@ pub fn browser_key_index_bytes(table_rows: impl IntoIterator<Item = u64>) -> u64
 const NUMERIC_BLOCK_ROWS: usize = 1_024;
 const NUMERIC_BLOCK_HEADER_BYTES: usize = 16;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ColumnKind {
     Int64,

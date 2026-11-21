@@ -97,7 +97,7 @@ pub fn direct_columnar_artifact_identity(
 /// The manifest's copy of the physical schema: the document `schema_hash`
 /// digests, in its key order, read back through the contract type so the
 /// manifest can only say what the encoder was given.
-pub(crate) fn direct_columnar_manifest_schema(
+pub fn direct_columnar_manifest_schema(
     schema: &WorkspaceSchema,
 ) -> Result<DirectColumnarSchema, serde_json::Error> {
     serde_json::from_value(serde_json::to_value(SchemaContract::new(schema))?)

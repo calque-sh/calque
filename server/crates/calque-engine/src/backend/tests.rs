@@ -1,5 +1,9 @@
 use super::*;
-use crate::{reencode::ReencodeOutcome, revocation::draft_barrier, LOCAL_DEVELOPMENT_SUBJECT};
+use crate::{
+    reencode::{ReencodeOutcome, ReencodeStage},
+    revocation::draft_barrier,
+    LOCAL_DEVELOPMENT_SUBJECT,
+};
 use artifact_contract::RepresentationEncoding;
 use dataset_grant_issuer::GrantIssuer;
 use std::{

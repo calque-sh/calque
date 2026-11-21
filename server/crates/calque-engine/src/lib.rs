@@ -25,6 +25,7 @@ mod slot_lag;
 mod snapshot;
 mod source;
 mod state;
+mod subset;
 mod tail;
 mod tenants;
 #[cfg(test)]

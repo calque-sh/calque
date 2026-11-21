@@ -191,6 +191,32 @@ impl SnapshotBuildPlan {
         })
     }
 
+    /// This plan cut down to `tables`, in its own order, under the table-set
+    /// hash of those tables alone: the plan of an artifact that holds only
+    /// them, at the same schema generation and scope.
+    pub fn narrowed_to(&self, tables: &BTreeSet<TableId>) -> Result<Self, SnapshotPlanError> {
+        if tables.is_empty() {
+            return Err(SnapshotPlanError::EmptyTableSet);
+        }
+        let kept: Vec<_> = self
+            .tables
+            .iter()
+            .filter(|table| tables.contains(&table.table_id))
+            .cloned()
+            .collect();
+        if kept.len() != tables.len() {
+            return Err(SnapshotPlanError::TableOutsidePlan);
+        }
+        Ok(Self {
+            schema_generation: self.schema_generation,
+            table_set_hash: table_set_digest(self.schema_generation, &kept),
+            tables: kept,
+            authorized_scope: self.authorized_scope.clone(),
+            authorization_identity: self.authorization_identity,
+            registry_binding: self.registry_binding.clone(),
+        })
+    }
+
     pub fn registry_binding(&self) -> &SchemaRegistryBinding {
         &self.registry_binding
     }
@@ -464,6 +490,8 @@ pub enum SnapshotPlanError {
     EmptyTableSet,
     #[error("authorization scope does not permit any snapshot table")]
     EmptyAuthorizedTableSet,
+    #[error("a narrowed snapshot plan names a table the plan does not hold")]
+    TableOutsidePlan,
     #[error("authorization scope and schema registry do not describe the same tables and columns")]
     AuthorizationRegistryMismatch,
     #[error("schema registry cannot compile a snapshot: {0}")]
@@ -673,6 +701,60 @@ mod tests {
             "tenant_one.tasks and tenant_two.tasks would both be served as collection tasks, \
              which is named by the table alone"
         );
+    }
+
+    /// A narrowed plan keeps the named tables in the plan's order, under the
+    /// table-set hash a plan of only those tables would carry, and refuses a
+    /// table the plan does not hold.
+    #[test]
+    fn a_narrowed_plan_holds_only_the_named_tables() {
+        let registry = registry(vec![
+            table("public", "projects", 10),
+            table("public", "tags", 20),
+            table("public", "tasks", 30),
+        ]);
+        let scope = source_wide_scope(&registry);
+        let plan = SnapshotBuildPlan::from_registry(&registry, &scope).unwrap();
+        let id = |index: usize| plan.tables[index].table_id.clone();
+
+        let narrowed = plan.narrowed_to(&BTreeSet::from([id(2), id(0)])).unwrap();
+        assert_eq!(
+            narrowed
+                .tables()
+                .iter()
+                .map(SnapshotTablePlan::source_table)
+                .collect::<Vec<_>>(),
+            ["projects", "tasks"]
+        );
+        assert_eq!(
+            narrowed.table_set_hash(),
+            table_set_digest(plan.schema_generation(), &narrowed.tables)
+        );
+        assert_ne!(narrowed.table_set_hash(), plan.table_set_hash());
+        assert_eq!(
+            narrowed.authorization_identity(),
+            plan.authorization_identity()
+        );
+
+        let whole = plan.narrowed_to(&(0..3).map(id).collect()).unwrap();
+        assert_eq!(whole.table_set_hash(), plan.table_set_hash());
+
+        let other = registry_table_id("public", "comments", 40);
+        assert!(matches!(
+            plan.narrowed_to(&BTreeSet::from([id(0), other])),
+            Err(SnapshotPlanError::TableOutsidePlan)
+        ));
+        assert!(matches!(
+            plan.narrowed_to(&BTreeSet::new()),
+            Err(SnapshotPlanError::EmptyTableSet)
+        ));
+    }
+
+    /// The id a registry gives a table it is not asked to enroll here.
+    fn registry_table_id(schema: &str, name: &str, relation_oid: u32) -> TableId {
+        registry(vec![table(schema, name, relation_oid)]).tables()[0]
+            .table_id
+            .clone()
     }
 
     #[test]

@@ -670,6 +670,7 @@ impl LocalBackend {
                 )
                 .map_err(|_| BootstrapHttpError::Unavailable)?;
         }
+        self.note_planned_tables(&plan);
         Ok(plan)
     }
 }

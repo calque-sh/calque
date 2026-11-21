@@ -22,8 +22,9 @@ pub use build_state::{
 };
 pub use copy_loader::{CopyLoadError, CopyLoadLimits, CopyLoadStats};
 pub use direct_build::{
-    direct_columnar_artifact_identity, direct_columnar_workspace_schema, ArtifactTee,
-    DirectArtifactAtCut, DirectArtifactRequest, DirectBuildSession, DirectFinalizationError,
+    direct_columnar_artifact_identity, direct_columnar_manifest_schema,
+    direct_columnar_workspace_schema, ArtifactTee, DirectArtifactAtCut, DirectArtifactRequest,
+    DirectBuildSession, DirectFinalizationError,
 };
 pub use direct_columnar::EncoderLimits;
 pub use direct_copy_loader::{

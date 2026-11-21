@@ -1185,18 +1185,25 @@ fn compile_candidates(
             cache_hint,
         });
     }
-    // The newest cut of each table set has the shortest tail, so an older
-    // one is planned only when the client holds it and so downloads nothing.
-    let mut newest: BTreeMap<BTreeSet<TableId>, u64> = BTreeMap::new();
-    for candidate in &candidates {
-        let sequence = newest.entry(candidate.tables.clone()).or_default();
-        *sequence = (*sequence).max(candidate.snapshot_position.sequence);
-    }
-    candidates.retain(|candidate| {
-        candidate.cache_hint
-            || newest.get(&candidate.tables) == Some(&candidate.snapshot_position.sequence)
-    });
+    retain_plannable(&mut candidates, context.missing);
     Ok(candidates)
+}
+
+/// Keeps the candidates a client can be planned. It installs one artifact, so
+/// each kept candidate holds every missing table. The newest cut has the
+/// shortest tail, so an artifact of an older cut is kept only when the client
+/// holds it and so downloads nothing: an artifact of fewer tables is published
+/// at a cut after the whole set is, and until then the newest cut's whole set
+/// is planned rather than an older cut of fewer tables.
+fn retain_plannable(candidates: &mut Vec<Candidate>, missing: &BTreeSet<TableId>) {
+    candidates.retain(|candidate| candidate.required_coverage == *missing);
+    let newest = candidates
+        .iter()
+        .map(|candidate| candidate.snapshot_position.sequence)
+        .max();
+    candidates.retain(|candidate| {
+        candidate.cache_hint || Some(candidate.snapshot_position.sequence) == newest
+    });
 }
 
 fn choose_representation(
@@ -4034,6 +4041,116 @@ mod tests {
             .flat_map(|candidate| candidate.tables.iter().cloned())
             .collect();
         assert_eq!(covered, BTreeSet::from([a, b, c, extra]));
+    }
+
+    /// A page of fewer tables than the server serves is planned the newest
+    /// cut's artifact of exactly its tables, else the newest cut's whole set,
+    /// and never two artifacts or an older cut it does not hold.
+    #[test]
+    fn a_page_is_planned_one_artifact_of_the_newest_cut_or_one_it_holds() {
+        let (source, manifest_table) = activated_source();
+        let at = |sequence| CursorPosition {
+            source_epoch: source.source_epoch().clone(),
+            sequence,
+        };
+        let a = TableId::new("table-a").unwrap();
+        let b = TableId::new("table-b").unwrap();
+        let candidate = |tables: &[&TableId], sequence, bytes, id: &str| {
+            let tables: BTreeSet<_> = tables.iter().map(|&table| table.clone()).collect();
+            Candidate {
+                manifest: with_artifact_id(
+                    &manifest(
+                        &source,
+                        &manifest_table,
+                        source.cursor_codec().encode(&at(sequence)),
+                        b"artifact",
+                    ),
+                    id,
+                ),
+                representation: ArtifactRepresentation {
+                    representation_id: hash_id('8'),
+                    object_id: ObjectId::new("object-8").unwrap(),
+                    encoding: RepresentationEncoding::Identity,
+                    encoded_sha256: "8".repeat(64),
+                    encoded_bytes: bytes,
+                    zstd: None,
+                    brotli: None,
+                    packed: None,
+                },
+                snapshot_position: at(sequence),
+                required_coverage: tables.clone(),
+                tables,
+                cache_hint: false,
+            }
+        };
+        let whole_old = candidate(&[&a, &b], 1, 100, "whole-old");
+        let only_a_old = candidate(&[&a], 1, 10, "a-old");
+        let whole = candidate(&[&a, &b], 2, 100, "whole");
+        let only_a = candidate(&[&a], 2, 10, "a");
+        let only_b = candidate(&[&b], 2, 10, "b");
+        let planned = |mut candidates: Vec<Candidate>, missing: &BTreeSet<TableId>| {
+            for candidate in &mut candidates {
+                candidate.required_coverage =
+                    candidate.tables.intersection(missing).cloned().collect();
+            }
+            retain_plannable(&mut candidates, missing);
+            let mut kept: Vec<_> = candidates
+                .iter()
+                .map(|candidate| candidate.manifest.manifest().artifact_id.to_string())
+                .collect();
+            kept.sort();
+            let selected = select_feasible_cover(
+                candidates,
+                missing,
+                unbounded_memory(),
+                Instant::now() + StdDuration::from_secs(5),
+            )
+            .unwrap();
+            let selected: Vec<_> = selected
+                .candidates
+                .iter()
+                .map(|candidate| candidate.manifest.manifest().artifact_id.to_string())
+                .collect();
+            (kept, selected)
+        };
+        let every = vec![
+            whole_old.clone(),
+            only_a_old.clone(),
+            whole.clone(),
+            only_a.clone(),
+            only_b.clone(),
+        ];
+
+        let just_a = BTreeSet::from([a.clone()]);
+        assert_eq!(
+            planned(every.clone(), &just_a),
+            (
+                vec!["a".to_owned(), "whole".to_owned()],
+                vec!["a".to_owned()]
+            )
+        );
+        // The two smaller artifacts together cost less, and are not planned.
+        let both = BTreeSet::from([a.clone(), b.clone()]);
+        assert_eq!(
+            planned(every.clone(), &both),
+            (vec!["whole".to_owned()], vec!["whole".to_owned()])
+        );
+        // Until the newest cut has one of its tables, a page is planned that
+        // cut's whole set over an older cut of its tables.
+        assert_eq!(
+            planned(vec![only_a_old.clone(), whole.clone()], &just_a),
+            (vec!["whole".to_owned()], vec!["whole".to_owned()])
+        );
+        // A page that holds an older cut is planned it, and downloads nothing.
+        let mut held = only_a_old;
+        held.cache_hint = true;
+        assert_eq!(
+            planned(vec![held, whole, only_a], &just_a),
+            (
+                vec!["a".to_owned(), "a-old".to_owned(), "whole".to_owned()],
+                vec!["a-old".to_owned()]
+            )
+        );
     }
 
     #[test]

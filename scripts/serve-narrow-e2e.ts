@@ -9,7 +9,9 @@
  * working set, show nothing of `tasks`, and stay live: a transaction that
  * changes both tables shows its `projects` part, a transaction that changes
  * only `tasks` leaves the page ready, and a later `projects` change still
- * arrives.
+ * arrives. Once the server has derived the artifact of `projects` alone, a
+ * second visitor on a fresh profile must be planned that artifact, download
+ * nothing of `tasks`, and reach the committed rows the same way.
  *
  * Usage: `pnpm serve:e2e:narrow`. Requires Docker and a Rust toolchain.
  * `CALQUE_SERVE_E2E_POSTGRES_PORT` selects the container's host port
@@ -22,7 +24,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import process from "node:process";
-import type { Browser } from "playwright";
+import type { Browser, BrowserContext, Page } from "playwright";
 import {
   buildServeBinaries,
   ensurePostgresContainer,
@@ -45,6 +47,15 @@ interface NarrowPageState {
   readonly publishedCollections: readonly (readonly string[])[];
   readonly collections: readonly string[];
   readonly statuses: readonly string[];
+}
+
+interface PlannedBootstrap {
+  readonly requiredTables: readonly unknown[];
+  readonly artifacts: readonly {
+    readonly tables: readonly unknown[];
+    readonly decodedBytes: number;
+    readonly selectedRepresentation: { readonly encodedBytes: number };
+  }[];
 }
 
 declare global {
@@ -70,6 +81,7 @@ const MOUNT_TIMEOUT_MS = 180_000;
 const LIVE_TIMEOUT_MS = 60_000;
 /** How long a tasks-only transaction is given to break the page. */
 const QUIET_WATCH_MS = 5_000;
+const DERIVE_TIMEOUT_MS = 120_000;
 
 const SEED_SQL = `
 CREATE TABLE projects (
@@ -119,6 +131,25 @@ function committedProjects(): readonly (readonly [number, string, string])[] {
       const [id = "", name = "", status = ""] = line.split("|");
       return [Number(id), name, status] as const;
     });
+}
+
+/** The plan of the first bootstrap any page of `context` makes. */
+function firstPlan(context: BrowserContext): Promise<PlannedBootstrap> {
+  return new Promise((resolve, reject) => {
+    context.on("response", (response) => {
+      if (!new URL(response.url()).pathname.endsWith("/v1/bootstrap")) return;
+      if (response.request().method() !== "POST") return;
+      response
+        .json()
+        .then((plan) => resolve(plan as PlannedBootstrap))
+        .catch(reject);
+    });
+  });
+}
+
+/** The tables the plan installs, which must be exactly the ones it needs. */
+function installedTables(plan: PlannedBootstrap): string {
+  return JSON.stringify(plan.artifacts.flatMap((artifact) => artifact.tables));
 }
 
 async function main(): Promise<Record<string, unknown>> {
@@ -208,24 +239,37 @@ async function main(): Promise<Record<string, unknown>> {
     ) as typeof import("playwright");
     const pageErrors: string[] = [];
     browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage({
-      viewport: { width: 1280, height: 900 },
-    });
-    page.on("pageerror", (error) => pageErrors.push(String(error)));
-    await page.addInitScript(
-      ([injectedEndpoint, injectedGrant, injectedDevice]) => {
-        Object.defineProperty(globalThis, "__calqueNarrowConfig", {
-          value: {
-            endpoint: injectedEndpoint,
-            grant: injectedGrant,
-            deviceId: injectedDevice,
-          },
-        });
-      },
-      [endpoint, grant.token, `serve-narrow-${randomUUID()}`] as const,
-    );
-    const state = (): Promise<NarrowPageState> =>
+    const openedBrowser = browser;
+    // Each visitor is a fresh profile with an empty HTTP cache.
+    const visit = async (): Promise<{
+      page: Page;
+      plan: Promise<PlannedBootstrap>;
+    }> => {
+      const context = await openedBrowser.newContext({
+        viewport: { width: 1280, height: 900 },
+      });
+      const plan = firstPlan(context);
+      const page = await context.newPage();
+      page.on("pageerror", (error) => pageErrors.push(String(error)));
+      await page.addInitScript(
+        ([injectedEndpoint, injectedGrant, injectedDevice]) => {
+          Object.defineProperty(globalThis, "__calqueNarrowConfig", {
+            value: {
+              endpoint: injectedEndpoint,
+              grant: injectedGrant,
+              deviceId: injectedDevice,
+            },
+          });
+        },
+        [endpoint, grant.token, `serve-narrow-${randomUUID()}`] as const,
+      );
+      return { page, plan };
+    };
+    const stateOf = (page: Page): Promise<NarrowPageState> =>
       page.evaluate(() => globalThis.__calqueNarrowState());
+    const first = await visit();
+    const { page } = first;
+    const state = (): Promise<NarrowPageState> => stateOf(page);
     const failIfBroken = (current: NarrowPageState): void => {
       if (current.state === "error")
         throw new Error(
@@ -248,6 +292,11 @@ async function main(): Promise<Record<string, unknown>> {
     assert.deepEqual(mounted.projects, committedProjects());
     assert.equal(mounted.projects.length, 3);
     assert.equal(mounted.statuses.at(-1), "ready");
+    // Nothing of `projects` alone is published yet: the first visitor
+    // installs the artifact of every served table.
+    const firstPlanned = await first.plan;
+    assert.equal(firstPlanned.artifacts.length, 1);
+    assert.equal(firstPlanned.artifacts[0]?.tables.length, 2);
 
     // One transaction over both tables: its projects part must show, and the
     // tasks part must not break the page.
@@ -300,8 +349,60 @@ async function main(): Promise<Record<string, unknown>> {
       "the page rebuilt its session after a change to an unbound table",
     );
     assert.deepEqual(final.projects, committedProjects());
+
+    // The first plan installed more than its page reads, so the server
+    // derives the artifact of `projects` alone at the same cut.
+    await waitFor(
+      "the server to derive the artifact of the page's tables",
+      DERIVE_TIMEOUT_MS,
+      () =>
+        Promise.resolve(
+          serveLog.join("").includes("subset derivation finished"),
+        ),
+    );
+    const second = await visit();
+    await second.page.goto(pageOrigin, { waitUntil: "load", timeout: 60_000 });
+    const secondReadyAfterMs = await waitFor(
+      "the second visitor to mount the projects working set",
+      MOUNT_TIMEOUT_MS,
+      async () => {
+        const current = await stateOf(second.page);
+        failIfBroken(current);
+        return current.state === "ready";
+      },
+    );
+    const secondPlanned = await second.plan;
+    assert.equal(secondPlanned.artifacts.length, 1);
+    assert.equal(
+      installedTables(secondPlanned),
+      JSON.stringify(secondPlanned.requiredTables),
+      "the second visitor installed tables its page does not read",
+    );
+    // Caught up from the derived artifact's cut, through every change since.
+    assert.deepEqual(
+      (await stateOf(second.page)).projects,
+      committedProjects(),
+    );
+    psql("UPDATE projects SET name = 'Audit (signed off)' WHERE id = 104;");
+    await waitFor(
+      "a projects change on the second visitor",
+      LIVE_TIMEOUT_MS,
+      async () => {
+        const current = await stateOf(second.page);
+        failIfBroken(current);
+        return current.projects.some(
+          ([id, name]) => id === 104 && name === "Audit (signed off)",
+        );
+      },
+    );
+    assert.deepEqual(
+      (await stateOf(second.page)).projects,
+      committedProjects(),
+    );
     assert.deepEqual(pageErrors, []);
 
+    const [whole] = firstPlanned.artifacts;
+    const [part] = secondPlanned.artifacts;
     return {
       result: "PASS",
       runId,
@@ -309,6 +410,17 @@ async function main(): Promise<Record<string, unknown>> {
       readyAfterMs,
       projects: final.projects.length,
       publications: final.publishedCollections.length,
+      secondReadyAfterMs,
+      firstVisitor: {
+        tables: whole?.tables.length,
+        decodedBytes: whole?.decodedBytes,
+        encodedBytes: whole?.selectedRepresentation.encodedBytes,
+      },
+      secondVisitor: {
+        tables: part?.tables.length,
+        decodedBytes: part?.decodedBytes,
+        encodedBytes: part?.selectedRepresentation.encodedBytes,
+      },
     };
   } catch (error) {
     process.stderr.write(

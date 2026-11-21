@@ -77,13 +77,14 @@ impl MaintenanceError {
 /// then encodes its brotli artifact, packed or plain, and publishes each only
 /// if [`admits_reencode`] holds for what `serving` holds when the catalog
 /// asks, under the fence lock.
+#[cfg(test)]
 pub(super) async fn reencode_generation(
     request: ReencodeRequest<'_>,
     serving: &StdRwLock<Arc<ServingAuthorization>>,
     generation: u64,
-    on_stage: impl FnMut(ReencodeStage),
+    on_stage: impl FnMut(crate::reencode::ReencodeStage),
 ) -> Result<ReencodeOutcomes, ReencodeError> {
-    reencode_and_publish_brotli(
+    crate::reencode::reencode_and_publish_brotli(
         request,
         || admits_reencode(&current_serving(serving), generation),
         on_stage,
@@ -164,25 +165,30 @@ impl LocalBackend {
                 return;
             }
         };
+        self.inner.subsets.serve(prepared);
         let cancellation = reencoder.replace();
         let span = reencoder.begin_encoding();
         let backend = self.clone();
+        let prepared = prepared.clone();
         let spawned = std::thread::Builder::new()
             .name("calque-artifact-reencode".to_owned())
             .spawn(move || {
                 if lowered {
                     crate::background::lower_current_thread("the re-encode");
                 }
-                backend.run_reencode(generation, &query, &cancellation, &span);
+                backend.run_reencode(&prepared, &query, &cancellation, &span);
             });
         if let Err(error) = spawned {
             tracing::warn!(generation, %error, "the published artifact was not re-encoded");
         }
     }
 
+    /// Re-encodes the newest cut's artifact, then derives the artifact of
+    /// each table set pages asked for at that cut, and only then retires
+    /// the artifacts they replace, so a page planned meanwhile finds one.
     pub(super) fn run_reencode(
         &self,
-        generation: u64,
+        prepared: &PreparedLocalSource,
         query: &PublishedArtifactQuery,
         cancellation: &CancellationToken,
         span: &EncodingSpan,
@@ -190,6 +196,7 @@ impl LocalBackend {
         let Some(reencoder) = self.inner.reencoder.as_ref() else {
             return;
         };
+        let generation = prepared.policy.generation();
         let _serial = reencoder
             .serial
             .lock()
@@ -215,7 +222,7 @@ impl LocalBackend {
                 return;
             }
         };
-        let outcome = runtime.block_on(reencode_generation(
+        let outcome = runtime.block_on(reencode_leaving_replaced(
             ReencodeRequest {
                 state_root: &reencoder.config.state_root,
                 catalog_path: &reencoder.config.catalog_path,
@@ -225,16 +232,11 @@ impl LocalBackend {
                 fence: &self.inner.fence_lock,
                 cancellation,
             },
-            &self.inner.serving,
-            generation,
-            |stage| {
-                if stage == ReencodeStage::Retiring {
-                    span.close();
-                }
-            },
+            || admits_reencode(&current_serving(&self.inner.serving), generation),
+            |_| {},
         ));
-        match outcome {
-            Ok(ReencodeOutcomes { zstd, brotli }) => {
+        let mut replaced = match outcome {
+            Ok((ReencodeOutcomes { zstd, brotli }, replaced)) => {
                 tracing::info!(
                     target: "calque::preparation",
                     generation,
@@ -255,14 +257,21 @@ impl LocalBackend {
                     ),
                     None => {}
                 }
+                replaced
             }
             Err(ReencodeError::Cancelled) => {
                 tracing::info!(generation, "re-encode cancelled");
+                return;
             }
             Err(error) => {
                 tracing::warn!(generation, %error, "the published artifact was not re-encoded");
+                Vec::new()
             }
-        }
+        };
+        let sets = self.inner.subsets.sets();
+        replaced.extend(self.derive_subsets(&runtime, prepared, &sets, cancellation));
+        span.close();
+        self.retire_replaced(&runtime, &replaced, cancellation);
     }
 
     /// Starts the thread that, every `MAINTENANCE_INTERVAL`, measures the
@@ -350,10 +359,16 @@ impl LocalBackend {
         let now_ms = now / 1_000;
         let (newest, newest_digests, older) = {
             let catalog = self.inner.catalog.blocking_lock();
-            let published = catalog.artifacts.published(&query)?;
-            let Some(newest) = newest_cut(&published, &self.inner.activated) else {
+            let Some(newest) =
+                newest_cut(&catalog.artifacts.published(&query)?, &self.inner.activated)
+            else {
                 return Ok(());
             };
+            // Every table set's artifacts, so a part of the served tables is
+            // plannable and retired with its cut.
+            let published = catalog
+                .artifacts
+                .published_for_cache_key(&query.cache_key)?;
             let newest_digests: BTreeSet<String> = published
                 .iter()
                 .map(ValidatedArtifactManifest::manifest)

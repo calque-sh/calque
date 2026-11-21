@@ -66,8 +66,8 @@ use crate::{
         TailMeter, MAINTENANCE_INTERVAL,
     },
     reencode::{
-        reencode_and_publish_brotli, EncodingSpan, ReencodeConfig, ReencodeError, ReencodeOutcomes,
-        ReencodeRequest, ReencodeStage, Reencoder,
+        reencode_leaving_replaced, EncodingSpan, ReencodeConfig, ReencodeError, ReencodeOutcomes,
+        ReencodeRequest, Reencoder,
     },
     revocation::{
         FenceWrite, FencedGeneration, LocalRevocationConfig, RevocationError, SignedBarrier,
@@ -89,11 +89,14 @@ mod fence;
 mod log_proxy;
 mod maintenance;
 mod moving;
+mod subsets;
 #[cfg(test)]
 mod tests;
 mod writes;
 
-use self::{bootstrap::*, changes::*, credentials::*, fence::*, log_proxy::*, maintenance::*};
+use self::{
+    bootstrap::*, changes::*, credentials::*, fence::*, log_proxy::*, maintenance::*, subsets::*,
+};
 pub use credentials::LocalCredentialPolicy;
 pub use moving::{BetweenGenerations, MovingBackend};
 pub use writes::{MountedCommands, MutationCommandPolicy};
@@ -214,6 +217,9 @@ struct LocalBackendInner {
     reencoder: Option<Reencoder>,
     /// Re-cuts the served scope and trims the canonical log in the background.
     recut: Option<Recutter>,
+    /// The parts of the served tables pages ask for, each of which the
+    /// re-encoder publishes an artifact of.
+    subsets: SubsetDemand,
     /// Present when the scope is partitioned: each grant reads one tenant's
     /// artifact, prepared on its first request.
     tenants: Option<Tenants>,
@@ -437,6 +443,7 @@ impl LocalBackend {
                 revocation: config.revocation,
                 reencoder: config.reencode.map(Reencoder::new),
                 recut,
+                subsets: SubsetDemand::default(),
                 tenants: config.tenants,
                 credential: config.credential,
                 command_policy: config.command_policy,

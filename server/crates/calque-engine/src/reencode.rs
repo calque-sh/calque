@@ -47,7 +47,7 @@ use crate::state::snapshot_workspace_root;
 
 /// A re-encode's build lease, held from registration to publication: one
 /// object's upload and the verification of up to three.
-const REENCODE_LEASE_MS: i64 = 10 * 60 * 1000;
+pub(crate) const REENCODE_LEASE_MS: i64 = 10 * 60 * 1000;
 /// How long the cleanup of a refused or failed re-encode may hold its lease.
 const CLEANUP_LEASE_MS: i64 = 60 * 1000;
 /// The longest a retirement waits on a plan's pin before it asks again.
@@ -132,6 +132,15 @@ impl Reencoder {
             .cancel();
     }
 
+    /// The running re-encode's token, which work that runs after it on the
+    /// same thread shares, so that what cancels the one cancels the other.
+    pub(crate) fn current(&self) -> CancellationToken {
+        self.current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Cancels the running re-encode and returns the token of the next.
     pub(crate) fn replace(&self) -> CancellationToken {
         let next = self.config.cancellation.child_token();
@@ -160,7 +169,14 @@ pub(crate) enum ReencodeStage {
     /// The brotli object is uploaded and the catalog is about to ask `admit`.
     BrotliAdmitting,
     /// The encodes are over, and what they replace is about to be retired.
+    #[cfg(test)]
     Retiring,
+    /// The published artifact is local, and an artifact of some of its
+    /// tables is about to be written from it.
+    Subsetting,
+    /// That artifact is uploaded, and its publication waits for the fence
+    /// lock.
+    SubsetAdmitting,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +220,14 @@ pub(crate) enum ReencodeError {
     Io(#[from] std::io::Error),
     #[error("the system clock is before 1970 or past 2262")]
     Clock,
+    #[error(transparent)]
+    Plan(#[from] snapshot_builder::SnapshotPlanError),
+    #[error(transparent)]
+    Schema(#[from] snapshot_builder::DirectColumnarCopyError),
+    #[error(transparent)]
+    Columnar(#[from] direct_columnar::EncodeError),
+    #[error("the published artifact's header names another plan than the served one")]
+    ParentIdentity,
 }
 
 #[derive(Clone, Copy)]
@@ -321,8 +345,7 @@ async fn zstd_stage(
         &mut catalog,
         store,
         &lease,
-        encoded.manifest(),
-        encoded.path(),
+        &[(encoded.manifest(), encoded.path())],
         fence,
         admit,
         on_stage,
@@ -502,8 +525,7 @@ async fn brotli_stage(
         &mut catalog,
         store,
         &lease,
-        encoded.manifest(),
-        encoded.path(),
+        &[(encoded.manifest(), encoded.path())],
         fence,
         admit,
         on_stage,
@@ -567,29 +589,27 @@ pub(crate) struct ReencodeOutcomes {
     pub(crate) brotli: Option<Result<ReencodeOutcome, ReencodeError>>,
 }
 
-/// Re-encodes the artifact published for `request.query` at
-/// [`REENCODED_ZSTD_LEVEL`], then publishes its brotli artifact, packed or
-/// plain, each only if `admit` holds when the catalog asks, which it does while
-/// `request.fence` is held shared. A fence holds that lock exclusively while
-/// it retires a generation, so an `admit` that answers whether the generation
-/// is still served never lets either artifact into a retired one. The
-/// artifacts they replace are retired last, so a plan's pin on one never
-/// delays a publication.
+/// [`reencode_leaving_replaced`], then the retirement of what it replaced.
+#[cfg(test)]
 pub(crate) async fn reencode_and_publish_brotli(
     request: ReencodeRequest<'_>,
     admit: impl Fn() -> bool,
     mut on_stage: impl FnMut(ReencodeStage),
 ) -> Result<ReencodeOutcomes, ReencodeError> {
-    let (outcomes, replaced) = encode_stages(request, admit, &mut on_stage).await?;
-    // The store holds its own copies now; a retirement can wait an hour.
+    let (outcomes, replaced) = reencode_leaving_replaced(request, admit, &mut on_stage).await?;
     on_stage(ReencodeStage::Retiring);
-    let mut catalog = SqliteArtifactCatalog::open(request.catalog_path)?;
-    retire(&mut catalog, &replaced, request.cancellation).await?;
+    retire_replaced(request.catalog_path, &replaced, request.cancellation).await?;
     Ok(outcomes)
 }
 
-/// [`reencode_and_publish_brotli`]'s encodes, returning the artifacts they
-/// replace for the caller to retire rather than waiting on their plans' pins.
+/// Re-encodes the artifact published for `request.query` at
+/// [`REENCODED_ZSTD_LEVEL`], then publishes its brotli artifact, packed or
+/// plain, each only if `admit` holds when the catalog asks, which it does while
+/// `request.fence` is held shared. A fence holds that lock exclusively while
+/// it retires a generation, so an `admit` that answers whether the generation
+/// is still served never lets either artifact into a retired one. It returns
+/// the artifacts they replace for the caller to retire last, with
+/// [`retire_replaced`], so a plan's pin on one never delays a publication.
 pub(crate) async fn reencode_leaving_replaced(
     request: ReencodeRequest<'_>,
     admit: impl Fn() -> bool,
@@ -652,31 +672,38 @@ pub(crate) async fn reencode_published(
     mut on_stage: impl FnMut(ReencodeStage),
 ) -> Result<ReencodeOutcome, ReencodeError> {
     let staged = zstd_stage(request, &admit, &mut on_stage).await?;
-    let mut catalog = SqliteArtifactCatalog::open(request.catalog_path)?;
-    retire(&mut catalog, &staged.replaced, request.cancellation).await?;
+    let replaced: Vec<_> = staged
+        .replaced
+        .iter()
+        .map(|manifest| manifest.manifest().artifact_id.clone())
+        .collect();
+    retire_replaced(request.catalog_path, &replaced, request.cancellation).await?;
     Ok(staged.outcome)
 }
 
+/// Uploads each of `objects` and publishes the build `lease` registered if
+/// `admit` holds when the catalog asks, under the fence lock held shared.
 #[allow(clippy::too_many_arguments)]
-async fn upload_and_publish(
+pub(crate) async fn upload_and_publish(
     catalog: &mut SqliteArtifactCatalog,
     store: &dyn ManagedBlobStore,
     lease: &BuildLease,
-    representation: &ArtifactRepresentation,
-    path: &Path,
+    objects: &[(&ArtifactRepresentation, &Path)],
     fence: &RwLock<()>,
     admit: &impl Fn() -> bool,
     on_stage: &mut impl FnMut(ReencodeStage),
     admitting: ReencodeStage,
 ) -> Result<PublishOutcome, ReencodeError> {
     catalog.mark_uploading(lease, now_ms()?)?;
-    let metadata = ObjectMetadata::new(
-        representation.encoded_bytes,
-        representation.encoded_sha256.clone(),
-    )?;
-    store
-        .put_file_if_absent(&representation.object_id, path, &metadata)
-        .await?;
+    for (representation, path) in objects {
+        let metadata = ObjectMetadata::new(
+            representation.encoded_bytes,
+            representation.encoded_sha256.clone(),
+        )?;
+        store
+            .put_file_if_absent(&representation.object_id, path, &metadata)
+            .await?;
+    }
     catalog.mark_uploaded(lease, now_ms()?)?;
     on_stage(admitting);
     let _fence = fence.read().await;
@@ -687,7 +714,7 @@ async fn upload_and_publish(
 
 /// Removes a re-encode that will not be published, and the object only it
 /// referenced.
-async fn abandon(
+pub(crate) async fn abandon(
     catalog: &mut SqliteArtifactCatalog,
     store: &dyn ManagedBlobStore,
     lease: &BuildLease,
@@ -708,20 +735,18 @@ async fn abandon(
     Ok(())
 }
 
-/// Retires each of `replaced` once no plan pins it.
-async fn retire(
-    catalog: &mut SqliteArtifactCatalog,
-    replaced: &[ValidatedArtifactManifest],
+/// Retires each of `replaced` once no plan pins it. The store holds its own
+/// copies, so a retirement can wait an hour.
+pub(crate) async fn retire_replaced(
+    catalog_path: &Path,
+    replaced: &[ArtifactId],
     cancellation: &CancellationToken,
 ) -> Result<(), ReencodeError> {
-    for manifest in replaced {
+    let mut catalog = SqliteArtifactCatalog::open(catalog_path)?;
+    for artifact in replaced {
         loop {
             let now = now_ms()?;
-            match catalog.retire(
-                &manifest.manifest().artifact_id,
-                now,
-                "replaced by its re-encode",
-            ) {
+            match catalog.retire(artifact, now, "replaced by its re-encode") {
                 Ok(_) => break,
                 Err(CatalogError::ArtifactPinnedByPlan { expires_ms }) => {
                     let wait = u64::try_from(expires_ms.saturating_sub(now)).unwrap_or(0);
@@ -740,7 +765,7 @@ async fn retire(
     Ok(())
 }
 
-async fn download(
+pub(crate) async fn download(
     store: &dyn ManagedBlobStore,
     object: &ObjectId,
     path: &Path,
@@ -767,7 +792,7 @@ async fn download(
     Ok(())
 }
 
-fn published_at(
+pub(crate) fn published_at(
     catalog: &SqliteArtifactCatalog,
     query: &PublishedArtifactQuery,
     cut: &OpaqueCursor,
@@ -779,7 +804,7 @@ fn published_at(
         .collect())
 }
 
-fn representation(
+pub(crate) fn representation(
     manifest: &ValidatedArtifactManifest,
     encoding: RepresentationEncoding,
 ) -> Result<&ArtifactRepresentation, ReencodeError> {
@@ -802,7 +827,10 @@ fn zstd_level(manifest: &ValidatedArtifactManifest) -> Option<i32> {
 }
 
 /// An encode that fails because it was cancelled reports the cancellation.
-fn cancelled_or(cancellation: &CancellationToken, error: ReencodeError) -> ReencodeError {
+pub(crate) fn cancelled_or(
+    cancellation: &CancellationToken,
+    error: ReencodeError,
+) -> ReencodeError {
     if cancellation.is_cancelled() {
         ReencodeError::Cancelled
     } else {
@@ -810,7 +838,7 @@ fn cancelled_or(cancellation: &CancellationToken, error: ReencodeError) -> Reenc
     }
 }
 
-fn now_ms() -> Result<i64, ReencodeError> {
+pub(crate) fn now_ms() -> Result<i64, ReencodeError> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ReencodeError::Clock)?;
@@ -818,12 +846,12 @@ fn now_ms() -> Result<i64, ReencodeError> {
 }
 
 /// A directory removed with everything in it when dropped.
-struct WorkDirectory {
-    path: PathBuf,
+pub(crate) struct WorkDirectory {
+    pub(crate) path: PathBuf,
 }
 
 impl WorkDirectory {
-    fn create(path: &Path) -> std::io::Result<Self> {
+    pub(crate) fn create(path: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(path)?;
         Ok(Self {
             path: path.to_path_buf(),

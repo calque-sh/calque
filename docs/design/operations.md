@@ -1334,6 +1334,18 @@ with a `CURSOR_BEFORE_RETENTION` stream error and `resnapshot_required` set,
 and the client bootstraps again. Calque never sends part of a batch the log no
 longer holds.
 
+### Pages that read fewer tables
+
+A page whose generated bindings name some of the source-wide scope's tables
+is planned the newest cut's artifact of every table at first. The process
+then copies those tables out of that artifact into an artifact of their own
+at the same cut, encodes it like a cut, and plans it for the next page that
+names the same tables. It keeps the 8 table sets planned most
+recently, copies each again at every new cut once that cut's encodes are
+published, and keeps and retires each with its cut. Each set costs its objects in the store
+and its encodes' CPU, in proportion to its tables' bytes. A partitioned
+scope prepares no such artifact.
+
 ## What a restart does to connected clients
 
 A plan is a token the deployment signs with a key in the state directory, so

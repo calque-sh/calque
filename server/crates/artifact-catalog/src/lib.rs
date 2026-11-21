@@ -1054,6 +1054,34 @@ impl SqliteArtifactCatalog {
         Ok(manifests)
     }
 
+    /// Every published artifact of `cache_key`, whatever its table set.
+    pub fn published_for_cache_key(
+        &self,
+        cache_key: &ArtifactCacheKey,
+    ) -> Result<Vec<ValidatedArtifactManifest>> {
+        let cache_key_json = serde_json::to_string(cache_key)?;
+        let mut statement = self.connection.prepare(
+            "SELECT manifest_json, table_set_hash FROM artifacts \
+             WHERE state = 'PUBLISHED' AND cache_key_json = ?1 \
+             ORDER BY artifact_id",
+        )?;
+        let rows = statement.query_map(params![cache_key_json], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut manifests = Vec::new();
+        for row in rows {
+            let (bytes, indexed_table_set_hash) = row?;
+            let manifest = ValidatedArtifactManifest::parse(&bytes)?;
+            if manifest.cache_key() != *cache_key
+                || manifest.manifest().compatibility.table_set_hash != indexed_table_set_hash
+            {
+                return Err(CatalogError::CorruptPublishedIndex);
+            }
+            manifests.push(manifest);
+        }
+        Ok(manifests)
+    }
+
     /// Bounded compatibility lookup restricted to artifacts intersecting the
     /// query-derived table set. The normalized table index prevents unrelated
     /// publication history from consuming the planner's candidate budget.
@@ -2335,6 +2363,44 @@ mod tests {
             PublishOutcome::Published
         );
         manifest
+    }
+
+    /// A cache key's published artifacts are found whatever their table set,
+    /// and those of another cache key are not.
+    #[tokio::test]
+    async fn a_cache_key_s_artifacts_are_found_across_table_sets() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut catalog =
+            SqliteArtifactCatalog::open(directory.path().join("catalog.sqlite3")).unwrap();
+        let store = LocalFilesystemBlobStore::open(directory.path().join("blobs"), 1024).unwrap();
+        let bytes = b"every table";
+        let whole = published_artifact(&mut catalog, &store, bytes, "artifact-whole").await;
+        let mut value = serde_json::to_value(whole.manifest()).unwrap();
+        value["artifactId"] = serde_json::json!("artifact-part");
+        value["compatibility"]["tableSetHash"] =
+            serde_json::json!(format!("sha256:{}", "d".repeat(64)));
+        let part = ValidatedArtifactManifest::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        let lease = catalog
+            .register_build(&part, "worker-1", 1_000, 1_000_000)
+            .unwrap();
+        catalog.mark_uploading(&lease, 1_100).unwrap();
+        catalog.mark_uploaded(&lease, 1_200).unwrap();
+        catalog
+            .verify_and_publish(&lease, &store, 1_300)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            catalog.published(&query(&whole)).unwrap(),
+            std::slice::from_ref(&whole)
+        );
+        assert_eq!(
+            catalog.published_for_cache_key(&whole.cache_key()).unwrap(),
+            [part, whole.clone()]
+        );
+        let mut other = whole.cache_key();
+        other.authorization_generation += 1;
+        assert!(catalog.published_for_cache_key(&other).unwrap().is_empty());
     }
 
     /// A superseded artifact leaves the published set at once, pinned or not,
