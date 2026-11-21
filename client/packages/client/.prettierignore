@@ -5,3 +5,5 @@ target
 tests/typed-consumer/calque.generated.ts
 tests/demo/calque.generated.ts
 tests/serve-tenants/calque.generated.ts
+tests/serve-narrow/calque.generated.ts
+tests/serve-narrow/calque.start.generated.ts

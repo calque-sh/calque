@@ -233,7 +233,9 @@ column, backfill it, and switch the collection to it.
 A page built from an older `calque.config.json` keeps working when a column is
 added. A page whose generated bindings name a table or column the new
 generation does not serve fails with `SCHEMA_MISMATCH`, and only a build
-generated from the new configuration loads. To remove a column, ship the
+generated from the new configuration loads. A table the new generation serves
+and the page's bindings do not name does not fail the page, though the move
+rebuilds it like any open page. To remove a column, ship the
 application built without it first, then the configuration.
 
 ## Protecting the primary's disk

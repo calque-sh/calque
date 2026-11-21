@@ -2861,3 +2861,111 @@ describe("the live poll negotiates the revocation barrier body", () => {
     expect(await negotiatedFlag({})).toBe(false);
   });
 });
+
+describe("a mount that reads fewer tables than its stream carries", () => {
+  const READ = ["issues", "issue_tags"];
+  const NARROW: ColumnarChangeContract = {
+    ...CONTRACT,
+    tables: CONTRACT.tables.filter(({ collection }) =>
+      READ.includes(collection),
+    ),
+    ignoredTableIds: CONTRACT.tables
+      .filter(({ collection }) => !READ.includes(collection))
+      .map(({ tableId }) => tableId),
+  };
+  const boundOperations = (operations: readonly Op[]): Op[] =>
+    operations.filter(({ collection }) => READ.includes(collection));
+
+  test("the bound part of a mixed transaction applies whole and matches a fresh build of the tables read", async () => {
+    const source = seedState();
+    const base = await encodeAt(source, "cursor-0");
+    const engine = overlayOver(base.workspace);
+    const binding = compileColumnarChangeBinding(WORKSPACE_CONTRACT, NARROW);
+    const decoded = await decodeColumnarChangeBatch(
+      await encodeBatch("cursor-0", "cursor-2", TAIL),
+      binding,
+      text.encode("cursor-0"),
+    );
+    // Each transaction keeps only the operations on tables the mount reads;
+    // the second holds one of those among five.
+    expect(
+      decoded.batch.transactions.map(({ operations }) => operations.length),
+    ).toEqual(TAIL.map(({ operations }) => boundOperations(operations).length));
+    expect(decoded.operationCount).toBe(
+      TAIL.flatMap(({ operations }) => boundOperations(operations)).length,
+    );
+    engine.applyCanonical(decoded.batch);
+    expect(utf8.decode(decoded.throughCursorInclusive)).toBe("cursor-2");
+
+    const reference = cloneState(source);
+    for (const transaction of TAIL)
+      for (const operation of boundOperations(transaction.operations))
+        applyToSource(reference, operation);
+    const fresh = await encodeAt(reference, "cursor-2");
+    expect(
+      diff(renderOverlay(engine), renderWorkspace(fresh.workspace)).join("\n"),
+    ).toBe("");
+  });
+
+  test("a transaction that touches only ignored tables applies nothing and still advances the cursor", async () => {
+    const source = seedState();
+    const base = await encodeAt(source, "cursor-0");
+    const engine = overlayOver(base.workspace);
+    const before = renderOverlay(engine);
+    const binding = compileColumnarChangeBinding(WORKSPACE_CONTRACT, NARROW);
+    const events = at(TAIL, 1).operations.filter(
+      ({ collection }) => collection === "events",
+    );
+    expect(events.length).toBeGreaterThan(0);
+    const decoded = await decodeColumnarChangeBatch(
+      await encodeBatch("cursor-0", "cursor-1", [
+        { cursor: "cursor-1", operations: events },
+      ]),
+      binding,
+      text.encode("cursor-0"),
+    );
+    expect(decoded.batch.transactions).toEqual([]);
+    expect(decoded.operationCount).toBe(0);
+    expect(utf8.decode(decoded.throughCursorInclusive)).toBe("cursor-1");
+    engine.applyCanonical(decoded.batch);
+    expect(diff(renderOverlay(engine), before)).toEqual([]);
+  });
+
+  test("the stream's table set is still the bound and the ignored tables together", async () => {
+    const binding = compileColumnarChangeBinding(WORKSPACE_CONTRACT, NARROW);
+    expect(binding.tableIds).toEqual(
+      CONTRACT.tables.map(({ tableId }) => tableId).sort(),
+    );
+    // A batch that names only the bound tables does not carry the server's
+    // table set, and is refused.
+    const bytes = await encodeBatch("cursor-0", "cursor-1", []);
+    const bound = compileColumnarChangeBinding(WORKSPACE_CONTRACT, {
+      ...NARROW,
+      ignoredTableIds: [],
+    });
+    await expect(
+      decodeColumnarChangeBatch(bytes, bound, text.encode("cursor-0")),
+    ).rejects.toMatchObject({ code: "CHANGE_STREAM_INVALID" });
+  });
+
+  test("a mutation on an ignored table is refused", () => {
+    const binding = compileColumnarChangeBinding(WORKSPACE_CONTRACT, NARROW);
+    const ignored = {
+      kind: "delete",
+      collection: "comments",
+      key: { id: "comment-1" },
+    } as const;
+    expect(() =>
+      decodeOptimisticMutation("m-1", [operationBytes(ignored)], binding),
+    ).toThrow(/unsubscribed table/u);
+  });
+
+  test("a contract that binds a table it also ignores is refused", () => {
+    expect(() =>
+      compileColumnarChangeBinding(WORKSPACE_CONTRACT, {
+        ...NARROW,
+        ignoredTableIds: [...(NARROW.ignoredTableIds ?? []), "public.issues"],
+      }),
+    ).toThrow(/binds public\.issues twice/u);
+  });
+});

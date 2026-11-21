@@ -10,6 +10,8 @@ import {
   controllableLongPoll,
   decoder,
   makeClient,
+  narrowSchema,
+  narrowed,
   outcomeResponder,
   plan,
   type FakeWorker,
@@ -86,12 +88,13 @@ function makeRenewingClient(
   answer: RenewalAnswer = renewing,
   mutationFetch: typeof fetch = acceptedResponder,
   options: Record<string, unknown> = {},
+  first: Record<string, unknown> = initialPlan(),
 ) {
   const renewals: RenewalRequest[] = [];
   const writes: string[] = [];
   const poll = controllableLongPoll();
   const made = makeClient(
-    initialPlan(),
+    first,
     poll.fetcher,
     (input, init) => {
       const request = fromBinary(
@@ -436,5 +439,28 @@ describe("a session renews its plan before it expires", () => {
     await vi.advanceTimersByTimeAsync(LIFE_MS);
     await quiet();
     expect(made.renewals).toHaveLength(0);
+  });
+
+  it("renews a page that reads fewer tables than the artifact serves, holding every served table", async () => {
+    const made = makeRenewingClient(
+      (request, count) =>
+        json(narrowed(renewedPlan(count, request.residentCursor))),
+      acceptedResponder,
+      { schema: narrowSchema },
+      narrowed(initialPlan()),
+    );
+    await ready(made);
+    await vi.advanceTimersByTimeAsync(10 * MINUTE);
+    await until(() => marks("plan:renewed") === 1, "the renewal");
+    // The change stream names both served tables, so the renewed plan must
+    // keep holding both while requiring only what the page reads.
+    expect(made.renewals).toEqual([
+      expect.objectContaining({
+        requiredTables: ["public.events"],
+        residentTables: TABLES,
+      }),
+    ]);
+    expect(made.client.status).toEqual({ state: "ready" });
+    await close(made);
   });
 });

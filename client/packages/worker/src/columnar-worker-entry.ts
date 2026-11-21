@@ -98,6 +98,17 @@ interface Receiving {
 }
 let receiving: Receiving | null = null;
 
+/**
+ * The artifact tables a live mount installs: the ones its change contract
+ * binds. The rest are verified with the artifact and never read. A frozen
+ * mount installs every table.
+ */
+function installedTables(
+  request: Extract<WorkerRequest, { type: "open" }>,
+): readonly string[] | undefined {
+  return request.changeStream?.tables.map((table) => table.collection);
+}
+
 function startReceiving(request: Extract<WorkerRequest, { type: "open" }>) {
   const settled: PromiseWithResolvers<void> = Promise.withResolvers();
   let receiver: ArtifactReceiver | undefined;
@@ -109,7 +120,11 @@ function startReceiving(request: Extract<WorkerRequest, { type: "open" }>) {
       !ports.every((port) => port instanceof MessagePort)
     )
       throw new Error("the open names no hasher ports to receive chunks on");
-    receiver = receiveDirectColumnarArtifact(request.trusted, request.capacity);
+    receiver = receiveDirectColumnarArtifact(
+      request.trusted,
+      request.capacity,
+      installedTables(request),
+    );
   } catch (error) {
     failure = { error };
     settled.resolve();
@@ -427,14 +442,21 @@ async function handle(request: LiveRequest): Promise<WorkerResponse> {
       : undefined;
     const opened = await received();
     workspace = opened;
-    for (const table of request.trusted.schema.tables)
+    const installed = new Set(
+      installedTables(request) ??
+        request.trusted.schema.tables.map((table) => table.name),
+    );
+    const tables = request.trusted.schema.tables.filter((table) =>
+      installed.has(table.name),
+    );
+    for (const table of tables)
       tableColumns.set(
         table.name,
         table.columns.map((column) => column.name),
       );
     if (request.queryCapacityBytes !== undefined || request.changeStream)
       overlay = new OverlayEngine(
-        request.trusted.schema.tables.map((schema) => {
+        tables.map((schema) => {
           const table = opened.table(schema.name);
           const columns = schema.columns.map((column) => column.name);
           return {
@@ -470,10 +492,7 @@ async function handle(request: LiveRequest): Promise<WorkerResponse> {
       };
     }
     const tableRows = Object.fromEntries(
-      request.trusted.schema.tables.map((table) => [
-        table.name,
-        opened.table(table.name).rows,
-      ]),
+      tables.map((table) => [table.name, opened.table(table.name).rows]),
     );
     return {
       id: request.id,

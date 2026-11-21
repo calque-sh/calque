@@ -137,6 +137,38 @@ function plan(): Record<string, unknown> {
   };
 }
 
+const EXTRA_TABLE_ID = "table:0000:g18";
+
+/** `value` with a second table, `audits`, which no generated collection reads. */
+function withExtraTable(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  const runtime = firstRuntime(value) as {
+    tables: Record<string, unknown>[];
+    schema: { tables: Record<string, unknown>[] };
+  };
+  runtime.tables.push({
+    tableId: EXTRA_TABLE_ID,
+    sourceSchema: "public",
+    sourceTable: "audits",
+    localTable: "audits",
+    schemaHash: `sha256:${"7".repeat(64)}`,
+    columnProfileHash: `sha256:${"8".repeat(64)}`,
+    rowCount: 2,
+    primaryKeyCodec: "pk-v1/protobuf",
+    columns: [{ columnId: 1, name: "id" }],
+  });
+  runtime.schema.tables.push({
+    name: "audits",
+    primaryKey: ["id"],
+    columns: [{ name: "id", type: "int64", nullable: false }],
+  });
+  const artifact = (value.artifacts as Record<string, unknown>[])[0];
+  if (!artifact) throw new Error("fixture artifact missing");
+  artifact.tables = ["public.events", EXTRA_TABLE_ID];
+  return value;
+}
+
 function firstRuntime(value: Record<string, unknown>): Record<string, unknown> {
   const artifact = (value.artifacts as Record<string, unknown>[])[0];
   if (!artifact) throw new Error("fixture artifact missing");
@@ -201,30 +233,98 @@ describe("verifyColumnarBootstrapPlan", () => {
     if (!otherTable) throw new Error("fixture table missing");
     otherTable.sourceSchema = "audit";
     expect(() => verifyColumnarBootstrapPlan(schema, otherRelation)).toThrow(
-      "the generated bindings do not match what the server serves: the server does not serve public.events, and no generated collection reads audit.events; this page was built from an older configuration, so load a build generated from the calque.config.json the server runs",
+      "the generated bindings do not match what the server serves: the server does not serve public.events; this page was built from an older configuration, so load a build generated from the calque.config.json the server runs",
     );
-    // A plan serving a relation no collection names is refused too.
-    const extra = structuredClone(hashed);
-    const extraRuntime = firstRuntime(extra) as {
-      tables: Record<string, unknown>[];
-      schema: { tables: Record<string, unknown>[] };
-    };
-    const extraTable = structuredClone(extraRuntime.tables[0]);
-    if (!extraTable) throw new Error("fixture table missing");
-    extraTable.tableId = "table:0000:g18";
-    extraTable.sourceTable = "audits";
-    extraTable.localTable = "audits";
-    extraRuntime.tables.push(extraTable);
-    const extraSchema = structuredClone(extraRuntime.schema.tables[0]);
-    if (!extraSchema) throw new Error("fixture schema table missing");
-    extraSchema.name = "audits";
-    extraRuntime.schema.tables.push(extraSchema);
-    const extraArtifact = (extra.artifacts as Record<string, unknown>[])[0];
-    if (!extraArtifact) throw new Error("fixture artifact missing");
-    extraArtifact.tables = [wire, "table:0000:g18"];
-    expect(() => verifyColumnarBootstrapPlan(schema, extra)).toThrow(
-      /: no generated collection reads public\.audits; this page was built from an older configuration/u,
-    );
+  });
+
+  describe("a plan whose artifact serves more tables than the bindings read", () => {
+    const wide = (): Record<string, unknown> => withExtraTable(plan());
+
+    it("binds the generated collections and lists the other served tables as ignored", () => {
+      const bound = bindColumnarPlan(
+        descriptor.collections,
+        parseBootstrapPlan(wide()),
+      );
+      expect(bound.contract.tables.map(({ collection }) => collection)).toEqual(
+        ["events"],
+      );
+      expect(bound.contract.ignoredTableIds).toEqual([EXTRA_TABLE_ID]);
+      expect(bound.artifact.tables).toEqual(["public.events", EXTRA_TABLE_ID]);
+      expect(bound.trusted.schema.tables.map(({ name }) => name)).toEqual([
+        "events",
+        "audits",
+      ]);
+    });
+
+    it("asks no wire column ids of an ignored table", () => {
+      const value = wide();
+      const runtime = firstRuntime(value) as {
+        tables: Record<string, unknown>[];
+      };
+      delete runtime.tables[1]?.columns;
+      expect(() => verifyColumnarBootstrapPlan(schema, value)).not.toThrow();
+    });
+
+    it("takes enum labels from the bound tables only", () => {
+      const value = wide();
+      const runtime = firstRuntime(value) as {
+        tables: { columns?: Record<string, unknown>[] }[];
+      };
+      const ignored = runtime.tables[1]?.columns?.[0];
+      if (!ignored) throw new Error("fixture column missing");
+      ignored.enumLabels = ["a", "b"];
+      expect(
+        bindColumnarPlan(descriptor.collections, parseBootstrapPlan(value))
+          .enumLabels,
+      ).toEqual([]);
+    });
+
+    it("still refuses a bound table that drifted while another table is ignored", () => {
+      const value = wide();
+      const runtime = firstRuntime(value) as {
+        schema: { tables: { columns: { type: string }[] }[] };
+      };
+      const level = runtime.schema.tables[0]?.columns[1];
+      if (!level) throw new Error("fixture column missing");
+      level.type = "f64";
+      expect(() => verifyColumnarBootstrapPlan(schema, value)).toThrow(
+        /: events\.level is served as f64, not text; this page was built/u,
+      );
+    });
+
+    it("refuses a plan that requires a table the bindings do not read", () => {
+      const value = wide();
+      value.requiredTables = ["public.events", EXTRA_TABLE_ID];
+      expect(() => verifyColumnarBootstrapPlan(schema, value)).toThrow(
+        /does not match the generated collections/u,
+      );
+    });
+
+    it("refuses a plan that serves one relation twice", () => {
+      const value = wide();
+      const runtime = firstRuntime(value) as {
+        tables: Record<string, unknown>[];
+      };
+      const second = runtime.tables[1];
+      if (!second) throw new Error("fixture table missing");
+      second.sourceTable = "events";
+      expect(() => verifyColumnarBootstrapPlan(schema, value)).toThrow(
+        /serves one relation twice/u,
+      );
+    });
+
+    it("refuses a plan that serves an ignored table beside no generated relation", () => {
+      const value = wide();
+      const runtime = firstRuntime(value) as {
+        tables: Record<string, unknown>[];
+      };
+      const first = runtime.tables[0];
+      if (!first) throw new Error("fixture table missing");
+      first.sourceTable = "renamed";
+      expect(() => verifyColumnarBootstrapPlan(schema, value)).toThrow(
+        /: the server does not serve public\.events; this page was built/u,
+      );
+    });
   });
 
   it("refuses a plan that does not parse under the protocol", () => {
@@ -526,5 +626,56 @@ describe("a renewal plan", () => {
     expect(() =>
       checkRenewal(held, parseBootstrapPlan(value), "cursor-q"),
     ).toThrow(refusal);
+  });
+});
+
+describe("a renewal of a plan whose artifact serves more tables than the page reads", () => {
+  const widePlan = (): Record<string, unknown> => withExtraTable(plan());
+  const held = renewablePlan(parseBootstrapPlan(widePlan()));
+  const renewal = (resident: string[]): Record<string, unknown> => {
+    const value = widePlan();
+    value.planId = "plan-2";
+    value.residentTables = resident;
+    value.residentCursor = "cursor-q";
+    value.activationCursor = "cursor-q";
+    value.artifacts = [];
+    Object.assign(value.changeStream as Record<string, unknown>, {
+      fromCursorExclusive: "cursor-q",
+      throughCursorInclusive: "cursor-q",
+    });
+    return value;
+  };
+
+  it("holds every served table as resident and the page's tables as required", () => {
+    expect(held.tableIds).toEqual(["public.events", EXTRA_TABLE_ID]);
+    expect(held.requiredTableIds).toEqual(["public.events"]);
+  });
+
+  it("keeps the change stream's table set: the renewal presents every served table", () => {
+    expect(() =>
+      checkRenewal(
+        held,
+        parseBootstrapPlan(renewal(["public.events", EXTRA_TABLE_ID])),
+        "cursor-q",
+      ),
+    ).not.toThrow();
+  });
+
+  it("is refused when it holds only the tables the page reads", () => {
+    expect(() =>
+      checkRenewal(
+        held,
+        parseBootstrapPlan(renewal(["public.events"])),
+        "cursor-q",
+      ),
+    ).toThrow(/keep the tables/u);
+  });
+
+  it("is refused when it requires a table the page did not ask for", () => {
+    const value = renewal(["public.events", EXTRA_TABLE_ID]);
+    value.requiredTables = ["public.events", EXTRA_TABLE_ID];
+    expect(() =>
+      checkRenewal(held, parseBootstrapPlan(value), "cursor-q"),
+    ).toThrow(/keep the tables/u);
   });
 });

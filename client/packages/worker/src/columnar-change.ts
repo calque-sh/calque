@@ -63,6 +63,13 @@ export interface ColumnarChangeContract {
   readonly generation: ExpectedSourceGeneration;
   readonly tables: readonly ColumnarChangeTableBinding[];
   /**
+   * The wire ids of tables the stream carries and the mount does not read.
+   * The server names every table of the artifact in each request, so the
+   * stream's table set is `tables` and these; an operation on one of them is
+   * dropped, and a mutation naming one is refused.
+   */
+  readonly ignoredTableIds?: readonly string[];
+  /**
    * The authorization authority's Ed25519 key for revocation barriers. It must
    * come from the application's configuration, never from the plan: a key the
    * change server chose would let that server mint the revocations it
@@ -92,8 +99,10 @@ interface CompiledTable {
 export interface CompiledColumnarChangeBinding {
   readonly planId: string;
   readonly generation: ExpectedSourceGeneration;
+  /** Every table the stream names, bound or ignored, sorted. */
   readonly tableIds: readonly string[];
   readonly byTableId: ReadonlyMap<string, CompiledTable>;
+  readonly ignoredTableIds: ReadonlySet<string>;
   readonly revocationBarrierKey?: RevocationBarrierVerificationKey;
 }
 
@@ -152,10 +161,16 @@ export function compileColumnarChangeBinding(
 ): CompiledColumnarChangeBinding {
   if (contract.planId.length === 0) invalid("change contract has no plan id");
   if (contract.tables.length === 0) invalid("change contract binds no tables");
+  const ignored = new Set<string>();
+  for (const tableId of contract.ignoredTableIds ?? []) {
+    if (ignored.has(tableId))
+      invalid(`change contract ignores ${tableId} twice`);
+    ignored.add(tableId);
+  }
   const byTableId = new Map<string, CompiledTable>();
   const collections = new Set<string>();
   for (const binding of contract.tables) {
-    if (byTableId.has(binding.tableId))
+    if (byTableId.has(binding.tableId) || ignored.has(binding.tableId))
       invalid(`change contract binds ${binding.tableId} twice`);
     if (collections.has(binding.collection))
       invalid(`change contract binds collection ${binding.collection} twice`);
@@ -228,8 +243,9 @@ export function compileColumnarChangeBinding(
   return Object.freeze({
     planId: contract.planId,
     generation: contract.generation,
-    tableIds: Object.freeze([...byTableId.keys()].sort()),
+    tableIds: Object.freeze([...byTableId.keys(), ...ignored].sort()),
     byTableId,
+    ignoredTableIds: ignored,
     ...(contract.revocationBarrierKey
       ? { revocationBarrierKey: contract.revocationBarrierKey }
       : {}),
@@ -295,18 +311,24 @@ export async function decodeColumnarChangeBatch(
           fragment.commitTimeUnixMicros > latestCommitTimeUnixMicros)
       )
         latestCommitTimeUnixMicros = fragment.commitTimeUnixMicros;
-      operationCount += fragment.operations.length;
       const keys = state.primaryKeys;
-      fragment.operations.forEach((operation, index) =>
-        operations.push(decodeOperation(operation, binding, keys[index])),
-      );
+      fragment.operations.forEach((operation, index) => {
+        // An operation on an ignored table was validated by the stream state
+        // and is not the mount's to apply.
+        if (binding.ignoredTableIds.has(operation.tableId)) return;
+        operations.push(decodeOperation(operation, binding, keys[index]));
+        operationCount += 1;
+      });
       if (fragment.finalFragment) {
-        transactions.push(
-          Object.freeze({
-            operations: Object.freeze(operations),
-            mutationIds: Object.freeze([]),
-          }),
-        );
+        // The bound part of a transaction is applied whole; a transaction
+        // that touched only ignored tables leaves nothing to apply.
+        if (operations.length > 0)
+          transactions.push(
+            Object.freeze({
+              operations: Object.freeze(operations),
+              mutationIds: Object.freeze([]),
+            }),
+          );
         operations = [];
       }
     }
@@ -404,7 +426,7 @@ function expectedTableStarts(
     return binding.tableIds.map((tableId) => ({ tableId }));
   const byTableId = new Map<string, ExpectedTableStart>();
   for (const start of starts) {
-    if (!binding.byTableId.has(start.tableId))
+    if (!binding.tableIds.includes(start.tableId))
       invalid(`fence names ${start.tableId}, which the contract does not bind`);
     if (byTableId.has(start.tableId))
       invalid(`fence names ${start.tableId} twice`);

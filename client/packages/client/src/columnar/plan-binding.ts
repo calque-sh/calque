@@ -26,6 +26,9 @@ import {
  * exactly one direct-columnar artifact covering every collection, as when the
  * generated file predates the served schema, fails with `SCHEMA_MISMATCH` and
  * recovery `none`; one that contradicts itself fails with `INVALID_RESPONSE`.
+ * The artifact may serve more tables than the collections read: the engine
+ * installs only the bound tables, the change contract names the rest as
+ * ignored, and every byte of the artifact is still verified.
  *
  * Collections and plan tables meet on the source relation, `schema.table`.
  * The wire `tableId` is hashed over one source's identity and schema
@@ -93,15 +96,17 @@ function relationOf(table: PlanArtifactTable): string {
 
 /**
  * Checks the generated descriptor against the artifact the plan serves: the
- * plan must serve exactly the generated relations, each collection must map
- * to an artifact table of the same name, carry the same columns with
- * compatible kinds, and share the primary key.
+ * plan must serve every generated relation, each collection must map to an
+ * artifact table of the same name, carry the same columns with compatible
+ * kinds, and share the primary key. Tables the artifact serves beyond the
+ * generated relations are allowed. Returns the plan table each collection
+ * binds to, in the collections' order.
  */
 function checkCollections(
   collections: readonly GeneratedClientCollectionDescriptor[],
   artifact: PlanArtifact,
   runtime: PlanArtifactColumnarRuntime,
-): void {
+): readonly PlanArtifactTable[] {
   const drift = (detail: string): SyncError =>
     new SyncError(
       "SCHEMA_MISMATCH",
@@ -112,26 +117,14 @@ function checkCollections(
   const served = new Map(
     runtime.tables.map((table) => [relationOf(table), table] as const),
   );
-  const generated = collectionRelations(collections);
   if (served.size !== runtime.tables.length)
     throw invalid("the plan serves one relation twice");
-  if (!sameSet([...served.keys()], generated)) {
-    const unserved = generated.filter((relation) => !served.has(relation));
-    const ungenerated = [...served.keys()]
-      .filter((relation) => !generated.includes(relation))
-      .sort();
-    throw drift(
-      [
-        ...(unserved.length === 0
-          ? []
-          : [`the server does not serve ${unserved.join(", ")}`]),
-        ...(ungenerated.length === 0
-          ? []
-          : [`no generated collection reads ${ungenerated.join(", ")}`]),
-      ].join(", and "),
-    );
-  }
-  for (const collection of collections) {
+  const unserved = collectionRelations(collections).filter(
+    (relation) => !served.has(relation),
+  );
+  if (unserved.length > 0)
+    throw drift(`the server does not serve ${unserved.join(", ")}`);
+  return collections.map((collection) => {
     const planTable = served.get(collection.tableId);
     if (!planTable || !artifact.tables.includes(planTable.tableId))
       throw drift(`the server does not serve ${collection.tableId}`);
@@ -163,18 +156,21 @@ function checkCollections(
       throw drift(
         `${collection.id} is keyed by ${schemaTable.primaryKey.join(", ")}, not ${collection.primaryKey.join(", ")}`,
       );
-  }
+    return planTable;
+  });
 }
 
 /**
  * The change contract the plan's wire column ids compile to. Every plan names
- * a change stream, so a columnar plan whose tables carry no wire ids is one
- * the client could open but never keep current; it is refused before any byte
- * is fetched rather than opened frozen.
+ * a change stream, so a columnar plan whose bound tables carry no wire ids is
+ * one the client could open but never keep current; it is refused before any
+ * byte is fetched rather than opened frozen. The stream names every table the
+ * artifact serves, so the tables no collection reads are listed as ignored.
  */
 function changeContract(
   plan: BootstrapPlan,
   runtime: PlanArtifactColumnarRuntime,
+  bound: readonly PlanArtifactTable[],
 ): ColumnarChangeContract {
   return {
     planId: plan.planId,
@@ -185,7 +181,10 @@ function changeContract(
       authorizationGeneration: BigInt(plan.source.authorizationGeneration),
       authorizationScopeHash: hashIdBytes(plan.authorization.scopeHash),
     },
-    tables: runtime.tables.map((table) => {
+    ignoredTableIds: runtime.tables
+      .filter((table) => !bound.includes(table))
+      .map((table) => table.tableId),
+    tables: bound.map((table) => {
       const columns = table.columns;
       if (columns === undefined)
         throw invalid(
@@ -215,7 +214,7 @@ function changeContract(
 /**
  * The source relations the generated collections require, `schema.table`
  * each, sorted: what the session asks the server for, and what the binding
- * requires the plan to serve exactly.
+ * requires the plan to serve and name as required.
  */
 export function collectionRelations(
   collections: readonly GeneratedClientCollectionDescriptor[],
@@ -242,16 +241,16 @@ export function bindColumnarPlan(
   const runtime = artifact.runtime;
   // The parser requires every required table to be covered, the resident
   // set is empty, and this is the only artifact; `checkCollections` adds
-  // that the tables it carries are exactly the generated relations.
-  checkCollections(collections, artifact, runtime);
-  // ...and `requiredTables` adds that the server said so. An artifact that
-  // happens to carry a table the plan did not require is no promise to keep
-  // that table whole, so a plan that under- or over-states the generated set
-  // is refused before any byte is fetched.
+  // that it serves every generated relation.
+  const bound = checkCollections(collections, artifact, runtime);
+  // ...and `requiredTables` adds that the server said so: a plan that under-
+  // or over-states what the page asked for is refused before any byte is
+  // fetched. The artifact may carry tables beyond them; the engine ignores
+  // those.
   if (
     !sameSet(
       plan.requiredTables,
-      runtime.tables.map((table) => table.tableId),
+      bound.map((table) => table.tableId),
     )
   )
     throw invalid(
@@ -276,8 +275,8 @@ export function bindColumnarPlan(
   return Object.freeze({
     artifact,
     trusted,
-    contract: changeContract(plan, runtime),
-    enumLabels: runtime.tables.flatMap((table) =>
+    contract: changeContract(plan, runtime, bound),
+    enumLabels: bound.flatMap((table) =>
       (table.columns ?? []).flatMap(({ name, enumLabels }) =>
         enumLabels === undefined
           ? []
@@ -297,15 +296,24 @@ export function bindColumnarPlan(
 export interface RenewablePlan {
   readonly source: BootstrapPlan["source"];
   readonly scopeHash: string;
-  /** The wire ids of the tables the mount holds. */
+  /**
+   * The wire ids of the tables the mount holds, which the change stream
+   * names: every table the artifact served.
+   */
   readonly tableIds: readonly string[];
+  /** The wire ids of the tables the page asked for. */
+  readonly requiredTableIds: readonly string[];
 }
 
 export function renewablePlan(plan: BootstrapPlan): RenewablePlan {
   return Object.freeze({
     source: plan.source,
     scopeHash: plan.authorization.scopeHash,
-    tableIds: Object.freeze([...plan.requiredTables]),
+    tableIds: Object.freeze([
+      ...plan.residentTables,
+      ...plan.artifacts.flatMap((artifact) => artifact.tables),
+    ]),
+    requiredTableIds: Object.freeze([...plan.requiredTables]),
   });
 }
 
@@ -333,7 +341,7 @@ export function checkRenewal(
   )
     throw invalid("a renewal plan must keep the source and scope it renews");
   if (
-    !sameSet(plan.requiredTables, held.tableIds) ||
+    !sameSet(plan.requiredTables, held.requiredTableIds) ||
     !sameSet(plan.residentTables, held.tableIds)
   )
     throw invalid("a renewal plan must keep the tables it renews");

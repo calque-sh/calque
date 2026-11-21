@@ -45,6 +45,10 @@ export const PINNED_BINDINGS: readonly PinnedBindings[] = Object.freeze([
     config: "tests/fixtures/config/serve-tenants.config.json",
     output: "client/packages/client/tests/serve-tenants/calque.generated.ts",
   },
+  {
+    config: "tests/fixtures/config/serve-narrow.config.json",
+    output: "client/packages/client/tests/serve-narrow/calque.generated.ts",
+  },
   // Rendered from what the README's self-host walk writes, so the committed
   // files are the walk's output (`pnpm quickstart:e2e` checks it).
   {

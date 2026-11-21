@@ -2567,19 +2567,32 @@ export interface ArtifactReceiver {
  * digest matches the plan, and once the schema matches its hash the receiver
  * interprets the header and then each table as the chunks held from the first
  * one on cover them. The plan binds every byte, so interpreting early reads
- * only what the server published.
+ * only what the server published. With `tables`, only those tables are
+ * interpreted: every chunk is still verified, but the others' columns are
+ * never read, indexed or counted against the capacity, and `table` refuses
+ * them.
  */
 export function receiveDirectColumnarArtifact(
   trusted: TrustedArtifact,
   capacity?: ArtifactCapacity,
+  tables?: readonly string[],
 ): ArtifactReceiver {
   const binding = bindTrusted(trusted, trusted.byteLength, capacity);
+  const wanted = tables === undefined ? undefined : new Set(tables);
+  if (
+    wanted &&
+    (wanted.size !== tables?.length ||
+      [...wanted].some(
+        (name) => !binding.schema.tables.some((table) => table.name === name),
+      ))
+  )
+    throw new Error("the tables to read are not the artifact's tables");
   const chunks = trusted.chunks;
   if (chunks === undefined)
     throw new Error("the trusted artifact names no chunk digests");
   const owned = new ArrayBuffer(trusted.byteLength);
   const bytes = new Uint8Array(owned);
-  const interpretation = interpret(owned, binding);
+  const interpretation = interpret(owned, binding, wanted);
   const accepted = new Uint8Array(chunks.sha256.length);
   let missing = chunks.sha256.length;
   /** How many chunks, from the first one on, are all held. */
@@ -2657,6 +2670,7 @@ export function receiveDirectColumnarArtifact(
 function interpret(
   owned: ArrayBuffer,
   binding: ArtifactBinding,
+  wanted?: ReadonlySet<string>,
 ): {
   advance(verified: number): void;
   finish(): DirectColumnarWorkspace;
@@ -2705,7 +2719,11 @@ function interpret(
     if (binding.capacity !== undefined) {
       const required =
         binding.capacity.requiredBytes +
-        keyIndexBytes(parsed.tables.map((table) => table.rows));
+        keyIndexBytes(
+          parsed.tables
+            .filter((table) => !wanted || wanted.has(table.name))
+            .map((table) => table.rows),
+        );
       if (required > binding.capacity.capacityBytes)
         throw new CapacityError(required, binding.capacity.capacityBytes);
     }
@@ -2857,6 +2875,11 @@ function interpret(
       if (!current) return;
       while (next < current.tables.length) {
         const state = (building ??= startTable(current, next));
+        if (wanted && !wanted.has(state.table.name)) {
+          building = undefined;
+          next += 1;
+          continue;
+        }
         while (state.read < state.table.columns.length) {
           const column = state.table.columns[state.read];
           if (column && columnEnd(column) > verified) return;

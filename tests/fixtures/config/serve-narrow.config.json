@@ -1,0 +1,69 @@
+{
+  "application": {
+    "id": "narrow",
+    "version": "0.1.0"
+  },
+  "protocol": {
+    "manifest": 1,
+    "artifact": 1,
+    "changeStream": 1,
+    "mutation": 1
+  },
+  "sources": [
+    {
+      "id": "local",
+      "databaseUrlEnv": "CALQUE_DATABASE_URL",
+      "publication": "calque_demo",
+      "slot": "calque_demo_slot"
+    }
+  ],
+  "scopes": [
+    {
+      "id": "all",
+      "source": "local",
+      "kind": "source-wide",
+      "dataVersion": 1
+    }
+  ],
+  "collections": [
+    {
+      "id": "projects",
+      "source": "local",
+      "kind": "table",
+      "relation": {
+        "schema": "public",
+        "table": "projects"
+      },
+      "columns": [
+        {
+          "name": "id",
+          "postgresType": "int8",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "postgresType": "text",
+          "nullable": false
+        },
+        {
+          "name": "status",
+          "postgresType": "text",
+          "nullable": false
+        }
+      ],
+      "primaryKey": ["id"],
+      "scope": "all",
+      "adapter": "direct-columnar",
+      "encoding": "calque-columnar"
+    }
+  ],
+  "commands": [
+    {
+      "id": "edit-projects",
+      "kind": "crud",
+      "collection": "projects",
+      "operations": ["insert", "update", "delete"],
+      "writableColumns": ["name", "status"]
+    }
+  ]
+}

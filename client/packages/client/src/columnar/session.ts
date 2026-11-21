@@ -2000,7 +2000,9 @@ export class ColumnarSession {
     // as the change stream's module has loaded, so that its round trip
     // overlaps the open. Nothing is read from it before the mount opened.
     const snapshotCursor = encoder.encode(artifact.snapshotCursor);
-    const tableIds = contract.tables.map((table) => table.tableId);
+    // The change stream names every table the artifact serves, those the
+    // page reads and those it ignores.
+    const tableIds = artifact.tables;
     const changeRequest: ColumnarLiveRequestOptions = {
       endpoint: plan.changeStream.endpoint,
       planId: plan.planId,

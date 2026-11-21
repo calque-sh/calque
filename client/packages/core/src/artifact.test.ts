@@ -1526,6 +1526,96 @@ describe("browser direct-columnar artifact", () => {
     expect(everyValue(await reordered.open())).toEqual(everyValue(workspace));
   });
 
+  test("interprets only the tables it is asked for, verifies every chunk, and refuses the others", async () => {
+    const encoded = fixture();
+    const binding = chunked(encoded.bytes, 96);
+    const chunks = hashedChunks(encoded.bytes, 96);
+    const received = async (tables: readonly string[]) => {
+      const receiver = receiveDirectColumnarArtifact(
+        binding,
+        undefined,
+        tables,
+      );
+      for (const chunk of chunks)
+        receiver.accept(chunk.index, chunk.bytes, chunk.sha256);
+      return receiver.open();
+    };
+    const whole = await received(
+      WORKSPACE_CONTRACT.tables.map(({ name }) => name),
+    );
+    const narrow = await received(["events", "issues"]);
+    expect(narrow.rowCount).toBe(2);
+    expect(narrow.artifactByteLength).toBe(encoded.byteLength);
+    const rowsOf = (workspace: DirectColumnarWorkspace, name: string) => {
+      const table = workspace.table(name);
+      const columns = WORKSPACE_CONTRACT.tables.find(
+        (candidate) => candidate.name === name,
+      )?.columns;
+      return Array.from({ length: table.rows }, (_, row) =>
+        columns?.map((column) => table.column(column.name).valueAt(row)),
+      );
+    };
+    for (const name of ["events", "issues"])
+      expect(rowsOf(narrow, name)).toEqual(rowsOf(whole, name));
+    const skipped = WORKSPACE_CONTRACT.tables.find(
+      ({ name }) => name !== "events" && name !== "issues",
+    )?.name;
+    if (!skipped) throw new Error("the fixture has no third table");
+    expect(() => narrow.table(skipped)).toThrow("unknown table");
+
+    // A byte of a skipped table is still verified.
+    const skippedChunk = chunks.at(-1);
+    if (!skippedChunk) throw new Error("the fixture has no chunk");
+    const tampered = Uint8Array.from(encoded.bytes);
+    tampered[encoded.byteLength - 1] =
+      (tampered[encoded.byteLength - 1] ?? 0) ^ 0x01;
+    const receiver = receiveDirectColumnarArtifact(binding, undefined, [
+      "events",
+    ]);
+    for (const chunk of hashedChunks(tampered, 96)) {
+      if (chunk.index === skippedChunk.index)
+        expect(() => {
+          receiver.accept(chunk.index, chunk.bytes, chunk.sha256);
+        }).toThrow("artifact digest binding mismatch");
+      else receiver.accept(chunk.index, chunk.bytes, chunk.sha256);
+    }
+    await expect(receiver.open()).rejects.toThrow(
+      "artifact digest binding mismatch",
+    );
+
+    expect(() =>
+      receiveDirectColumnarArtifact(binding, undefined, ["nope"]),
+    ).toThrow("not the artifact's tables");
+    expect(() =>
+      receiveDirectColumnarArtifact(binding, undefined, ["events", "events"]),
+    ).toThrow("not the artifact's tables");
+  });
+
+  test("does not count the key indexes of the tables it skips against the capacity", async () => {
+    const encoded = fixture();
+    // Seven one-row tables hold 60 key-index bytes; two hold 20.
+    const capacity = (extra: number) => ({
+      capacityBytes: encoded.byteLength + extra,
+      residentBytes: 0,
+      standbyBytes: 0,
+      safetyBytes: 0,
+    });
+    const open = async (tables: readonly string[], extra: number) => {
+      const receiver = receiveDirectColumnarArtifact(
+        chunked(encoded.bytes, 96),
+        capacity(extra),
+        tables,
+      );
+      for (const chunk of hashedChunks(encoded.bytes, 96))
+        receiver.accept(chunk.index, chunk.bytes, chunk.sha256);
+      return receiver.open();
+    };
+    await expect(open(["events", "issues"], 19)).rejects.toBeInstanceOf(
+      CapacityError,
+    );
+    expect((await open(["events", "issues"], 2 * 2 * 4 + 4)).rowCount).toBe(2);
+  });
+
   test("interprets each table while the rest downloads, once the chunks from the first one on cover it, and its key index once they cover its key columns", async () => {
     const encoded = fixture();
     const binding = chunked(encoded.bytes, 96);

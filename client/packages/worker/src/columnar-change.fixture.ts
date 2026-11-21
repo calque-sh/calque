@@ -24,6 +24,10 @@ export async function changeBatch(
 ): Promise<Uint8Array> {
   const cursor = (token: string) =>
     create(change.CursorSchema, { token: text.encode(token) });
+  const tableIds = [
+    ...contract.tables.map((table) => table.tableId),
+    ...(contract.ignoredTableIds ?? []),
+  ].sort();
   const frames = [
     create(change.ChangeStreamFrameSchema, {
       protocolVersion: 1,
@@ -35,12 +39,10 @@ export async function changeBatch(
             contract.generation,
           ),
           fromCursorExclusive: cursor(from),
-          tableIds: contract.tables.map((table) => table.tableId).sort(),
+          tableIds,
           serverTimeUnixMicros: 1n,
           planId: contract.planId,
-          tableStarts: contract.tables
-            .map((table) => ({ tableId: table.tableId }))
-            .sort((left, right) => left.tableId.localeCompare(right.tableId)),
+          tableStarts: tableIds.map((tableId) => ({ tableId })),
           streamId: text.encode(`stream-${contract.planId}`),
         }),
       },

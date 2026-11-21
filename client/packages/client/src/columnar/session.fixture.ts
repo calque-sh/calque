@@ -579,6 +579,19 @@ export const descriptor: GeneratedClientSchemaDescriptor = {
   ],
 };
 
+/** Bindings that read `events` alone, though the fixture server serves `issues` too. */
+export const narrowSchema = createGeneratedClientSchema<Collections>({
+  collections: descriptor.collections.slice(0, 1),
+});
+
+/** `value` as the server answers a page that asked for `events` alone. */
+export function narrowed(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  value.requiredTables = ["public.events"];
+  return value;
+}
+
 export const ARTIFACT_BYTES = 16;
 /** The one digest a plan names for an artifact under 4 MiB. */
 export const CHUNK_DIGEST = `sha256:${"5".repeat(64)}`;

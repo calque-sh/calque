@@ -198,7 +198,10 @@ without a rendered connection, the first call returns `refresh()` too.
 `requiredTables` are the generated collections' source relations, as
 `schema.table`. The bindings' renderer exports them from
 `calque.start.generated.ts`, beside the bindings, a module that imports
-nothing. The first client the page creates adopts the started request,
+nothing. A page may name fewer tables than its server
+serves: the client reads the tables its bindings name and ignores the rest,
+including their changes. A table the bindings name that the server does not
+serve is still refused with `SCHEMA_MISMATCH`. The first client the page creates adopts the started request,
 on its first activation, only if it would have sent the same request itself:
 the same endpoint, the bearer its own `auth()` returns, the same tables,
 memory budget and heap reserve, and the same `deviceId` if it was created
