@@ -163,16 +163,29 @@ export class ByteStringTable {
     return this.#size;
   }
 
-  /** The number of `bytes[start..end)`, added when absent. */
-  add(bytes: Uint8Array, start: number, end: number): number {
-    const hash = hashRange(bytes, start, end);
+  /** The number of `bytes[start..end)`, or -1 when absent. */
+  find(bytes: Uint8Array, start: number, end: number): number {
+    const located = this.#locate(
+      bytes,
+      start,
+      end,
+      hashRange(bytes, start, end),
+    );
+    return located >= 0 ? located : -1;
+  }
+
+  /**
+   * The key of `bytes[start..end)` when present, else `-(slot + 1)` for the
+   * empty slot it would take.
+   */
+  #locate(bytes: Uint8Array, start: number, end: number, hash: number): number {
     const length = end - start;
     const slots = this.#slots;
     const mask = slots.length - 1;
     let slot = hash & mask;
     for (;;) {
       const entry = slots[slot] ?? 0;
-      if (entry === 0) break;
+      if (entry === 0) return -(slot + 1);
       const key = entry - 1;
       if (this.#hashes[key] === hash) {
         const from = key === 0 ? 0 : (this.#ends[key - 1] ?? 0);
@@ -186,6 +199,15 @@ export class ByteStringTable {
       }
       slot = (slot + 1) & mask;
     }
+  }
+
+  /** The number of `bytes[start..end)`, added when absent. */
+  add(bytes: Uint8Array, start: number, end: number): number {
+    const hash = hashRange(bytes, start, end);
+    const length = end - start;
+    const located = this.#locate(bytes, start, end, hash);
+    if (located >= 0) return located;
+    const slot = -located - 1;
     const key = this.#size;
     const from = key === 0 ? 0 : (this.#ends[key - 1] ?? 0);
     if (from + length > this.#data.length) {
@@ -207,8 +229,9 @@ export class ByteStringTable {
     this.#ends[key] = from + length;
     this.#hashes[key] = hash;
     this.#size = key + 1;
-    slots[slot] = key + 1;
-    if (this.#size * 2 > slots.length) this.#rehash(slots.length * 2);
+    this.#slots[slot] = key + 1;
+    if (this.#size * 2 > this.#slots.length)
+      this.#rehash(this.#slots.length * 2);
     return key;
   }
 

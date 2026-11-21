@@ -8,6 +8,7 @@ import {
 import { ByteKeyTable, ByteStringTable, GroupKeyTable } from "./query-keys.js";
 import {
   snapshotOverlayForQuery,
+  type OverlayEncodedIn,
   type OverlayEngine,
   type OverlayQuerySnapshot,
   type OverlayQueryValue,
@@ -35,7 +36,16 @@ function intrinsic(value: unknown): (...args: never[]) => unknown {
   return value as (...args: never[]) => unknown;
 }
 
+/**
+ * The canonical specification, apart from the values of in-list predicates.
+ * Those have their own caps below, so a list of thousands of keys does not
+ * crowd out the rest of the query.
+ */
 export const MAX_QUERY_SPEC_BYTES = 64 * 1024;
+/** Values across every in-list predicate of one specification. */
+export const MAX_QUERY_LIST_VALUES = 50_000;
+/** Canonical bytes of the values of every in-list predicate of one specification. */
+export const MAX_QUERY_LIST_BYTES = 4 * 1024 * 1024;
 export const MAX_QUERY_RESULT_ROWS = 10_000;
 export const MAX_QUERY_RESULT_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_QUERY_RESULT_ROWS = 1_000;
@@ -51,6 +61,11 @@ const MAX_QUERY_RESERVATIONS = 256;
 const RESERVATION_METADATA_BYTES = 512;
 /** One entry of the hash index a join builds over its right source. */
 const JOIN_INDEX_ROW_BYTES = 96;
+/**
+ * One value of an in-list: its hash set entry and key, and the encoded
+ * form of the base column the set is translated to.
+ */
+const IN_LIST_VALUE_BYTES = 128;
 
 /**
  * Execution as a generator that yields between bounded pieces of work, so a
@@ -132,6 +147,15 @@ export type QueryPredicate =
       readonly kind: "is-null";
       readonly expression: QueryExpression;
       readonly negated?: boolean;
+    }
+  | {
+      /**
+       * PostgreSQL's `field = ANY(values)`: the field equals some value. An
+       * empty list matches no row, and its `not` matches every row.
+       */
+      readonly kind: "in-list";
+      readonly field: QueryField;
+      readonly values: readonly QueryLiteral[];
     }
   | { readonly kind: "and"; readonly predicates: readonly QueryPredicate[] }
   | { readonly kind: "or"; readonly predicates: readonly QueryPredicate[] }
@@ -226,6 +250,20 @@ interface NormalizedQueryOptions {
 interface ValidationState {
   predicateNodes: number;
   readonly ancestors: Set<object>;
+  /** The value lists of the in-list predicates met so far. */
+  readonly lists: (readonly QueryLiteral[])[];
+  listValues: number;
+  listBytes: number;
+}
+
+function newValidationState(): ValidationState {
+  return {
+    predicateNodes: 0,
+    ancestors: new Set(),
+    lists: [],
+    listValues: 0,
+    listBytes: 0,
+  };
 }
 
 function invalid(message: string): never {
@@ -328,13 +366,19 @@ function dataArray(
  * read internal slots, so a proxy or look-alike is rejected here rather than at
  * a later read.
  */
-function validateBytes(value: unknown): Uint8Array {
+function validateBytes(value: unknown, state?: ValidationState): Uint8Array {
   try {
     if (
       Reflect.apply(TYPED_ARRAY_TAG, value, []) !== "Uint8Array" ||
       !Number.isSafeInteger(Reflect.apply(TYPED_ARRAY_BYTE_LENGTH, value, []))
     )
       invalid("query literal must be a Uint8Array or a JSON scalar");
+    // Before the copy below, so a list of huge values allocates none of them.
+    if (state)
+      chargeListBytes(
+        state,
+        2 * (Reflect.apply(TYPED_ARRAY_BYTE_LENGTH, value, []) as number),
+      );
   } catch (error) {
     if (error instanceof QueryError) throw error;
     invalid("query literal must be a Uint8Array or a JSON scalar");
@@ -345,16 +389,31 @@ function validateBytes(value: unknown): Uint8Array {
   return new Uint8Array(value as Uint8Array);
 }
 
-function validateLiteral(value: unknown): QueryLiteral {
+function validateLiteral(
+  value: unknown,
+  state?: ValidationState,
+): QueryLiteral {
   if (
     value === null ||
     typeof value === "boolean" ||
     typeof value === "number" ||
     typeof value === "bigint" ||
     typeof value === "string"
-  )
+  ) {
+    // The least a value adds to the canonical text: a string is at least its
+    // code units, and any other scalar a byte.
+    if (state)
+      chargeListBytes(state, typeof value === "string" ? value.length : 1);
     return value;
-  return validateBytes(value);
+  }
+  return validateBytes(value, state);
+}
+
+/** Counts `bytes` against the lists' budget, refusing past it. */
+function chargeListBytes(state: ValidationState, bytes: number): void {
+  state.listBytes += bytes;
+  if (state.listBytes > MAX_QUERY_LIST_BYTES)
+    invalid(`in-list values exceed ${MAX_QUERY_LIST_BYTES} bytes`);
 }
 
 function validateField(
@@ -409,6 +468,8 @@ function validatePredicate(
       "negated",
       "predicates",
       "predicate",
+      "field",
+      "values",
     ],
     "predicate",
     state,
@@ -451,6 +512,33 @@ function validatePredicate(
         state,
       ),
       ...(raw.negated === undefined ? {} : { negated: raw.negated }),
+    });
+  }
+  if (raw.kind === "in-list") {
+    if (Object.keys(raw).length !== 3) invalid("in-list predicate is invalid");
+    const field = validateField(raw.field, "predicate.field", state);
+    const raws = dataArray(
+      raw.values,
+      MAX_QUERY_LIST_VALUES,
+      "predicate.values",
+    );
+    state.listValues += raws.length;
+    if (state.listValues > MAX_QUERY_LIST_VALUES)
+      invalid(`in-list values exceed ${MAX_QUERY_LIST_VALUES}`);
+    const values = raws.map((item) => {
+      // A comparison with NULL is never true, so the value could only be a
+      // mistake for a NULL test.
+      if (item === null)
+        invalid(
+          "in-list value must not be null; test for NULL with is-null (isNull or isNotNull)",
+        );
+      return validateLiteral(item, state);
+    });
+    state.lists.push(values);
+    return Object.freeze({
+      kind: "in-list",
+      field,
+      values: Object.freeze(values),
     });
   }
   if (raw.kind === "and" || raw.kind === "or") {
@@ -581,10 +669,18 @@ function canonicalized(input: unknown): {
   readonly specification: ValidatedQuerySpecification;
   readonly canonical: string;
 } {
-  const state: ValidationState = { predicateNodes: 0, ancestors: new Set() };
+  const state = newValidationState();
   const specification = validateQueryInternal(input, state);
   const canonical = canonicalQuery(specification);
-  if (encoder.encode(canonical).byteLength > MAX_QUERY_SPEC_BYTES)
+  // The lists' values are measured as they sit in the canonical text.
+  let listBytes = 0;
+  for (const values of state.lists)
+    listBytes += encoder.encode(
+      JSON.stringify(values, canonicalValue),
+    ).byteLength;
+  if (listBytes > MAX_QUERY_LIST_BYTES)
+    invalid(`in-list values exceed ${MAX_QUERY_LIST_BYTES} bytes`);
+  if (encoder.encode(canonical).byteLength - listBytes > MAX_QUERY_SPEC_BYTES)
     invalid(`query specification exceeds ${MAX_QUERY_SPEC_BYTES} bytes`);
   return { specification, canonical };
 }
@@ -640,18 +736,20 @@ function validateQueryInternal(
   return result;
 }
 
+function canonicalValue(_key: string, value: unknown): unknown {
+  if (typeof value === "bigint") return { $bigint: String(value) };
+  if (value instanceof Uint8Array) return { $bytes: hex(value) };
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) return { $number: "nan" };
+    if (value === Number.POSITIVE_INFINITY) return { $number: "+infinity" };
+    if (value === Number.NEGATIVE_INFINITY) return { $number: "-infinity" };
+    if (Object.is(value, -0)) return { $number: "-0" };
+  }
+  return value;
+}
+
 function canonicalQuery(specification: ValidatedQuerySpecification): string {
-  return JSON.stringify(specification, (_key, value: unknown) => {
-    if (typeof value === "bigint") return { $bigint: String(value) };
-    if (value instanceof Uint8Array) return { $bytes: hex(value) };
-    if (typeof value === "number") {
-      if (Number.isNaN(value)) return { $number: "nan" };
-      if (value === Number.POSITIVE_INFINITY) return { $number: "+infinity" };
-      if (value === Number.NEGATIVE_INFINITY) return { $number: "-infinity" };
-      if (Object.is(value, -0)) return { $number: "-0" };
-    }
-    return value;
-  });
+  return JSON.stringify(specification, canonicalValue);
 }
 
 /**
@@ -764,6 +862,17 @@ type CompiledPredicate =
   | {
       readonly kind: "is-null";
       readonly expression: CompiledExpression;
+      readonly negated: boolean;
+    }
+  | {
+      readonly kind: "in-list";
+      readonly field: CompiledField;
+      readonly values: readonly QueryLiteral[];
+      readonly members: LiteralSet;
+      /**
+       * A non-null value no list value equals. A NULL value matches neither
+       * form, except under an empty list, whose negation matches every row.
+       */
       readonly negated: boolean;
     }
   | {
@@ -953,6 +1062,14 @@ function compileQuery(
         kind: "is-null",
         expression: compileExpression(predicate.expression),
         negated: (predicate.negated ?? false) !== negated,
+      };
+    if (predicate.kind === "in-list")
+      return {
+        kind: "in-list",
+        field: compileField(predicate.field),
+        values: predicate.values,
+        members: new LiteralSet(predicate.values),
+        negated,
       };
     return {
       kind: negated
@@ -1373,6 +1490,12 @@ function matchesPredicate(
       expressionValue(predicate.expression, relation, row, snapshots) === null;
     return predicate.negated ? !result : result;
   }
+  if (predicate.kind === "in-list") {
+    inspection.materializedComparisons++;
+    if (predicate.values.length === 0) return predicate.negated;
+    const value = relationValue(relation, row, predicate.field, snapshots);
+    return value !== null && predicate.members.has(value) !== predicate.negated;
+  }
   if (predicate.kind === "rank") {
     inspection.materializedComparisons++;
     const value = relationValue(relation, row, predicate.field, snapshots);
@@ -1463,6 +1586,38 @@ function encodedPredicateDecision(
     operator,
     literalExpression.value as SqlValue,
   );
+}
+
+/**
+ * The values of an in-list predicate, hashed once, that `has` tests a row
+ * against. Equality is `exactEqual`'s: types never mix, NaN equals NaN, and
+ * `-0` differs from `0`, which a `Set` would merge.
+ */
+class LiteralSet {
+  readonly #primitives = new Set<string | number | bigint | boolean>();
+  readonly #bytes = new Set<string>();
+  #zero = false;
+  #negativeZero = false;
+
+  constructor(values: readonly QueryLiteral[]) {
+    for (const value of values) {
+      if (value instanceof Uint8Array) this.#bytes.add(bytesKey(value));
+      else if (value === 0) {
+        if (Object.is(value, -0)) this.#negativeZero = true;
+        else this.#zero = true;
+      } else if (value !== null) this.#primitives.add(value);
+    }
+  }
+
+  has(value: QueryValue): boolean {
+    if (value === 0)
+      return Object.is(value, -0) ? this.#negativeZero : this.#zero;
+    if (value instanceof Uint8Array) return this.#bytes.has(bytesKey(value));
+    // A JSON value never equals a scalar.
+    return (
+      value !== null && typeof value !== "object" && this.#primitives.has(value)
+    );
+  }
 }
 
 function valueKey(value: QueryValue): string {
@@ -1707,7 +1862,8 @@ function predicateReadsOnly(
     );
   if (predicate.kind === "is-null")
     return expressionReadsOnly(predicate.expression, source);
-  if (predicate.kind === "rank") return predicate.field.source === source;
+  if (predicate.kind === "rank" || predicate.kind === "in-list")
+    return predicate.field.source === source;
   return (
     expressionReadsOnly(predicate.left, source) &&
     expressionReadsOnly(predicate.right, source)
@@ -2041,6 +2197,33 @@ function prepareRankLeaf(
   };
 }
 
+type InListNode = Extract<CompiledPredicate, { readonly kind: "in-list" }>;
+
+const ENCODED_IN = new WeakMap<InListNode, OverlayEncodedIn | null>();
+
+/**
+ * The base's encoded test of a non-empty in-list, prepared once however many
+ * of the row, block and chunk paths ask: `undefined` when the field is not the
+ * base's or its column has no encoded form that tests a set.
+ */
+function encodedIn(
+  node: InListNode,
+  snapshot: OverlayQuerySnapshot,
+): OverlayEncodedIn | undefined {
+  if (node.field.source !== 0 || node.values.length === 0) return undefined;
+  let prepared = ENCODED_IN.get(node);
+  if (prepared === undefined) {
+    prepared =
+      snapshot.prepareEncodedIn(
+        node.field.column,
+        node.values as readonly SqlValue[],
+        node.negated,
+      ) ?? null;
+    ENCODED_IN.set(node, prepared);
+  }
+  return prepared ?? undefined;
+}
+
 interface BlockPredicate {
   /** `FALSE`, `UNDECIDED` or `TRUE` per position after `evaluate`. */
   readonly out: Uint8Array;
@@ -2148,6 +2331,20 @@ function prepareBlockPredicate(
         return decided;
       };
     }
+    if (node.kind === "in-list") {
+      if (node.values.length === 0) {
+        const value = node.negated ? TRUE : FALSE;
+        return (selection, count, out) => {
+          for (let index = 0; index < count; index++)
+            out[selection[index] ?? 0] = value;
+          return count;
+        };
+      }
+      const prepared = encodedIn(node, snapshot);
+      if (!prepared) return undefined;
+      return (selection, count, out) =>
+        count - prepared.block(addresses, selection, count, out);
+    }
     let compare: ArtifactBlockCompare | undefined;
     let negated = false;
     if (node.kind === "compare") {
@@ -2196,6 +2393,18 @@ function prepareBlockPredicate(
       return root(ALL_POSITIONS, block.length, out);
     },
   };
+}
+
+/** Values across the in-list predicates of one predicate. */
+function inListValues(predicate: QueryPredicate): number {
+  if (predicate.kind === "in-list") return predicate.values.length;
+  if (predicate.kind === "not") return inListValues(predicate.predicate);
+  if (predicate.kind === "and" || predicate.kind === "or")
+    return predicate.predicates.reduce(
+      (total, child) => total + inListValues(child),
+      0,
+    );
+  return 0;
 }
 
 /**
@@ -2264,6 +2473,22 @@ function prepareEncodedPredicate(
       if (value === UNDECIDED) return undefined;
       tally.comparisons++;
       return value === TRUE;
+    };
+  }
+  if (predicate.kind === "in-list") {
+    if (predicate.values.length === 0) {
+      const constant = predicate.negated;
+      return () => {
+        tally.comparisons++;
+        return constant;
+      };
+    }
+    const prepared = encodedIn(predicate, snapshot);
+    if (!prepared) return undefined;
+    return (address) => {
+      const decision = prepared.decide(address);
+      if (decision !== undefined) tally.comparisons++;
+      return decision;
     };
   }
   let compare: EncodedDecision | undefined;
@@ -2352,6 +2577,10 @@ function predicateChunkRows(
     predicate.expression.field.source === 0
   )
     return snapshot.baseChunkRows(predicate.expression.field.column);
+  if (predicate.kind === "in-list")
+    return predicate.field.source === 0
+      ? snapshot.baseChunkRows(predicate.field.column)
+      : undefined;
   if (predicate.kind === "and" || predicate.kind === "or") {
     const sizes = predicate.predicates
       .map((child) => predicateChunkRows(child, snapshot))
@@ -2397,6 +2626,10 @@ function predicateChunkMayMatch(
   }
   // A chunk's bounds are text bounds, which say nothing of declaration order.
   if (predicate.kind === "rank") return undefined;
+  if (predicate.kind === "in-list")
+    return predicate.values.length === 0
+      ? predicate.negated
+      : encodedIn(predicate, snapshot)?.chunkMayMatch(chunk);
   if (predicate.kind === "and") {
     let unknown = false;
     for (const child of predicate.predicates) {
@@ -3743,13 +3976,24 @@ function estimateReservation(
       ),
       "query reservation",
     );
-  // The block evaluator's scratch, fixed by the predicate's shape.
-  if (specification.where)
+  // The block evaluator's scratch, fixed by the predicate's shape, and the
+  // sets its in-lists are hashed into.
+  if (specification.where) {
     total = checkedAdd(
       total,
       filterScratchBytes(specification.where),
       "query reservation",
     );
+    total = checkedAdd(
+      total,
+      checkedProduct(
+        inListValues(specification.where),
+        IN_LIST_VALUE_BYTES,
+        "in-list reservation",
+      ),
+      "query reservation",
+    );
+  }
   // Everything proportional to relation rows, for as many rows as the schema
   // bounds. A plan no fact bounds reserves none of it here; `executePlan`
   // charges it against the rows it counts.

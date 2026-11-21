@@ -161,6 +161,14 @@ function compilePredicate(
         ...(node.negated ? { negated: true } : {}),
       };
     }
+    case "in-list": {
+      const resolved = resolve(state, port, node.column);
+      return {
+        kind: "in-list",
+        field: field(resolved),
+        values: node.values.map((value) => literal(resolved, value)),
+      };
+    }
     case "and":
     case "or":
       return {

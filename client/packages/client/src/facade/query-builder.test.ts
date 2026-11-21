@@ -15,6 +15,7 @@ import {
   eq,
   gt,
   gte,
+  inList,
   isNotNull,
   isNull,
   lt,
@@ -543,6 +544,40 @@ describe("facade predicates", () => {
       not<EventRow>(or(eq("level", "warn"), lt("score", 0.3))),
       [1n],
     ],
+    [
+      "inList",
+      inList<EventRow, "level">("level", ["info", "warn", "x"]),
+      [2n, 3n],
+    ],
+    [
+      "inList with duplicates",
+      inList<EventRow, "id">("id", [4n, 4n, 1n]),
+      [1n, 4n],
+    ],
+    [
+      "inList on a nullable column",
+      inList<EventRow, "score">("score", [0.4, 0.2]),
+      [2n, 4n],
+    ],
+    [
+      "not inList leaves out the NULL row",
+      not<EventRow>(inList("score", [0.4, 0.2])),
+      [1n],
+    ],
+    ["inList of no value", inList<EventRow, "level">("level", []), []],
+    [
+      "not inList of no value keeps the NULL row",
+      not<EventRow>(inList("score", [])),
+      [1n, 2n, 3n, 4n],
+    ],
+    [
+      "inList under and and or",
+      and<EventRow>(
+        or(inList("level", ["error", "warn"]), isNull("score")),
+        not(inList("project_id", [20n])),
+      ),
+      [1n, 2n],
+    ],
     // A `bool` column holds JavaScript booleans, so the facade's literal and
     // core's SqlValue both admit one.
     [
@@ -562,6 +597,58 @@ describe("facade predicates", () => {
       expect(selected.map((row) => row.id)).toEqual(ids);
     },
   );
+
+  it("compiles inList to one node whose size grows only with its values", async () => {
+    const { runQuery, events } = fakePort();
+    const ids = Array.from({ length: 5_000 }, (_unused, index) =>
+      BigInt(index),
+    );
+    await events.query().where(inList("id", ids)).select("id").run();
+    const where = lastSpecification(runQuery).where;
+    expect(where).toMatchObject({
+      kind: "in-list",
+      field: { source: "events", column: "id" },
+    });
+    expect(where && "values" in where ? where.values : []).toHaveLength(5_000);
+    expect(() =>
+      validateQuerySpecification(lastSpecification(runQuery)),
+    ).not.toThrow();
+  });
+
+  it("copies the list, so a later change to it cannot reach the query", async () => {
+    const { runQuery, events } = fakePort();
+    const ids = [1n, 2n];
+    const predicate = inList<EventRow, "id">("id", ids);
+    ids.push(3n);
+    await events.query().where(predicate).select("id").run();
+    const where = lastSpecification(runQuery).where;
+    expect(where && "values" in where ? where.values : []).toEqual([1n, 2n]);
+  });
+
+  it("refuses a null value, a value of no scalar type and a list that is not an array", () => {
+    expect(() =>
+      inList<EventRow, "score">("score", [0.4, null as never]),
+    ).toThrow(/cannot compare with null; use isNull\(\) or isNotNull\(\)/u);
+    expect(() => inList<EventRow, "score">("score", [Number.NaN])).toThrow(
+      "finite number",
+    );
+    expect(() => inList<EventRow, "level">("level", [{} as never])).toThrow(
+      "boolean, number, bigint, string, or bytes",
+    );
+    expect(() => inList<EventRow, "level">("level", "error" as never)).toThrow(
+      "needs an array",
+    );
+    expect(() => inList<EventRow, "level">("" as never, ["a"])).toThrow(
+      "non-empty column name",
+    );
+  });
+
+  it("refuses a column the collection lacks when the query is built", () => {
+    const { events } = fakePort();
+    expect(() =>
+      events.query().where(inList<EventRow, "level">("nope" as never, ["a"])),
+    ).toThrow(/events has no column nope/u);
+  });
 
   it("refuses a null literal and names the NULL test", () => {
     for (const comparison of [eq, neq, lt, lte, gt, gte])

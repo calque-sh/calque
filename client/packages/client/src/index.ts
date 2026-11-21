@@ -19,6 +19,7 @@ export {
   eq,
   gt,
   gte,
+  inList,
   isNotNull,
   isNull,
   lt,

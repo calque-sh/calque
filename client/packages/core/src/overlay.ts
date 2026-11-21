@@ -201,6 +201,17 @@ export interface OverlayQuerySnapshot {
     literal: SqlValue,
   ): ArtifactBlockCompare | undefined;
   /**
+   * `ArtifactQueryVector.prepareIn` for the base's column, answering for
+   * the overlay: an address past the base, or a cell the overlay changed, reads
+   * `undefined` in `decide` and 1 in `block`, and a changed chunk's
+   * `chunkMayMatch` is `undefined`.
+   */
+  prepareEncodedIn(
+    column: number,
+    literals: readonly SqlValue[],
+    negated: boolean,
+  ): OverlayEncodedIn | undefined;
+  /**
    * The base's encoded cells for one column, or `undefined` when it has none
    * or the collection is truncated. They answer for an address below
    * `baseRows` unless `dirty` says the overlay changed that cell.
@@ -216,6 +227,12 @@ export interface OverlayQuerySnapshot {
   statisticsBytes(): number;
   statisticsCapacityBytes(): number;
   statisticsRowsScanned(): number;
+}
+
+export interface OverlayEncodedIn {
+  decide(address: number): boolean | undefined;
+  readonly block: ArtifactBlockCompare;
+  chunkMayMatch(chunk: number): boolean | undefined;
 }
 
 interface OverlayBaseEncoded {
@@ -834,6 +851,53 @@ export class OverlayEngine {
                 }
               }
               return undecided;
+            };
+          },
+          prepareEncodedIn: (
+            column: number,
+            literals: readonly SqlValue[],
+            negated: boolean,
+          ): OverlayEncodedIn | undefined => {
+            const prepared = BASE_QUERY_VECTORS.get(
+              target.schema.base,
+            )?.columns[column]?.prepareIn(literals, negated);
+            if (!prepared || target.truncated) return undefined;
+            const clean = dirtOf(column) === null;
+            return {
+              decide: (address: number) =>
+                address < target.schema.base.rows &&
+                !this.#baseCellDirty(target, address, column)
+                  ? prepared.compare(address)
+                  : undefined,
+              block: clean
+                ? prepared.block
+                : (addresses, selection, count, out) => {
+                    let undecided = prepared.block(
+                      addresses,
+                      selection,
+                      count,
+                      out,
+                    );
+                    for (let index = 0; index < count; index++) {
+                      const position = selection[index] ?? 0;
+                      if (
+                        out[position] !== 1 &&
+                        this.#baseCellDirty(
+                          target,
+                          addresses[position] ?? 0,
+                          column,
+                        )
+                      ) {
+                        out[position] = 1;
+                        undecided++;
+                      }
+                    }
+                    return undecided;
+                  },
+              chunkMayMatch: (chunk: number) =>
+                dirtOf(column)?.[chunk] === 1
+                  ? undefined
+                  : prepared.chunkMayMatch(chunk),
             };
           },
           baseEncoded: (column: number): OverlayBaseEncoded | undefined => {

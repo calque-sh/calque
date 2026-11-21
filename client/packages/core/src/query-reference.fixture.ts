@@ -213,6 +213,14 @@ function predicateTruth(
       expressionValue(predicate.expression, binding, sources) === null;
     return predicate.negated ? !isNull : isNull;
   }
+  if (predicate.kind === "in-list") {
+    // `column = ANY(values)`, read as the disjunction of `column = value`: an
+    // empty list is FALSE, and any other list is UNKNOWN for a NULL column.
+    if (predicate.values.length === 0) return false;
+    const value = fieldValue(predicate.field, binding, sources);
+    if (value === null) return null;
+    return predicate.values.some((candidate) => scalarEqual(value, candidate));
+  }
   const left = expressionValue(predicate.left, binding, sources);
   const right = expressionValue(predicate.right, binding, sources);
   if (left === null || right === null) return null;

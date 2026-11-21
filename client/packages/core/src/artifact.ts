@@ -4,8 +4,10 @@ import {
   packedNumberReader,
   packedOffsetAt,
 } from "./packed.js";
+import { ByteKeyTable, ByteStringTable } from "./query-keys.js";
 
-const MAGIC = new TextEncoder().encode("CALQART1");
+const textEncoder = new TextEncoder();
+const MAGIC = textEncoder.encode("CALQART1");
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const MAX_HEADER_BYTES = 1_048_576;
 const align8 = (value: number) => (value + 7) & ~7;
@@ -150,6 +152,15 @@ export interface ArtifactQueryVector {
     operator: "eq" | "neq" | "lt" | "lte" | "gt" | "gte",
     literal: Scalar,
   ): ArtifactBlockCompare | undefined;
+  /**
+   * Tests rows against a set of literals hashed once, or `undefined` for a
+   * column that cannot test equality in its encoded form. A literal of another
+   * type than the column holds matches no row.
+   */
+  prepareIn(
+    literals: readonly Scalar[],
+    negated: boolean,
+  ): ArtifactInTest | undefined;
   /** The column's cells in their encoded form, for the kinds that have one. */
   readonly encoded: ArtifactEncodedColumn | undefined;
   chunkMayMatch(
@@ -160,6 +171,19 @@ export interface ArtifactQueryVector {
   statisticsBytes(): number;
   statisticsCapacityBytes(): number;
   statisticsRowsScanned(): number;
+}
+
+/**
+ * A set of literals a column is tested against. A null cell satisfies neither
+ * the set nor its negation: a row is decided as `member !== negated` when it
+ * is not null, and is false otherwise.
+ */
+export interface ArtifactInTest {
+  compare(index: number): boolean;
+  /** `ArtifactQueryVector.prepareBlockCompare`'s contract over the set. */
+  readonly block: ArtifactBlockCompare;
+  /** Whether a chunk can hold a row the test holds for, or `undefined`. */
+  chunkMayMatch(chunk: number): boolean | undefined;
 }
 
 export type ArtifactBlockCompare = (
@@ -1154,6 +1178,67 @@ interface ResidentChunkStatistic {
   readonly maximum?: EncodedOrdered;
 }
 
+/** Codes and small integers below this are tested in a bitmap. */
+const DENSE_SET_LIMIT = 1 << 16;
+
+/**
+ * The encoded values of an in-list, hashed once. Equality is `encodedCompare`'s:
+ * NaN equals NaN and `-0` differs from `0`, which a `Set` would merge.
+ */
+class EncodedSet {
+  readonly #numbers = new Set<number>();
+  readonly #bigints = new Set<bigint>();
+  /** Set when every nonzero number is an integer below `DENSE_SET_LIMIT`. */
+  readonly #dense: Uint8Array | undefined;
+  #zero = false;
+  #negativeZero = false;
+  /** The values in `encodedCompare` order, for chunk bounds. */
+  readonly sorted: readonly EncodedOrdered[];
+
+  constructor(values: readonly EncodedOrdered[]) {
+    let dense = true;
+    let largest = 0;
+    for (const value of values) {
+      if (typeof value === "bigint") this.#bigints.add(value);
+      else if (value === 0) {
+        if (Object.is(value, -0)) this.#negativeZero = true;
+        else this.#zero = true;
+      } else {
+        this.#numbers.add(value);
+        if (Number.isInteger(value) && value > 0 && value < DENSE_SET_LIMIT)
+          largest = Math.max(largest, value);
+        else dense = false;
+      }
+    }
+    if (dense && this.#numbers.size > 0) {
+      this.#dense = new Uint8Array(largest + 1);
+      for (const value of this.#numbers) this.#dense[value] = 1;
+    }
+    this.sorted = [...values].sort(encodedCompare);
+  }
+
+  has(value: EncodedOrdered): boolean {
+    if (typeof value === "bigint") return this.#bigints.has(value);
+    if (value === 0)
+      return Object.is(value, -0) ? this.#negativeZero : this.#zero;
+    return this.#dense ? this.#dense[value] === 1 : this.#numbers.has(value);
+  }
+
+  /** Whether some value lies in `[minimum, maximum]`. */
+  within(minimum: EncodedOrdered, maximum: EncodedOrdered): boolean {
+    let low = 0;
+    let high = this.sorted.length;
+    while (low < high) {
+      const middle = low + ((high - low) >>> 1);
+      if (encodedCompare(this.sorted[middle] as EncodedOrdered, minimum) < 0)
+        low = middle + 1;
+      else high = middle;
+    }
+    const candidate = this.sorted[low];
+    return candidate !== undefined && encodedCompare(candidate, maximum) <= 0;
+  }
+}
+
 function statisticsCharge(chunks: number): number {
   return chunks === 0 ? 0 : 64 + chunks * 128;
 }
@@ -1270,6 +1355,36 @@ function queryVector(
       );
     };
   };
+  const prepareIn = (
+    literals: readonly Scalar[],
+    negated: boolean,
+  ): ArtifactInTest | undefined => {
+    if (!supported.has("eq")) return undefined;
+    const wanted: EncodedOrdered[] = [];
+    for (const literal of literals) {
+      const value = encodeLiteral(literal);
+      if (value !== undefined) wanted.push(value);
+    }
+    const members = new EncodedSet(wanted);
+    const compare = (index: number): boolean =>
+      validAt(index) && members.has(encodedAt(index)) !== negated;
+    return {
+      compare,
+      block: blockOf(rows, compare) as ArtifactBlockCompare,
+      chunkMayMatch: (chunk) => {
+        const stat = ensureStatistics()[chunk];
+        if (!stat) return undefined;
+        if (stat.minimum === undefined || stat.maximum === undefined)
+          return false;
+        if (!negated) return members.within(stat.minimum, stat.maximum);
+        // Every non-null row holds one value, which the set holds.
+        return !(
+          encodedCompare(stat.minimum, stat.maximum) === 0 &&
+          members.has(stat.minimum)
+        );
+      },
+    };
+  };
   return Object.freeze({
     rows,
     chunkRows: QUERY_CHUNK_ROWS,
@@ -1281,6 +1396,7 @@ function queryVector(
       return prepareCompare(operator, literal)?.(index);
     },
     prepareCompare,
+    prepareIn,
     prepareBlockCompare:
       blockCompare === undefined
         ? (
@@ -1429,6 +1545,22 @@ function uuidQueryVector(
       return outside;
     };
   };
+  const prepareIn = (
+    literals: readonly Scalar[],
+    negated: boolean,
+  ): ArtifactInTest => {
+    const members = new ByteKeyTable();
+    for (const literal of literals)
+      if (literal instanceof Uint8Array && literal.byteLength === 16)
+        members.add(literal, 0);
+    const compare = (index: number): boolean =>
+      validAt(index) && members.find(cells, index * 16) >= 0 !== negated;
+    return {
+      compare,
+      block: blockOf(rows, compare) as ArtifactBlockCompare,
+      chunkMayMatch: () => undefined,
+    };
+  };
   return Object.freeze({
     rows,
     chunkRows: QUERY_CHUNK_ROWS,
@@ -1440,6 +1572,7 @@ function uuidQueryVector(
       return prepareCompare(operator, literal)?.(index);
     },
     prepareCompare,
+    prepareIn,
     prepareBlockCompare,
     encoded: Object.freeze({ kind: "uuid", rows, cells, validAt }),
     chunkMayMatch: () => undefined,
@@ -1488,6 +1621,27 @@ function textQueryVector(
       return equal;
     };
   };
+  const prepareIn = (
+    literals: readonly Scalar[],
+    negated: boolean,
+  ): ArtifactInTest | undefined => {
+    if (!rowsAreText()) return undefined;
+    const members = new ByteStringTable();
+    for (const literal of literals)
+      if (typeof literal === "string" && literal.isWellFormed()) {
+        const target = textEncoder.encode(literal);
+        members.add(target, 0, target.byteLength);
+      }
+    const compare = (index: number): boolean =>
+      validAt(index) &&
+      members.find(bytes, offsets[index] ?? 0, offsets[index + 1] ?? 0) >= 0 !==
+        negated;
+    return {
+      compare,
+      block: blockOf(rows, compare) as ArtifactBlockCompare,
+      chunkMayMatch: () => undefined,
+    };
+  };
   // A filter the block path cannot take asks row by row, with one literal.
   let last:
     | {
@@ -1513,6 +1667,7 @@ function textQueryVector(
       return last.compare?.(index);
     },
     prepareCompare,
+    prepareIn,
     prepareBlockCompare: (
       operator: "eq" | "neq" | "lt" | "lte" | "gt" | "gte",
       literal: Scalar,

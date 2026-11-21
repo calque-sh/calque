@@ -269,6 +269,14 @@ export function sql(
       return `(${operand(predicate.left)} ${SQL_OPERATORS[predicate.operator]} ${operand(predicate.right)})`;
     case "is-null":
       return `(${operand(predicate.expression)} IS ${predicate.negated === true ? "NOT " : ""}NULL)`;
+    case "in-list": {
+      for (const value of predicate.values) {
+        if (typeof value !== "bigint" && typeof value !== "string")
+          throw new Error("the differential binds integers and texts only");
+        parameters.push(value);
+      }
+      return `("${predicate.field.column}" IN (${predicate.values.map(() => "?").join(", ")}))`;
+    }
     case "not":
       return `(NOT ${sql(predicate.predicate, parameters)})`;
     default:
@@ -312,6 +320,15 @@ export function randomLeaf(random: () => number): QueryPredicate {
       kind: "is-null",
       expression: field(column),
       negated: random() < 0.5,
+    };
+  if (draw > 0.85)
+    return {
+      kind: "in-list",
+      field: { source: "t", column },
+      // Never empty: an empty list is decided without a cell, on any base.
+      values: Array.from({ length: 1 + Math.floor(random() * 4) }, () =>
+        integer ? pick(random, INTEGERS) : pick(random, [...TEXTS, "c", "zz"]),
+      ),
     };
   const operator = pick(random, OPERATORS);
   if (draw < 0.4)

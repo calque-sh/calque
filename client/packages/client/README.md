@@ -15,6 +15,16 @@ A filter treats NULL as a PostgreSQL WHERE clause does: a comparison with
 NULL is unknown, so `neq("assignee", 7n)` and `not(gt("score", 0.3))` leave
 out rows where that column is NULL, and `isNull` and `isNotNull` test for NULL.
 
+`inList("parent_id", ids)` matches rows whose column equals any of `ids`, as
+PostgreSQL's `parent_id = ANY(ids)` does. It is one predicate however long the
+list: a query may carry up to 50,000 listed values and 4 MiB of them, apart
+from the 64 KiB the rest of its specification may take, and the engine tests
+each row against a hash set of them. Prefer it to
+`or(...ids.map((id) => eq("parent_id", id)))`, which exceeds that
+specification limit at a few hundred ids. A NULL column matches neither
+`inList` nor `not(inList(...))`; an empty list matches no row, so its `not`
+matches every row.
+
 An `int2` or `int4` column is a `number` in TypeScript and an `int8` one a
 `bigint`. `sum` over any of the three is a `bigint`, as PostgreSQL's `sum`
 over `int2` and `int4` is, and over a `float4` or `float8` column a `number`.

@@ -22,6 +22,11 @@ export type PredicateNode =
       readonly column: string;
       readonly negated: boolean;
     }
+  | {
+      readonly kind: "in-list";
+      readonly column: string;
+      readonly values: readonly PredicateLiteral[];
+    }
   | { readonly kind: "and"; readonly predicates: readonly PredicateNode[] }
   | { readonly kind: "or"; readonly predicates: readonly PredicateNode[] }
   | { readonly kind: "not"; readonly predicate: PredicateNode };
@@ -58,7 +63,7 @@ export function sealColumnName(value: unknown): string {
 }
 
 function sealLiteral(
-  operator: PredicateOperator,
+  operator: PredicateOperator | "inList",
   value: unknown,
 ): PredicateLiteral {
   // A comparison with NULL is never true, as in SQL, so a null literal could
@@ -161,6 +166,31 @@ export function gte<Row extends object, Column extends keyof Row & string>(
   value: NonNullable<Row[Column]>,
 ): QueryPredicate<Row> {
   return compare("gte", column, value);
+}
+
+/**
+ * Matches rows whose `column` equals any of `values`, as PostgreSQL's
+ * `column = ANY(values)` does, and as `or(...values.map((v) => eq(column, v)))`
+ * does, but as one predicate whose size grows only with the values and which
+ * the engine tests against a hash set. A row whose `column` is NULL matches
+ * neither it nor its `not`. An empty list matches no row, so its `not`
+ * matches every row, NULL included. A value is never null.
+ */
+export function inList<Row extends object, Column extends keyof Row & string>(
+  column: Column,
+  values: readonly NonNullable<Row[Column]>[],
+): QueryPredicate<Row> {
+  if (!Array.isArray(values))
+    throw new TypeError("inList() needs an array of values");
+  return seal({
+    kind: "in-list",
+    column: sealColumnName(column),
+    values: Object.freeze(
+      Array.from(values as readonly unknown[], (value) =>
+        sealLiteral("inList", value),
+      ),
+    ),
+  });
 }
 
 /** Matches rows whose `column` is NULL. */

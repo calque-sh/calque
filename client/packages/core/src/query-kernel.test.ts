@@ -280,6 +280,8 @@ function readsEventOnly(predicate: QueryPredicate): boolean {
       return reads(predicate.left) && reads(predicate.right);
     case "is-null":
       return reads(predicate.expression);
+    case "in-list":
+      return predicate.field.source === "event";
     case "not":
       return readsEventOnly(predicate.predicate);
     default:

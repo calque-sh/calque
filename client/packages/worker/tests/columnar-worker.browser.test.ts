@@ -535,6 +535,54 @@ describe("dedicated direct-columnar worker", () => {
     expect(extremes.result.rows).toEqual([["User 3", "Added"]]);
   });
 
+  it("selects rows by an in-list the engine tests against a hash set, and by its negation", async () => {
+    const { contract, client } = await openMount({
+      queryCapacityBytes: 64 << 20,
+    });
+    await client.applyChangeBatches([
+      await encodeBatch(contract, {
+        from: "cursor-0",
+        through: "cursor-1",
+        operations: [
+          { kind: "update", id: "user-2", changed: { display_name: "Added" } },
+        ],
+      }),
+    ]);
+    const names = async (where: QueryPredicate) =>
+      (
+        await client.query({
+          version: 1,
+          from: { collection: "users", as: "u" },
+          where,
+          select: [
+            {
+              kind: "field",
+              field: { source: "u", column: "display_name" },
+              as: "name",
+            },
+          ],
+          orderBy: [{ by: "name", direction: "asc" }],
+        })
+      ).result.rows.map(([name]) => name);
+    const field = { source: "u", column: "display_name" } as const;
+    const listed = (...values: string[]): QueryPredicate => ({
+      kind: "in-list",
+      field,
+      values,
+    });
+    expect(await names(listed("User 0", "Added", "nobody", "User 0"))).toEqual([
+      "Added",
+      "User 0",
+    ]);
+    // The value the change replaced is no longer there to match.
+    expect(await names(listed("User 2"))).toEqual([]);
+    expect(await names(listed())).toEqual([]);
+    expect(
+      await names({ kind: "not", predicate: listed("User 0", "Added") }),
+    ).toEqual(["User 1", "User 3"]);
+    expect(await names({ kind: "not", predicate: listed() })).toHaveLength(4);
+  });
+
   it("refuses to open an artifact that names no snapshot cursor", async () => {
     // A live mount starts its first catch-up from the artifact's cursor, so a
     // mount without one would have nowhere to resume from.

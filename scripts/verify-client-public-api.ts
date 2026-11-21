@@ -781,7 +781,7 @@ const CORE_ROOT_TYPES: readonly string[] = [
 // Every declaration reachable from `dist/index.d.ts`, digested, so a changed
 // field type or a widened union fails the gate.
 const CORE_DECLARATION_GRAPH_SHA256 =
-  "9c9e63d6200fccfc52b1fb8c0f6221f616c3181fd374baa2a95bc3cb154c0fce";
+  "1584fcf1c374a90c3f477f243df94567a9e41aec93a0ce0ed435af9e52b1273d";
 // Core is the bottom of the client stack and names no package above it.
 const CORE_FORBIDDEN_UPWARD_PACKAGES: readonly string[] = [
   "@calque/client",
