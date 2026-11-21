@@ -660,6 +660,13 @@ function stringAccessor(
   return stringReader(offsets, bytes);
 }
 
+/**
+ * Below this many bytes an ASCII value is built from its char codes: a
+ * `TextDecoder` call costs more than the loop for a short value.
+ */
+const SHORT_ASCII_BYTES = 64;
+const asciiCodes: number[] = [];
+
 /** Reads row `index` of `offsets` already non-decreasing and in bounds. */
 function stringReader(
   offsets: Uint32Array,
@@ -672,9 +679,25 @@ function stringReader(
       index >= offsets.length - 1
     )
       throw new RangeError("row is outside the column");
-    return decoder.decode(
-      bytes.subarray(at(offsets, index), at(offsets, index + 1)),
-    );
+    const start = at(offsets, index);
+    const end = at(offsets, index + 1);
+    const length = end - start;
+    // ASCII is valid UTF-8 and holds no byte-order mark, so this answers
+    // what the fatal decoder would.
+    if (length <= SHORT_ASCII_BYTES) {
+      asciiCodes.length = length;
+      let ascii = true;
+      for (let offset = 0; offset < length; offset++) {
+        const byte = bytes[start + offset] ?? 0x80;
+        if (byte > 0x7f) {
+          ascii = false;
+          break;
+        }
+        asciiCodes[offset] = byte;
+      }
+      if (ascii) return String.fromCharCode.apply(null, asciiCodes);
+    }
+    return decoder.decode(bytes.subarray(start, end));
   };
 }
 

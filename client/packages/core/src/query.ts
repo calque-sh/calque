@@ -3392,12 +3392,35 @@ function resultValue(value: QueryValue): QueryOutputValue {
   return value;
 }
 
+/**
+ * What `encoder.encode(text).byteLength` answers, a lone surrogate counted as
+ * U+FFFD's three bytes, without allocating: an encode per cell dominated
+ * reading a wide result.
+ */
+function utf8Length(text: string): number {
+  let bytes = text.length;
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (code < 0x80) continue;
+    if (code < 0x800) bytes += 1;
+    else if (
+      code >= 0xd800 &&
+      code <= 0xdbff &&
+      (text.charCodeAt(index + 1) & 0xfc00) === 0xdc00
+    ) {
+      bytes += 2;
+      index++;
+    } else bytes += 2;
+  }
+  return bytes;
+}
+
 function payloadBytes(value: QueryValue): number {
   if (value === null || typeof value === "boolean") return 1;
   if (typeof value === "number" || typeof value === "bigint") return 8;
-  if (typeof value === "string") return encoder.encode(value).byteLength;
+  if (typeof value === "string") return utf8Length(value);
   if (value instanceof Uint8Array) return value.byteLength;
-  return encoder.encode(canonicalJson(value)).byteLength;
+  return utf8Length(canonicalJson(value));
 }
 
 function sealResult(

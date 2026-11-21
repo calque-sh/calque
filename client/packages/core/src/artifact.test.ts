@@ -1263,6 +1263,67 @@ describe("browser direct-columnar artifact", () => {
     expect(workspace.table("names").lookupKey("absent")).toBe(-1);
   });
 
+  test("reads short and long, ASCII and other text as the decoder does", async () => {
+    const texts = [
+      "",
+      "a",
+      "x".repeat(63),
+      "y".repeat(64),
+      "z".repeat(65),
+      `${"a".repeat(63)}é`,
+      `é${"a".repeat(10)}`,
+      "\u{1F600}",
+      "﻿bom",
+      "\u007f",
+    ];
+    const schema: DirectColumnarSchema = {
+      format: "calque-direct-columnar",
+      version: DIRECT_COLUMNAR_FORMAT_VERSION,
+      tables: [
+        {
+          name: "texts",
+          primaryKey: ["id"],
+          columns: [
+            { name: "id", type: "int64", nullable: false },
+            { name: "plain", type: "utf8", nullable: false },
+            { name: "coded", type: "dict", nullable: false },
+          ],
+        },
+      ],
+    };
+    const encoded = encodeArtifact(
+      schema,
+      new Map([
+        [
+          "texts",
+          texts.map((text, index) => ({
+            id: BigInt(index),
+            plain: text,
+            coded: text,
+          })),
+        ],
+      ]),
+    );
+    const workspace = await openDirectColumnarArtifact(
+      ownedBuffer(encoded.bytes),
+      {
+        byteLength: encoded.byteLength,
+        digest: encoded.digest,
+        identity: encoded.identity,
+        schema,
+      },
+    );
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    const decoded = texts.map((text) =>
+      decoder.decode(new TextEncoder().encode(text)),
+    );
+    const table = workspace.table("texts");
+    for (const name of ["plain", "coded"])
+      expect(
+        texts.map((_text, index) => table.column(name).valueAt(index)),
+      ).toEqual(decoded);
+  });
+
   test("accepts the sorted dictionary the same rows produce", async () => {
     const tables = fixtureTables();
     tables.set("issue_tags", [

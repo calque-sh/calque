@@ -650,6 +650,41 @@ describe("columnar query evaluator", () => {
     expect(again.rows[0]?.[0]).toEqual(Uint8Array.of(1));
   });
 
+  test("counts a text cell's maxBytes as its UTF-8 encoding", () => {
+    const texts = [
+      "",
+      "ascii",
+      "déjà",
+      "漢字",
+      "\u{1F600}",
+      "a\uD800",
+      "\uDC00b",
+      "\uD800𐀀",
+      "\uDBFF",
+    ];
+    const overlay = overlayOf([
+      {
+        name: "notes",
+        columns: ["id", "text"],
+        rows: texts.map((text, index) => [`n${index}`, text]),
+      },
+    ]);
+    const specification: QuerySpecification = {
+      version: 1,
+      from: { collection: "notes", as: "n" },
+      select: [{ kind: "field", field: field("text", "n"), as: "t" }],
+    };
+    const exact =
+      encoder.encode("t").byteLength +
+      texts.reduce((total, text) => total + encoder.encode(text).byteLength, 0);
+    expect(
+      engine(overlay).query(specification, { maxBytes: exact }).rows,
+    ).toHaveLength(texts.length);
+    expect(() =>
+      engine(overlay).query(specification, { maxBytes: exact - 1 }),
+    ).toThrowError(expect.objectContaining({ code: "RESULT_TOO_LARGE" }));
+  });
+
   test("precharges a fixed aggregate capacity pool and releases reservations", () => {
     const overlay = overlayOf(COLLECTIONS);
     const specification: QuerySpecification = {
