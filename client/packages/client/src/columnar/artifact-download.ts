@@ -125,11 +125,18 @@ export type DecodedEncoding =
   "brotli-large-window" | "packed-brotli-large-window";
 
 /**
- * Sends the hashers the artifact a page kept, chunk by chunk as `copy` opens
- * them, reading the next chunk while the hashers take the last, and ends once
- * every one of `chunks` is handed over. A chunk that does not open rejects
- * with `StoredRowsError`, and `handed` holds the chunks already sent, so the
- * download that takes over skips them.
+ * How many chunks of a stored copy are read ahead of the one the hashers take
+ * next. A browser read of the origin private file system costs a round trip
+ * per chunk, so one read at a time spends the load waiting on it.
+ */
+export const STORED_READ_AHEAD = 4;
+
+/**
+ * Sends the hashers the artifact a page kept, in order, chunk by chunk as
+ * `copy` opens them, with up to `STORED_READ_AHEAD` chunks read ahead, and
+ * ends once every one of `chunks` is handed over. A chunk that does not open
+ * rejects with `StoredRowsError`, and `handed` holds the chunks already sent,
+ * so the download that takes over skips them.
  */
 export async function sendStoredArtifact(
   copy: StoredCopy,
@@ -138,10 +145,16 @@ export async function sendStoredArtifact(
   receiving: ReceivingWorkspace,
   handed: HandedChunks,
 ): Promise<void> {
-  let next = awaitedLater(copy.chunk(0));
+  const reading: Promise<ArrayBuffer>[] = [];
+  let requested = 0;
+  const readAhead = (): void => {
+    while (requested < chunks && reading.length < STORED_READ_AHEAD)
+      reading.push(awaitedLater(copy.chunk(requested++)));
+  };
+  readAhead();
   for (let index = 0; index < chunks; index += 1) {
-    const bytes = await next;
-    if (index + 1 < chunks) next = awaitedLater(copy.chunk(index + 1));
+    const bytes = await (reading.shift() as Promise<ArrayBuffer>);
+    readAhead();
     const sent = hashers.send(index, bytes);
     handed.count = index + 1;
     if (index + 1 < chunks) await sent;
