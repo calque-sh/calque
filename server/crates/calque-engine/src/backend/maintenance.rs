@@ -183,9 +183,10 @@ impl LocalBackend {
         }
     }
 
-    /// Re-encodes the newest cut's artifact, then derives the artifact of
-    /// each table set pages asked for at that cut, and only then retires
-    /// the artifacts they replace, so a page planned meanwhile finds one.
+    /// Copies the artifact of each table set pages asked for out of the
+    /// newest cut, re-encodes the cut's artifact, then the copies, and only
+    /// then retires the artifacts they replace, so a page planned meanwhile
+    /// finds one.
     pub(super) fn run_reencode(
         &self,
         prepared: &PreparedLocalSource,
@@ -222,6 +223,18 @@ impl LocalBackend {
                 return;
             }
         };
+        // The copies come first: each is a fraction of the cut's bytes at the
+        // level a new cut is published with, and a page that asks for its
+        // tables is planned it while the slower encodes below run.
+        let subsets = SubsetCut::new(prepared, query.clone(), cut.clone()).map(|subset_cut| {
+            let copied = self.copy_subsets(
+                &runtime,
+                &subset_cut,
+                &self.inner.subsets.sets(),
+                cancellation,
+            );
+            (subset_cut, copied)
+        });
         let outcome = runtime.block_on(reencode_leaving_replaced(
             ReencodeRequest {
                 state_root: &reencoder.config.state_root,
@@ -268,8 +281,9 @@ impl LocalBackend {
                 Vec::new()
             }
         };
-        let sets = self.inner.subsets.sets();
-        replaced.extend(self.derive_subsets(&runtime, prepared, &sets, cancellation));
+        replaced.extend(subsets.map_or_else(Vec::new, |(cut, copied)| {
+            self.encode_subsets(&runtime, &cut, &copied, cancellation)
+        }));
         span.close();
         self.retire_replaced(&runtime, &replaced, cancellation);
     }

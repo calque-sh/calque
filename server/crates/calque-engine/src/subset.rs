@@ -1,10 +1,11 @@
 //! Artifacts of some of the served tables.
 //!
 //! A page whose bindings name fewer tables than its server serves is planned
-//! the whole artifact at first. [`derive_subset`] then writes the artifact of
+//! the whole artifact at first. [`copy_subset`] then writes the artifact of
 //! only its tables at the same cut, by copying their parts out of the decoded
-//! object already published there, publishes it, and gives it the re-encodes
-//! every publication gets, so the next such page downloads only its tables.
+//! object already published there, and publishes it. [`encode_subset`] gives
+//! it the re-encodes every publication gets, so the next such page downloads
+//! only its tables.
 //! A subset is an artifact of its cut like any other, and is retired with it.
 
 use std::{
@@ -42,6 +43,7 @@ use crate::{
 pub(crate) const MAX_SUBSETS: usize = 8;
 
 /// What one [`derive_subset`] did.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct SubsetOutcomes {
     /// `NothingToReencode` when `tables` is the whole set or nothing is
@@ -51,12 +53,8 @@ pub(crate) struct SubsetOutcomes {
     pub(crate) encodes: Option<ReencodeOutcomes>,
 }
 
-/// Publishes the artifact of only `tables` at `request.cut`, derived from
-/// the artifact `request.query` publishes there for every table of `plan`,
-/// then re-encodes it as a publication is. Each publication is admitted as a
-/// re-encode is: only if `admit` holds when the catalog asks, under the fence
-/// lock. Returns the artifacts its re-encodes replace, for the caller to
-/// retire.
+/// [`copy_subset`], then [`encode_subset`] once the copy is published.
+#[cfg(test)]
 pub(crate) async fn derive_subset(
     request: ReencodeRequest<'_>,
     plan: &SnapshotBuildPlan,
@@ -64,46 +62,20 @@ pub(crate) async fn derive_subset(
     admit: impl Fn() -> bool,
     mut on_stage: impl FnMut(ReencodeStage),
 ) -> Result<(SubsetOutcomes, Vec<ArtifactId>), ReencodeError> {
-    let narrowed = plan.narrowed_to(tables)?;
-    let nothing = |subset| {
-        Ok((
+    let subset = copy_subset(request, plan, tables, &admit, &mut on_stage).await?;
+    if !matches!(
+        subset,
+        ReencodeOutcome::Published { .. } | ReencodeOutcome::AlreadyPublished
+    ) {
+        return Ok((
             SubsetOutcomes {
                 subset,
                 encodes: None,
             },
             Vec::new(),
-        ))
-    };
-    if narrowed.table_set_hash() == plan.table_set_hash() {
-        return nothing(ReencodeOutcome::NothingToReencode);
+        ));
     }
-    let query = PublishedArtifactQuery {
-        cache_key: request.query.cache_key.clone(),
-        table_set_hash: narrowed.table_set_hash().to_owned(),
-    };
-    let catalog = SqliteArtifactCatalog::open(request.catalog_path)?;
-    let derived = published_at(&catalog, &query, request.cut)?.is_empty();
-    drop(catalog);
-    let subset = if derived {
-        publish_subset(request, plan, &narrowed, &admit, &mut on_stage).await?
-    } else {
-        ReencodeOutcome::AlreadyPublished
-    };
-    if !matches!(
-        subset,
-        ReencodeOutcome::Published { .. } | ReencodeOutcome::AlreadyPublished
-    ) {
-        return nothing(subset);
-    }
-    let (encodes, replaced) = reencode_leaving_replaced(
-        ReencodeRequest {
-            query: &query,
-            ..request
-        },
-        &admit,
-        &mut on_stage,
-    )
-    .await?;
+    let (encodes, replaced) = encode_subset(request, plan, tables, admit, on_stage).await?;
     Ok((
         SubsetOutcomes {
             subset,
@@ -111,6 +83,64 @@ pub(crate) async fn derive_subset(
         },
         replaced,
     ))
+}
+
+/// Publishes the artifact of only `tables` at `request.cut`, copied from the
+/// artifact `request.query` publishes there for every table of `plan`, with
+/// the representations a new cut is published with. It is admitted as a
+/// re-encode is: only if `admit` holds when the catalog asks, under the fence
+/// lock.
+pub(crate) async fn copy_subset(
+    request: ReencodeRequest<'_>,
+    plan: &SnapshotBuildPlan,
+    tables: &BTreeSet<TableId>,
+    admit: impl Fn() -> bool,
+    mut on_stage: impl FnMut(ReencodeStage),
+) -> Result<ReencodeOutcome, ReencodeError> {
+    let narrowed = plan.narrowed_to(tables)?;
+    if narrowed.table_set_hash() == plan.table_set_hash() {
+        return Ok(ReencodeOutcome::NothingToReencode);
+    }
+    let catalog = SqliteArtifactCatalog::open(request.catalog_path)?;
+    let copied =
+        !published_at(&catalog, &subset_query(&request, &narrowed), request.cut)?.is_empty();
+    drop(catalog);
+    if copied {
+        return Ok(ReencodeOutcome::AlreadyPublished);
+    }
+    publish_subset(request, plan, &narrowed, &admit, &mut on_stage).await
+}
+
+/// Re-encodes the artifact of only `tables` published at `request.cut` as a
+/// publication is, and returns the artifacts it replaces, for the caller to
+/// retire.
+pub(crate) async fn encode_subset(
+    request: ReencodeRequest<'_>,
+    plan: &SnapshotBuildPlan,
+    tables: &BTreeSet<TableId>,
+    admit: impl Fn() -> bool,
+    on_stage: impl FnMut(ReencodeStage),
+) -> Result<(ReencodeOutcomes, Vec<ArtifactId>), ReencodeError> {
+    let query = subset_query(&request, &plan.narrowed_to(tables)?);
+    reencode_leaving_replaced(
+        ReencodeRequest {
+            query: &query,
+            ..request
+        },
+        admit,
+        on_stage,
+    )
+    .await
+}
+
+fn subset_query(
+    request: &ReencodeRequest<'_>,
+    narrowed: &SnapshotBuildPlan,
+) -> PublishedArtifactQuery {
+    PublishedArtifactQuery {
+        cache_key: request.query.cache_key.clone(),
+        table_set_hash: narrowed.table_set_hash().to_owned(),
+    }
 }
 
 async fn publish_subset(

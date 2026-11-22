@@ -5,7 +5,10 @@ use snapshot_builder::SnapshotBuildPlan;
 use sync_types::ArtifactId;
 
 use super::*;
-use crate::subset::{derive_subset, MAX_SUBSETS};
+use crate::{
+    reencode::ReencodeOutcome,
+    subset::{copy_subset, encode_subset, MAX_SUBSETS},
+};
 
 /// The table sets source-wide pages were planned for that are part of the
 /// served tables, and the source they were asked of.
@@ -28,6 +31,37 @@ struct DemandState {
 struct Served {
     prepared: PreparedLocalSource,
     tables: BTreeSet<TableId>,
+}
+
+/// The newest cut of the served source, and what copying a subset at it
+/// reads.
+pub(super) struct SubsetCut {
+    plan: SnapshotBuildPlan,
+    query: PublishedArtifactQuery,
+    cursor: OpaqueCursor,
+    generation: u64,
+}
+
+impl SubsetCut {
+    pub(super) fn new(
+        prepared: &PreparedLocalSource,
+        query: PublishedArtifactQuery,
+        cursor: OpaqueCursor,
+    ) -> Option<Self> {
+        let generation = prepared.policy.generation();
+        match SnapshotBuildPlan::from_registry(&prepared.registry, &prepared.scope) {
+            Ok(plan) => Some(Self {
+                plan,
+                query,
+                cursor,
+                generation,
+            }),
+            Err(error) => {
+                tracing::warn!(generation, %error, "no subset artifact was derived");
+                None
+            }
+        }
+    }
 }
 
 impl SubsetDemand {
@@ -83,9 +117,9 @@ impl SubsetDemand {
         self.state().scheduled = false;
     }
 
-    /// The sets a re-encode derives after its own, most recently planned
-    /// first. A derivation spawned since still runs, and finds them
-    /// published.
+    /// The sets a re-encode copies before its own encodes and encodes after
+    /// them, most recently planned first. A derivation spawned since still
+    /// runs, and finds them published.
     pub(super) fn sets(&self) -> Vec<BTreeSet<TableId>> {
         self.state().sets.iter().rev().cloned().collect()
     }
@@ -169,80 +203,90 @@ impl LocalBackend {
                 return;
             }
         };
-        let replaced = self.derive_subsets(&runtime, &prepared, &sets, cancellation);
+        let Some(cut) = self.newest_subset_cut(&prepared) else {
+            return;
+        };
+        let copied = self.copy_subsets(&runtime, &cut, &sets, cancellation);
+        let replaced = self.encode_subsets(&runtime, &cut, &copied, cancellation);
         self.retire_replaced(&runtime, &replaced, cancellation);
     }
 
-    /// Derives the artifact of each of `sets` at the newest cut published for
-    /// `prepared`, and returns what their re-encodes replace. A set the
-    /// served tables no longer hold is forgotten.
-    pub(super) fn derive_subsets(
+    /// The newest cut published for `prepared`, which subsets are copied at.
+    fn newest_subset_cut(&self, prepared: &PreparedLocalSource) -> Option<SubsetCut> {
+        let reencoder = self.inner.reencoder.as_ref()?;
+        let newest = published_query_for(prepared)
+            .map_err(MaintenanceError::from)
+            .and_then(|query| {
+                let published = SqliteArtifactCatalog::open(&reencoder.config.catalog_path)
+                    .and_then(|catalog| catalog.published(&query))?;
+                Ok(newest_cut(&published, &self.inner.activated).map(|cut| (query, cut)))
+            });
+        match newest {
+            Ok(Some((query, cut))) => SubsetCut::new(prepared, query, cut.cursor),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    generation = prepared.policy.generation(),
+                    %error,
+                    "no subset artifact was derived"
+                );
+                None
+            }
+        }
+    }
+
+    fn subset_request<'a>(
+        &'a self,
+        reencoder: &'a Reencoder,
+        cut: &'a SubsetCut,
+        cancellation: &'a CancellationToken,
+    ) -> ReencodeRequest<'a> {
+        ReencodeRequest {
+            state_root: &reencoder.config.state_root,
+            catalog_path: &reencoder.config.catalog_path,
+            store: self.inner.store.as_ref(),
+            query: &cut.query,
+            cut: &cut.cursor,
+            fence: &self.inner.fence_lock,
+            cancellation,
+        }
+    }
+
+    /// Publishes the artifact of each of `sets` at `cut`, copied from the whole
+    /// set's, and returns the sets published there. A set the served tables no
+    /// longer hold is forgotten.
+    pub(super) fn copy_subsets(
         &self,
         runtime: &tokio::runtime::Runtime,
-        prepared: &PreparedLocalSource,
+        cut: &SubsetCut,
         sets: &[BTreeSet<TableId>],
         cancellation: &CancellationToken,
-    ) -> Vec<ArtifactId> {
+    ) -> Vec<BTreeSet<TableId>> {
         let Some(reencoder) = self.inner.reencoder.as_ref() else {
             return Vec::new();
         };
-        let generation = prepared.policy.generation();
-        let derived = (|| {
-            let plan = SnapshotBuildPlan::from_registry(&prepared.registry, &prepared.scope)
-                .map_err(|_| crate::LocalSnapshotError::InvalidPlan)?;
-            let query = published_query_for(prepared)?;
-            let published = SqliteArtifactCatalog::open(&reencoder.config.catalog_path)
-                .and_then(|catalog| catalog.published(&query))?;
-            Ok::<_, MaintenanceError>(
-                newest_cut(&published, &self.inner.activated).map(|cut| (plan, query, cut)),
-            )
-        })();
-        let (plan, query, cut) = match derived {
-            Ok(Some(derived)) => derived,
-            Ok(None) => return Vec::new(),
-            Err(error) => {
-                tracing::warn!(generation, %error, "no subset artifact was derived");
-                return Vec::new();
-            }
-        };
-        let mut replaced = Vec::new();
+        let generation = cut.generation;
+        let mut copied = Vec::new();
         for tables in sets {
             if cancellation.is_cancelled() {
                 break;
             }
-            let outcome = runtime.block_on(derive_subset(
-                ReencodeRequest {
-                    state_root: &reencoder.config.state_root,
-                    catalog_path: &reencoder.config.catalog_path,
-                    store: self.inner.store.as_ref(),
-                    query: &query,
-                    cut: &cut.cursor,
-                    fence: &self.inner.fence_lock,
-                    cancellation,
-                },
-                &plan,
+            let outcome = runtime.block_on(copy_subset(
+                self.subset_request(reencoder, cut, cancellation),
+                &cut.plan,
                 tables,
                 || admits_reencode(&current_serving(&self.inner.serving), generation),
                 |_| {},
             ));
             match outcome {
-                Ok((outcomes, ids)) => {
-                    tracing::info!(
-                        target: "calque::preparation",
-                        generation,
-                        tables = tables.len(),
-                        subset = ?outcomes.subset,
-                        zstd = ?outcomes.encodes.as_ref().map(|encodes| &encodes.zstd),
-                        brotli = ?outcomes.encodes.as_ref().and_then(|encodes| encodes
-                            .brotli
-                            .as_ref()
-                            .map(|outcome| outcome.as_ref().map_err(ToString::to_string))),
-                        "subset derivation finished"
-                    );
-                    replaced.extend(ids);
+                Ok(ReencodeOutcome::Published { .. } | ReencodeOutcome::AlreadyPublished) => {
+                    copied.push(tables.clone());
+                }
+                Ok(outcome) => {
+                    tracing::info!(generation, ?outcome, "the subset artifact was not copied");
                 }
                 Err(ReencodeError::Cancelled) => {
-                    tracing::info!(generation, "subset derivation cancelled");
+                    tracing::info!(generation, "subset copy cancelled");
                     break;
                 }
                 Err(ReencodeError::Plan(error)) => {
@@ -250,7 +294,58 @@ impl LocalBackend {
                     self.inner.subsets.forget(tables);
                 }
                 Err(error) => {
-                    tracing::warn!(generation, %error, "the subset artifact was not derived");
+                    tracing::warn!(generation, %error, "the subset artifact was not copied");
+                }
+            }
+        }
+        copied
+    }
+
+    /// Re-encodes the artifact of each of `sets` published at `cut`, and
+    /// returns what the re-encodes replace.
+    pub(super) fn encode_subsets(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        cut: &SubsetCut,
+        sets: &[BTreeSet<TableId>],
+        cancellation: &CancellationToken,
+    ) -> Vec<ArtifactId> {
+        let Some(reencoder) = self.inner.reencoder.as_ref() else {
+            return Vec::new();
+        };
+        let generation = cut.generation;
+        let mut replaced = Vec::new();
+        for tables in sets {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let outcome = runtime.block_on(encode_subset(
+                self.subset_request(reencoder, cut, cancellation),
+                &cut.plan,
+                tables,
+                || admits_reencode(&current_serving(&self.inner.serving), generation),
+                |_| {},
+            ));
+            match outcome {
+                Ok((ReencodeOutcomes { zstd, brotli }, ids)) => {
+                    tracing::info!(
+                        target: "calque::preparation",
+                        generation,
+                        tables = tables.len(),
+                        ?zstd,
+                        brotli = ?brotli.as_ref().map(|outcome| outcome
+                            .as_ref()
+                            .map_err(ToString::to_string)),
+                        "subset derivation finished"
+                    );
+                    replaced.extend(ids);
+                }
+                Err(ReencodeError::Cancelled) => {
+                    tracing::info!(generation, "subset encode cancelled");
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(generation, %error, "the subset artifact was not re-encoded");
                 }
             }
         }

@@ -2,9 +2,10 @@
 kind: changed
 ---
 After the first page whose generated bindings name some of the served tables
-loads, `calque serve` prepares an artifact of only those tables once the
-newest cut's artifact is fully encoded, and later pages that name the same
-tables download nothing of the others. While writes keep re-cutting the
-source before its encodes finish, as at 100k rows under steady writes, those
-pages still download every served table. Under a `partitioned` scope, every
-page still downloads every served table of its tenant.
+loads, `calque serve` prepares an artifact of only those tables at each new
+cut, and later pages that name the same tables download nothing of the
+others, under steady writes too. Right after a new cut, such a page
+downloads every served table until that cut's artifact of its tables is
+ready, and under steady writes that artifact is less compressed than on a
+quiet source. Under a `partitioned` scope, every page still downloads every
+served table of its tenant.
