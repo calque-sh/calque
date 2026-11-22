@@ -33,6 +33,7 @@ import {
   readEnvironment,
   rereadHostSleep,
 } from "./bench-host.ts";
+import { BootstrapProbe } from "./bench-bootstrap-probe.ts";
 import { NetworkMemoryVoid } from "./bench-network-memory.ts";
 import {
   BENCH_ROW_COUNTS,
@@ -320,6 +321,37 @@ export async function realtimeSession(run: Run): Promise<RealtimeResult> {
     await session.cdp.send("Network.disable");
     await shapeNetwork(run, session);
     if (loadFailure) sessionFailure = `the page did not load: ${loadFailure}`;
+    if (loadFailure) {
+      const page = await session.page
+        .evaluate(() => {
+          const probe = (globalThis as unknown as BenchWindow).__incidents;
+          return probe
+            ? {
+                status: probe.status,
+                error: probe.error,
+                statusLog: probe.statusLog ?? null,
+                coldLoad: probe.coldLoad,
+                gridRows: probe.grid?.rows ?? null,
+                publications: probe.publications,
+              }
+            : null;
+        })
+        .catch((error: unknown) => String(error));
+      const frames = session.capture.prefix();
+      writeRecord(run, "realtime-0-no-present", {
+        page,
+        expected,
+        frames: frames.length,
+        complete: session.capture.complete,
+        documentTimestampMs: session.network.documentTimestampMs,
+        lastFrames: frames.slice(-5),
+      });
+      await session.page
+        .screenshot({
+          path: join(run.directory, "samples", "realtime-0-no-present.png"),
+        })
+        .catch(() => undefined);
+    }
     if (sessionFailure === null) {
       const writer = new LoadWriter(
         run.sourceEnvironment,
@@ -358,6 +390,17 @@ export async function realtimeSession(run: Run): Promise<RealtimeResult> {
         ),
       );
       monitor.start();
+      const bootstraps =
+        run.options.bootstrapProbe === undefined
+          ? null
+          : BootstrapProbe.start(
+              connectionOf(run),
+              `${server.endpoint}/`,
+              bootstrapElement(
+                readFileSync(join(PAGE_ROOT, "index.html"), "utf8"),
+              ).requiredTables,
+              run.options.bootstrapProbe,
+            );
       const cpuStart = {
         seconds: await processCpuSeconds(server.pid),
         ms: hrtimeMs(),
@@ -450,6 +493,13 @@ export async function realtimeSession(run: Run): Promise<RealtimeResult> {
         load = await writer.stop();
         loadStoppedMs = hrtimeMs();
         await prober.close();
+        if (bootstraps !== null)
+          writeRecord(run, "bootstrap-probe", {
+            kind: "bootstrap-probe",
+            narrow: run.options.bootstrapProbe,
+            startedAt: bootstraps.startedAt,
+            answers: await bootstraps.stop(),
+          });
       }
       log(engagementLine(engagement));
       drain = await awaitQuietPublications(() =>
@@ -599,6 +649,12 @@ export async function realtimeSession(run: Run): Promise<RealtimeResult> {
 
 /** Background clients whose transactions the observers decode. */
 const BACKGROUND_OBSERVERS = 8;
+
+function connectionOf(run: Run): NonNullable<Run["connection"]> {
+  if (!run.connection)
+    throw new Error("the bootstrap probe needs the run's connection");
+  return run.connection;
+}
 
 /**
  * What a background client bootstraps with: the page's own request

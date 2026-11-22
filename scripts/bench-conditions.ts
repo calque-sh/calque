@@ -63,6 +63,11 @@ export interface BenchOptions {
    */
   readonly loadRate?: number;
   /**
+   * `--bootstrap-probe <n>`: bootstrap requests posted beside the realtime
+   * page, n of each round's for part of its tables (`bench-bootstrap-probe.ts`).
+   */
+  readonly bootstrapProbe?: number;
+  /**
    * `--tail <transactions>`: the load's transactions committed after the hold
    * and before the reference pass, so every page catches up through them from
    * the artifact's cut.
@@ -174,6 +179,9 @@ export function unjudgedReasons(options: BenchOptions): string[] {
       : [
           `load of ${String(options.loadRate)} transactions/s, not ${String(LOAD_TRANSACTIONS_PER_SECOND)}`,
         ]),
+    ...(options.bootstrapProbe === undefined
+      ? []
+      : [`bootstrap probe with ${String(options.bootstrapProbe)} narrow sets`]),
     ...(options.tail === undefined
       ? []
       : [
@@ -224,7 +232,7 @@ export function rendersPlan(options: Pick<BenchOptions, "network">): boolean {
 }
 
 const USAGE =
-  "usage: pnpm bench [-- --smoke] [--calque <path>] [--dataset <content-v1|v1>] [--network <off|Mbit/s/latency ms|shaped:Mbit/s/RTT ms>] [--diagnostic] [--hold-until-logged <text>] [--realtime-only] [--postgres-bin <dir>] [--no-edge] [--background-clients <n>] [--background-qos utility] [--load-rate <tx/s>] [--tail <transactions>] [--recut-tail-ratio <ratio>] [--recut-min-interval <seconds>] [--recut-keep-ratio <ratio>] [--no-stored-rows] [--returning] [--between-visits <transactions>] [--schema-change <config-add|rewrite-whole|rename-suspend>]";
+  "usage: pnpm bench [-- --smoke] [--calque <path>] [--dataset <content-v1|v1>] [--network <off|Mbit/s/latency ms|shaped:Mbit/s/RTT ms>] [--diagnostic] [--hold-until-logged <text>] [--realtime-only] [--postgres-bin <dir>] [--no-edge] [--background-clients <n>] [--background-qos utility] [--load-rate <tx/s>] [--bootstrap-probe <narrow sets>] [--tail <transactions>] [--recut-tail-ratio <ratio>] [--recut-min-interval <seconds>] [--recut-keep-ratio <ratio>] [--no-stored-rows] [--returning] [--between-visits <transactions>] [--schema-change <config-add|rewrite-whole|rename-suspend>]";
 
 export function parseBenchArguments(
   arguments_: readonly string[],
@@ -242,6 +250,7 @@ export function parseBenchArguments(
   let backgroundClients: number | null = null;
   let backgroundQos: BackgroundQos | null = null;
   let loadRate: number | null = null;
+  let bootstrapProbe: number | null = null;
   let tail: number | null = null;
   let recutTailRatio: number | null = null;
   let recutMinIntervalSeconds: number | null = null;
@@ -296,6 +305,9 @@ export function parseBenchArguments(
     } else if (argument === "--load-rate" && loadRate === null) {
       loadRate = parseLoadRate(value(index));
       index += 1;
+    } else if (argument === "--bootstrap-probe" && bootstrapProbe === null) {
+      bootstrapProbe = parseBootstrapProbe(value(index));
+      index += 1;
     } else if (argument === "--tail" && tail === null) {
       tail = parseTail(value(index));
       index += 1;
@@ -338,6 +350,10 @@ export function parseBenchArguments(
     throw new Error(
       "--load-rate sets the realtime session's writer, so it needs --realtime-only",
     );
+  if (bootstrapProbe !== null && !realtimeOnly)
+    throw new Error(
+      "--bootstrap-probe posts beside the realtime session, so it needs --realtime-only",
+    );
   if (tail !== null && realtimeOnly)
     throw new Error(
       "--tail is caught up by the cold samples, so it takes no --realtime-only",
@@ -367,6 +383,7 @@ export function parseBenchArguments(
     ...(backgroundClients === null ? {} : { backgroundClients }),
     ...(backgroundQos === null ? {} : { backgroundQos }),
     ...(loadRate === null ? {} : { loadRate }),
+    ...(bootstrapProbe === null ? {} : { bootstrapProbe }),
     ...(tail === null ? {} : { tail }),
     ...(recutTailRatio === null ? {} : { recutTailRatio }),
     ...(recutMinIntervalSeconds === null ? {} : { recutMinIntervalSeconds }),
@@ -396,6 +413,14 @@ export function parseLoadRate(text: string): number {
       "--load-rate takes a whole number of transactions a second from 1 to 1000",
     );
   return rate;
+}
+
+/** `--bootstrap-probe`'s value: how many of a round's requests are narrow. */
+export function parseBootstrapProbe(text: string): number {
+  const narrow = /^[0-9]+$/u.test(text) ? Number(text) : Number.NaN;
+  if (!Number.isSafeInteger(narrow) || narrow < 0 || narrow > 8)
+    throw new Error("--bootstrap-probe takes a whole number from 0 to 8");
+  return narrow;
 }
 
 /** `--tail`'s value: a whole number of transactions, 1 to 5,000,000. */

@@ -71,14 +71,15 @@ async function clientRenderBootstrap(): Promise<RenderBootstrap> {
 export async function requestPlan(
   connection: Connection,
   backendEndpoint: string,
+  requiredTables?: readonly string[],
 ): Promise<string> {
   const renderBootstrap = await clientRenderBootstrap();
-  const answers: { readonly status: number; readonly plan: string | null }[] =
-    [];
+  const answers: { readonly status: number; readonly body: string }[] = [];
   await renderBootstrap(
     {
       ...connection,
       ...bootstrapElement(readFileSync(join(PAGE_ROOT, "index.html"), "utf8")),
+      ...(requiredTables === undefined ? {} : { requiredTables }),
       endpoint: backendEndpoint,
     },
     {
@@ -87,18 +88,29 @@ export async function requestPlan(
         const response = await fetch(input, init);
         answers.push({
           status: response.status,
-          plan: response.status === 200 ? await response.clone().text() : null,
+          body: await response.clone().text(),
         });
         return response;
       },
     },
   );
-  const plan = answers.at(-1)?.plan ?? null;
-  if (plan === null)
+  const answer = answers.at(-1);
+  if (answer?.status !== 200)
     throw new Error(
-      `calque answered the run's own bootstrap request with ${String(answers.at(-1)?.status ?? "no response")}, not a plan`,
+      `calque answered the run's own bootstrap request with ${answer === undefined ? "no response" : `${String(answer.status)} ${refusalCode(answer.body)}`}, not a plan`,
     );
-  return plan;
+  return answer.body;
+}
+
+/** The `code` of a refusal's body, which tells calque's refusals apart. */
+function refusalCode(body: string): string {
+  if (body === "") return "and no body";
+  try {
+    const { code } = JSON.parse(body) as { code?: unknown };
+    return typeof code === "string" ? code : "and no code";
+  } catch {
+    return "and a body that is not JSON";
+  }
 }
 
 /**
