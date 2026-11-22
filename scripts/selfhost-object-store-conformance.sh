@@ -12,7 +12,7 @@
 # Bring the composition up first, with the same environment. Then:
 #
 #   export CARGO_TARGET_DIR="$(git rev-parse --show-toplevel)/target/cargo"
-#   export CALQUE_SELFHOST_S3_PORT="${CALQUE_SELFHOST_S3_PORT:-59001}"
+#   export CALQUE_SELFHOST_S3_PORT="${CALQUE_SELFHOST_S3_PORT:-29001}"
 #   sh scripts/selfhost-object-store-conformance.sh
 #
 # Expects: `test result: ok. 2 passed; 0 failed; 0 ignored`.

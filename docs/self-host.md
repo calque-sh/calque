@@ -15,7 +15,7 @@ Rust toolchain through rustup, a C compiler, and libpq with `pg_config` on
 `PATH` ([Building calque from source](development.md#building-calque-from-source)).
 Run everything from the repository root.
 
-The composition publishes PostgreSQL on port 55452, MinIO on 59001, the
+The composition publishes PostgreSQL on port 25452, MinIO on 29001, the
 server's plaintext port on 8787, its metrics port on 8788 and the HTTPS edge on
 8443, all on `127.0.0.1`, and the example page is served on 5173. All six must
 be free. A running `pnpm demo` takes 8787 and 5173 when they are free, so stop
@@ -93,7 +93,7 @@ database's published loopback port, and `calque init` turns the inspection into
 the manifest the server mounts:
 
 ```sh
-export CALQUE_DATABASE_URL="postgresql://calque_sync:$CALQUE_SELFHOST_DB_PASSWORD@127.0.0.1:${CALQUE_SELFHOST_POSTGRES_PORT:-55452}/calque"
+export CALQUE_DATABASE_URL="postgresql://calque_sync:$CALQUE_SELFHOST_DB_PASSWORD@127.0.0.1:${CALQUE_SELFHOST_POSTGRES_PORT:-25452}/calque"
 cargo run -q -p calque -- inspect --database-url-env CALQUE_DATABASE_URL \
   --source primary --publication calque_app \
   --table public.projects --table public.tasks > calque.inspection.json

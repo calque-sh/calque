@@ -80,7 +80,9 @@ services:
       - postgres-socket:/var/run/postgresql
     ports:
       # The database, for the operator: enrolment inspection, seeding, backup.
-      - "127.0.0.1:${CALQUE_SELFHOST_POSTGRES_PORT:-55452}:5432"
+      # This port and the object store's are below Linux's ephemeral range,
+      # where an outgoing connection can hold a port when `up` publishes it.
+      - "127.0.0.1:${CALQUE_SELFHOST_POSTGRES_PORT:-25452}:5432"
     command:
       - "postgres"
       - "-c"
@@ -127,7 +129,7 @@ services:
     ports:
       # For the operator and for the blob-store conformance run, which points
       # at this same store. Loopback only.
-      - "127.0.0.1:${CALQUE_SELFHOST_S3_PORT:-59001}:9000"
+      - "127.0.0.1:${CALQUE_SELFHOST_S3_PORT:-29001}:9000"
     healthcheck:
       test:
         ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/ready"]

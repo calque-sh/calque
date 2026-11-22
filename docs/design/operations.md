@@ -119,13 +119,13 @@ auth_method = 'trust'` returning no rows is the check.
 | `CALQUE_SELFHOST_DATABASE` | `calque` | The database. |
 | `CALQUE_SELFHOST_DB_ROLE` | `calque_sync` | The least-privilege `LOGIN REPLICATION` role the server connects as, created by `docker/selfhost-postgres-init`. |
 | `CALQUE_SELFHOST_DB_PASSWORD` | *required* | Its password, quoted into SQL by `format()`'s `%L`. It is also interpolated into a URL query value, so it must be URL-safe: hexadecimal is the safe shape, as for the object-store keys. |
-| `CALQUE_SELFHOST_POSTGRES_PORT` | `55452` | Published on `127.0.0.1` for the operator: enrollment inspection, seeding, backup. |
+| `CALQUE_SELFHOST_POSTGRES_PORT` | `25452` | Published on `127.0.0.1` for the operator: enrollment inspection, seeding, backup. |
 | `CALQUE_SELFHOST_PUBLIC_HOST` | `localhost` | The one name browsers use. Caddy serves only this name and takes its certificate for it; the server answers exactly this `Host` and builds every artifact and change URL on `https://<it>:<HTTPS port>/`. |
 | `CALQUE_SELFHOST_HTTPS_PORT` | `8443` | The edge's published port. A real host uses `443`. |
 | `CALQUE_SELFHOST_HTTPS_ADDRESS` | `127.0.0.1` | The interface the edge is published on. A real host uses `0.0.0.0`. |
 | `CALQUE_SELFHOST_HTTP_PORT` | `8787` | The server's own plaintext listener, published on `127.0.0.1` for the operator's probes. A probe there sends `Host: <public host>`; a browser sent there is refused with `421`. |
 | `CALQUE_SELFHOST_METRICS_PORT` | `8788` | The metrics listener, the only one that serves `/metrics`, published on `127.0.0.1` for the operator's scraper. It answers `Host: 127.0.0.1:<this port>`, which is what a scraper connecting to that address sends. |
-| `CALQUE_SELFHOST_S3_PORT` | `59001` | The object store, published on `127.0.0.1` for the operator and the conformance run below. |
+| `CALQUE_SELFHOST_S3_PORT` | `29001` | The object store, published on `127.0.0.1` for the operator and the conformance run below. |
 | `CALQUE_SELFHOST_S3_HOST` | `objectstore` | The host the server reaches the object store at: `CALQUE_S3_ENDPOINT` is `http://<it>:9000`. |
 | `CALQUE_SELFHOST_CONFIG` | *required* | Absolute path to the `calque.config.json` that `calque init` produced. Its `sources[].databaseUrlEnv` must be `CALQUE_DATABASE_URL`, which is `init`'s default. |
 | `CALQUE_SELFHOST_GRANT_AUDIENCE` | *required* | The audience every dataset grant must carry. |
@@ -436,7 +436,7 @@ SQL
 
 # On the host, through the published port: loopback, so the guard's other
 # accepted endpoint. Inside the composition the server uses the socket form.
-export CALQUE_DATABASE_URL="postgresql://calque_sync:$CALQUE_SELFHOST_DB_PASSWORD@127.0.0.1:${CALQUE_SELFHOST_POSTGRES_PORT:-55452}/calque"
+export CALQUE_DATABASE_URL="postgresql://calque_sync:$CALQUE_SELFHOST_DB_PASSWORD@127.0.0.1:${CALQUE_SELFHOST_POSTGRES_PORT:-25452}/calque"
 cargo run -p calque -- inspect --database-url-env CALQUE_DATABASE_URL \
   --source primary --publication calque_app --table public.issues \
   | cargo run -p calque -- init --from-inspection - --application-id incident-ops
@@ -485,7 +485,7 @@ and the same environment exported:
 
 ```sh
 export CARGO_TARGET_DIR="$(git rev-parse --show-toplevel)/target/cargo"
-export CALQUE_SELFHOST_S3_PORT="${CALQUE_SELFHOST_S3_PORT:-59001}"
+export CALQUE_SELFHOST_S3_PORT="${CALQUE_SELFHOST_S3_PORT:-29001}"
 sh scripts/selfhost-object-store-conformance.sh
 ```
 
