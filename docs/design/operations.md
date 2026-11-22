@@ -634,9 +634,9 @@ single canonical cursor stops being single.
   fence, which is the design and not a limitation to work around by disabling
   it. Read scale-out would need a second process that holds no fence, which
   does not exist.
-- **Rolling upgrades.** There is no upgrade path across releases yet — see
-  "Upgrades" below — and there is no two-version overlap, because two versions
-  would be two writers.
+- **Rolling upgrades.** A release upgrades in place from the one before it
+  (see "Upgrades" below), by a restart: there is no two-version overlap,
+  because two versions would be two writers.
 - **Connection draining.** `serve` shuts down on SIGTERM by releasing its
   fence lease and slot; in-flight `/v1/changes` responses end when the
   listener does. Clients see a dropped connection and reconnect. Nothing waits
@@ -738,8 +738,9 @@ without restarting Calque.
 `CDC runtime stopped without reconnecting`, and
 `the fenced generation's artifact was not published` from a fence order's
 background publication, also carry `state_must_be_destroyed`. When it is `true`
-the state directory holds state this build does not migrate, or the source's
-replication slot was dropped or invalidated so its changes cannot be replayed,
+the state directory holds state this build does not read, one an upgrade does
+not carry or one a later release wrote, or the source's replication slot was
+dropped or invalidated so its changes cannot be replayed,
 and a restart meets the same refusal: run
 `calque destroy --state-dir <dir> --database-url-env <NAME> --yes`, then
 restart (see "Upgrades").
@@ -949,9 +950,49 @@ absent-only.
 
 ## Upgrades
 
-There is no upgrade path across releases yet. A build reads only state in the
-format it writes and migrates none, so `calque dev` and `calque serve` refuse a
-state directory another build wrote, and name the command that clears it:
+A release upgrades in place from the one before it. Stop the server, start the
+new release's image or binary on the same state directory, object store and
+database, and it resumes the source: no `calque destroy`, and the slot, the
+canonical log, the authorization records and the write receipts carry over.
+`pnpm selfhost:e2e` walks it in CI against the composition, from the last
+published release's image to the tree's, under a page that release's client
+opened, and checks the page against PostgreSQL afterwards.
+
+Each source's state records the format the last runtime to start it writes,
+in `calque_control.source_state_format`. A source with no row is at format 1,
+which every release through 0.4.0 leaves. A start that finds:
+
+- its own format, or an earlier one it reads as it stands, resumes the source,
+  and open pages keep their cursor across the restart;
+- an earlier one it cannot read, after a release changed the artifact, catalog
+  or canonical log format, moves the source to its next schema generation, as
+  a schema change does: it prepares the working set again from PostgreSQL, and
+  open pages rebuild once;
+- a later one refuses before it reads or writes anything, and leaves the state
+  as it was:
+
+  ```text
+  this source's state was written by a later release of calque (state format
+  <n>; this build reads formats up to <m>), so this build does not start it.
+  Run that release or a later one to keep the state, or start over with this
+  release. Run calque destroy --state-dir <dir> --database-url-env <NAME>
+  --yes, then rerun <command> to prepare the working set anew.
+  ```
+
+Rolling back is therefore a restart on the later release, or a destroy and a
+new preparation on the earlier one. A recovery unit taken before an upgrade
+does not restore after it once the new release has advanced the slot (see
+"Backup and restore against the composition"). Release 0.4.0 and every one
+before it record no format and do not refuse a later one, so after an upgrade
+from one of them, run `calque destroy` before starting it again: started on
+state a later release moved to another schema generation, it serves the
+earlier generation's registry.
+
+An upgrade that skips releases reads every format an earlier release recorded,
+but only the upgrade from the release before is walked.
+
+The state that an upgrade does not carry is refused, naming the command that
+clears it:
 
 - an artifact catalog at an earlier schema version:
 
@@ -998,10 +1039,11 @@ for the incidents demo). `<command>` is `dev` or `serve`, whichever refused, and
 database URL from the variable its own `--database-url-env` names, so the
 printed line connects to the source the refusing command read.
 
-Recovery units follow the same rule: `restore` and `verify-restore` read only
-the unit format this build writes, version 4, which carries the enum labels
-the source serves. An older unit is refused with the remedy named
-(see "Backup and restore against the composition").
+Recovery units: `restore` and `verify-restore` read the unit format this
+build writes, version 6, which carries the schema generation and the state
+format, and version 5, which the release before wrote and which restores at
+schema generation 1 and state format 1. An older unit is refused with the
+remedy named (see "Backup and restore against the composition").
 
 ## Tenants
 

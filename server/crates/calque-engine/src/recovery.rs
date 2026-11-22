@@ -31,10 +31,13 @@ use crate::{guard::PostgresConnectionFamily, DatabaseUrl, StateStore};
 
 /// A unit of another version is refused by version, naming the fix, rather
 /// than as an `OracleMismatch` that reads like a corrupt backup.
-/// Version 6 carries the source's schema generation. An earlier
-/// unit has none to restore, so a source restored from it would serve
-/// generation 1 under a registry of a later one.
+/// Version 6 carries the source's schema generation and state format.
 const RECOVERY_FORMAT_VERSION: u32 = 6;
+/// The format the release before this one took, which a restore also reads.
+/// A version-5 unit carries no schema generation and no state format: no build
+/// that took one ever moved a source or recorded a format, so it restores at
+/// generation 1 and state format 1, what a source with no row is at.
+const PREVIOUS_RECOVERY_FORMAT_VERSION: u32 = 5;
 const COMPLETE_FILE: &str = "recovery.json";
 const CONTROL_DIRECTORY: &str = "control";
 const STATE_DIRECTORY: &str = "state";
@@ -51,6 +54,16 @@ struct ControlTable {
     name: &'static str,
     columns: &'static str,
     order_by: &'static str,
+    /// The first unit format that carries the table.
+    since_format: u32,
+}
+
+/// The control tables a unit of `format_version` carries, in the order a unit
+/// stores and hashes them.
+fn carried_control_tables(format_version: u32) -> impl Iterator<Item = &'static ControlTable> {
+    CONTROL_TABLES
+        .iter()
+        .filter(move |table| table.since_format <= format_version)
 }
 
 /// The source's `calque_control` tables a unit carries and a restore replaces.
@@ -63,66 +76,85 @@ const CONTROL_TABLES: &[ControlTable] = &[
         name: "source_fence_lease",
         columns: "source_id, source_epoch, fence_token, owner_id, lease_phase, expires_at, source_backend_pid",
         order_by: "source_id",
+        since_format: 1,
     },
     ControlTable {
         name: "canonical_log_writer_fence",
         columns: "source_id, source_epoch, fence_token",
         order_by: "source_id",
+        since_format: 1,
     },
     ControlTable {
         name: "source_slot_enrollment",
         columns: "source_id, source_epoch, slot_name, publication_name, system_identifier, database_name, timeline_id, previous_timeline_id, pgoutput_profile, initial_lsn, durable_canonical_lsn, publication_fingerprint, enum_labels_from_lsn",
         order_by: "source_id",
+        since_format: 1,
     },
     ControlTable {
         name: "source_enum_label",
         columns: "source_id, source_epoch, enum_type_oid, label, value_oid, value_xmin, held_from_lsn, seen_from_lsn",
         order_by: "enum_type_oid, label",
+        since_format: 1,
     },
     ControlTable {
         name: "source_enum_version",
         columns: "source_id, source_epoch, value_oid, value_xmin, seen_from_lsn",
         order_by: "value_oid, value_xmin",
+        since_format: 1,
     },
     ControlTable {
         name: "source_column_version",
         columns: "source_id, source_epoch, relation_oid, attribute_number, attribute_xmin, relation_filenode",
         order_by: "relation_oid, attribute_number",
+        since_format: 1,
     },
     ControlTable {
         name: "source_schema_generation",
         columns: "source_id, source_epoch, schema_generation, boundary_sequence, serving_from_lsn",
         order_by: "source_id",
+        since_format: 6,
+    },
+    ControlTable {
+        name: "source_state_format",
+        columns: "source_id, source_epoch, state_format",
+        order_by: "source_id",
+        since_format: 6,
     },
     ControlTable {
         name: "canonical_log_head",
         columns: "source_id, source_epoch, head_sequence",
         order_by: "source_id",
+        since_format: 1,
     },
     ControlTable {
         name: "canonical_log_record",
         columns: "source_id, source_epoch, sequence, transaction_identity, entry_bytes, entry_sha256",
         order_by: "sequence",
+        since_format: 1,
     },
     ControlTable {
         name: "canonical_log_retention",
         columns: "source_id, source_epoch, minimum_retained_sequence, next_build_lease_token, retired_compacted_through_lsn",
         order_by: "source_id",
+        since_format: 1,
     },
     ControlTable {
         name: "canonical_log_plan_retention_lease",
         columns: "source_id, source_epoch, plan_id, minimum_sequence, expires_at",
         order_by: "source_epoch, plan_id",
+        since_format: 1,
     },
     ControlTable {
         name: "canonical_log_build_retention_lease",
         columns: "source_id, source_epoch, build_id, owner_id, lease_token, minimum_sequence, expires_at",
         order_by: "source_epoch, build_id",
+        since_format: 1,
     },
     ControlTable {
         name: "canonical_log_retired_record",
         columns: "source_id, source_epoch, original_sequence, transaction_identity, entry_sha256",
         order_by: "original_sequence",
+        since_format: 1,
     },
 ];
 
@@ -439,8 +471,12 @@ pub fn create_recovery_backup(
     }
     transaction.commit()?;
 
-    let oracle =
-        recovery_oracle_from_backup(destination, &state.names.source_id, &state.source_epoch)?;
+    let oracle = recovery_oracle_from_backup(
+        destination,
+        &state.names.source_id,
+        &state.source_epoch,
+        RECOVERY_FORMAT_VERSION,
+    )?;
     let manifest = RecoveryManifest {
         format_version: RECOVERY_FORMAT_VERSION,
         source_id: state.names.source_id.to_string(),
@@ -491,7 +527,8 @@ pub fn restore_recovery_backup(
     let manifest = read_manifest(backup)?;
     let source_id = SourceId::new(manifest.source_id.clone())?;
     let source_epoch = SourceEpoch::new(manifest.source_epoch.clone())?;
-    let backup_oracle = recovery_oracle_from_backup(backup, &source_id, &source_epoch)?;
+    let backup_oracle =
+        recovery_oracle_from_backup(backup, &source_id, &source_epoch, manifest.format_version)?;
     if backup_oracle != manifest.oracle {
         return Err(RecoveryError::OracleMismatch);
     }
@@ -531,7 +568,11 @@ pub fn restore_recovery_backup(
     if restored_state != state {
         return Err(RecoveryError::BackupIdentityMismatch);
     }
-    restore_control_from_directory(&mut transaction, &backup.join(CONTROL_DIRECTORY))?;
+    restore_control_from_directory(
+        &mut transaction,
+        &backup.join(CONTROL_DIRECTORY),
+        manifest.format_version,
+    )?;
     advance_fence_sequence(&mut transaction, &source_id)?;
     // The object half goes back before the control rows commit, so a store
     // that will not take an object, or will not answer for one afterwards,
@@ -612,7 +653,8 @@ fn verify_restored_in(
         objects,
     )?;
 
-    let control_sha256 = hash_control_from_database(transaction, &state.names.source_id)?;
+    let control_sha256 =
+        hash_control_from_database(transaction, &state.names.source_id, expected.format_version)?;
     let catalog_sha256 = catalog_logical_sha256(&state_root.join(CATALOG_FILE))?;
     let state_sha256 = hash_named_files(state_root, STATE_FILES)?;
     let objects_sha256 = hash_objects(objects, state_root, &state_root.join(CATALOG_FILE))?;
@@ -845,8 +887,9 @@ fn copy_control_to_directory(
 fn restore_control_from_directory(
     transaction: &mut Transaction<'_>,
     directory: &Path,
+    format_version: u32,
 ) -> Result<(), RecoveryError> {
-    for table in CONTROL_TABLES {
+    for table in carried_control_tables(format_version) {
         let path = directory.join(format!("{}.bin", table.name));
         require_regular_file(&path)?;
         let query = format!(
@@ -1109,6 +1152,7 @@ fn recovery_oracle_from_backup(
     backup: &Path,
     source_id: &SourceId,
     source_epoch: &SourceEpoch,
+    format_version: u32,
 ) -> Result<RecoveryOracle, RecoveryError> {
     let state_root = backup.join(STATE_DIRECTORY);
     let state_store = StateStore::open_existing(&state_root)?;
@@ -1118,7 +1162,7 @@ fn recovery_oracle_from_backup(
     }
     state_store.read_registry()?;
     state_store.read_secrets()?;
-    let control_sha256 = hash_control_directory(&backup.join(CONTROL_DIRECTORY))?;
+    let control_sha256 = hash_control_directory(&backup.join(CONTROL_DIRECTORY), format_version)?;
     let catalog_sha256 = catalog_logical_sha256(&state_root.join(CATALOG_FILE))?;
     let state_sha256 = hash_named_files(&state_root, STATE_FILES)?;
     // A unit is always a tree, read through the published-set definition
@@ -1161,10 +1205,10 @@ fn assemble_oracle(
     }
 }
 
-fn hash_control_directory(directory: &Path) -> Result<String, RecoveryError> {
+fn hash_control_directory(directory: &Path, format_version: u32) -> Result<String, RecoveryError> {
     let mut digest = Sha256::new();
     digest.update(b"calque.recovery.control.v1\0");
-    for table in CONTROL_TABLES {
+    for table in carried_control_tables(format_version) {
         hash_field(&mut digest, table.name.as_bytes());
         hash_file_into(&mut digest, &directory.join(format!("{}.bin", table.name)))?;
     }
@@ -1174,13 +1218,14 @@ fn hash_control_directory(directory: &Path) -> Result<String, RecoveryError> {
 fn hash_control_from_database(
     client: &mut impl GenericClient,
     source_id: &SourceId,
+    format_version: u32,
 ) -> Result<String, RecoveryError> {
     let quoted: String = client
         .query_one("SELECT quote_literal($1::text)", &[&source_id.as_str()])?
         .get(0);
     let mut digest = Sha256::new();
     digest.update(b"calque.recovery.control.v1\0");
-    for table in CONTROL_TABLES {
+    for table in carried_control_tables(format_version) {
         hash_field(&mut digest, table.name.as_bytes());
         let query = format!(
             "COPY (SELECT {} FROM calque_control.{} WHERE source_id = {} ORDER BY {}) TO STDOUT WITH (FORMAT binary)",
@@ -1403,7 +1448,9 @@ fn read_manifest(root: &Path) -> Result<RecoveryManifest, RecoveryError> {
         return Err(RecoveryError::ManifestTooLarge);
     }
     let manifest: RecoveryManifest = serde_json::from_slice(&bytes)?;
-    if manifest.format_version != RECOVERY_FORMAT_VERSION {
+    if !(PREVIOUS_RECOVERY_FORMAT_VERSION..=RECOVERY_FORMAT_VERSION)
+        .contains(&manifest.format_version)
+    {
         return Err(RecoveryError::UnsupportedFormat(manifest.format_version));
     }
     Ok(manifest)
@@ -1551,7 +1598,7 @@ pub enum RecoveryError {
     OracleMismatch,
     #[error("recovery manifest exceeds its byte limit")]
     ManifestTooLarge,
-    #[error("recovery unit is format version {0}, and this build reads version {}; restore it with the calque release that took it, or take a fresh unit with calque backup from a deployment running this build", RECOVERY_FORMAT_VERSION)]
+    #[error("recovery unit is format version {0}, and this build reads versions {} and {}; restore it with the calque release that took it, or take a fresh unit with calque backup from a deployment running this build", PREVIOUS_RECOVERY_FORMAT_VERSION, RECOVERY_FORMAT_VERSION)]
     UnsupportedFormat(u32),
     #[error("recovery byte count overflowed")]
     SizeOverflow,
@@ -2225,7 +2272,7 @@ mod tests {
         // corrupt backup.
         assert_eq!(
             RecoveryError::UnsupportedFormat(1).to_string(),
-            "recovery unit is format version 1, and this build reads version 6; restore it with the calque release that took it, or take a fresh unit with calque backup from a deployment running this build"
+            "recovery unit is format version 1, and this build reads versions 5 and 6; restore it with the calque release that took it, or take a fresh unit with calque backup from a deployment running this build"
         );
         assert_eq!(
             RecoveryError::ActiveSourceLease.to_string(),
@@ -2812,11 +2859,12 @@ mod tests {
     /// A unit carries the enum labels its source serves, the enrollment
     /// fields that bound them, its served columns' versions and its schema
     /// generation, so the restored source resumes where the unit left it. A
-    /// unit of an earlier format lacks some of them and is refused by version
-    /// before a restore writes anything.
+    /// unit the release before took, which carries no schema generation,
+    /// restores as generation 1, and one of an older format is refused by
+    /// version before a restore writes anything.
     #[test]
     #[ignore = "requires CALQUE_CONTROL_DATABASE_URL or CALQUE_DATABASE_URL"]
-    fn a_unit_carries_the_served_enum_labels_and_an_earlier_format_is_refused() {
+    fn a_unit_carries_the_served_enum_labels_and_an_older_format_is_refused() {
         let temporary = tempfile::tempdir().unwrap();
         let source_root = temporary.path().join("source");
         let backup_root = temporary.path().join("backup");
@@ -2895,6 +2943,20 @@ mod tests {
                 .collect()
         };
         assert_eq!(schema_generation(&mut control), ["2:0:0/30"]);
+        let state_format = |control: &mut Client| -> Vec<i32> {
+            control
+                .query(
+                    "SELECT state_format FROM calque_control.source_state_format
+                      WHERE source_id = $1",
+                    &[&source_id.as_str()],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect()
+        };
+        let written = i32::try_from(source_runtime::STATE_FORMAT).unwrap();
+        assert_eq!(state_format(&mut control), [written]);
 
         create_recovery_backup(
             &database,
@@ -2915,13 +2977,59 @@ mod tests {
         assert_eq!(carried(&mut control), before);
         assert_eq!(column_versions(&mut control), columns_before);
         assert_eq!(schema_generation(&mut control), ["2:0:0/30"]);
+        assert_eq!(state_format(&mut control), [written]);
 
-        let earlier = temporary.path().join("earlier");
-        copy_tree(&backup_root, &earlier).unwrap();
-        let mut manifest = read_manifest(&earlier).unwrap();
-        manifest.format_version = 5;
+        let previous = temporary.path().join("previous");
+        copy_tree(&backup_root, &previous).unwrap();
+        for table in ["source_schema_generation", "source_state_format"] {
+            fs::remove_file(
+                previous
+                    .join(CONTROL_DIRECTORY)
+                    .join(format!("{table}.bin")),
+            )
+            .unwrap();
+        }
+        let mut manifest = read_manifest(&previous).unwrap();
+        manifest.format_version = PREVIOUS_RECOVERY_FORMAT_VERSION;
+        manifest.oracle = recovery_oracle_from_backup(
+            &previous,
+            &source_id,
+            &SourceEpoch::new(manifest.source_epoch.clone()).unwrap(),
+            PREVIOUS_RECOVERY_FORMAT_VERSION,
+        )
+        .unwrap();
         fs::write(
-            earlier.join(COMPLETE_FILE),
+            previous.join(COMPLETE_FILE),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        lose_control_rows(&mut control, &source_id);
+        let restored_previous = temporary.path().join("restored-previous");
+        restore_recovery_backup(
+            &database,
+            &previous,
+            &restored_previous,
+            ExistingSourceRows::Refuse,
+            RecoveryObjects::StateDirectory,
+        )
+        .unwrap();
+        assert_eq!(carried(&mut control), before);
+        assert_eq!(column_versions(&mut control), columns_before);
+        assert!(schema_generation(&mut control).is_empty());
+        assert!(state_format(&mut control).is_empty());
+        verify_restored_recovery_backup(
+            &database,
+            &previous,
+            &restored_previous,
+            RecoveryObjects::StateDirectory,
+        )
+        .unwrap();
+
+        let older = temporary.path().join("older");
+        copy_tree(&previous, &older).unwrap();
+        manifest.format_version = PREVIOUS_RECOVERY_FORMAT_VERSION - 1;
+        fs::write(
+            older.join(COMPLETE_FILE),
             serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
@@ -2929,14 +3037,14 @@ mod tests {
         let refused = temporary.path().join("refused");
         let error = restore_recovery_backup(
             &database,
-            &earlier,
+            &older,
             &refused,
             ExistingSourceRows::Refuse,
             RecoveryObjects::StateDirectory,
         )
         .unwrap_err();
         assert!(
-            matches!(error, RecoveryError::UnsupportedFormat(5)),
+            matches!(error, RecoveryError::UnsupportedFormat(version) if version == PREVIOUS_RECOVERY_FORMAT_VERSION - 1),
             "{error}"
         );
         assert!(!refused.exists());

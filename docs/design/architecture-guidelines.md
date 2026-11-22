@@ -63,8 +63,10 @@ The rest of this document is the target. These parts of it are not built:
 - The `calque.*` identifier rule: the wire identifiers are `sync.change.v1`
   (`wireProtocol` in `spec/bootstrap-plan.schema.json`) and `sync.mutation.v1`
   (`LOGICAL_MARKER_PREFIX` in `server/crates/mutation-api/src/lib.rs`).
-- Upgrade, rollback and rolling deployment: a build reads only state in the
-  format it writes ([operations, Upgrades](operations.md#upgrades)), no grace
+- Rollback across releases and rolling deployment: a release upgrades in
+  place from the one before it, but refuses state a later release wrote, so
+  going back is a `calque destroy` and a new preparation
+  ([operations, Upgrades](operations.md#upgrades)); no grace
   rule keeps old application or schema versions on CDC, and there is no
   two-version overlap of `calque`, because two versions would be two writers
   ([operations](operations.md#what-the-self-hosted-composition-does-not-do)).

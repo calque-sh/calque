@@ -26,11 +26,12 @@ use source_control::{
 use source_runtime::{
     establish_persistent_source, establish_persistent_source_interruptible,
     inspect_owned_publication, provision_persistent_slot, read_schema_generation,
-    start_schema_generation, AcquireRequest, ActiveSourceSession, FenceAuthority, FenceError,
-    FenceStore, LeaseIdentity, OwnedPublication, OwnerId, PersistentIngestBoundary,
-    PersistentIngestConfig, PersistentIngestDisposition, PersistentIngestError,
-    PersistentIngestObserver, PostgresFenceStore, PostgresRefusal, SlotProvisioningConfig,
-    SourceRuntimeError, SourceStartupShutdown, DEFAULT_OPEN_TRANSACTION_WAIT,
+    read_state_format, start_schema_generation, state_upgrade, AcquireRequest, ActiveSourceSession,
+    FenceAuthority, FenceError, FenceStore, LaterStateFormat, LeaseIdentity, OwnedPublication,
+    OwnerId, PersistentIngestBoundary, PersistentIngestConfig, PersistentIngestDisposition,
+    PersistentIngestError, PersistentIngestObserver, PostgresFenceStore, PostgresRefusal,
+    SlotProvisioningConfig, SourceRuntimeError, SourceStartupShutdown, StateUpgrade,
+    DEFAULT_OPEN_TRANSACTION_WAIT,
 };
 use sync_types::{CursorCodec, CursorPosition};
 use thiserror::Error;
@@ -239,6 +240,9 @@ fn prepare_local_source_unexplained(
     if inspect_identity(&mut client)? != state.source_identity {
         return Err(LocalSourceError::SourceIdentityChanged);
     }
+    let force_move = force_move
+        || state_upgrade(read_state_format(&mut client, &state.names.source_id)?)?
+            == StateUpgrade::Reprepare;
     if let Some(warning) = slot_wal_warning(&mut client)? {
         tracing::warn!("{warning}");
     }
@@ -1026,6 +1030,10 @@ fn start_local_source_runtime_sampling(
                         authority.release_after_failure(&provisional);
                         return Err(session_error(error, &prepared.activated));
                     }
+                }
+                if let Err(error) = authority.record_state_format(&provisional) {
+                    authority.release_after_failure(&provisional);
+                    return Err(error.into());
                 }
                 let schema_boundary = match start_schema_generation(
                     &authority,
@@ -2566,6 +2574,8 @@ pub enum LocalSourceError {
     /// meets the enrollment the old one left.
     #[error("this source was enrolled by another state directory at the same path.")]
     EnrolledByAnotherState,
+    #[error(transparent)]
+    LaterStateFormat(#[from] LaterStateFormat),
     #[error("the configured table set is empty")]
     EmptyTableSet,
     #[error("the PostgreSQL publication {publication} was altered: Calque needs it to publish exactly the enrolled tables, for insert, update, delete and truncate, without publish_via_partition_root or row filters, with the column lists it had at enrollment.")]
@@ -2626,9 +2636,10 @@ impl LocalSourceError {
     /// an earlier release wrote, whether connecting the log refused it or an
     /// ingest step met it, a schema registry that does not match the state
     /// beside it, a source another state directory enrolled or an earlier
-    /// release enrolled, or a replication slot that was dropped or that
-    /// PostgreSQL invalidated, since the changes it held cannot be replayed
-    /// and the working set has to be prepared anew. A failed session cleanup
+    /// release enrolled, a source whose state a later release wrote, unless
+    /// that release serves it again, or a replication slot that was dropped
+    /// or that PostgreSQL invalidated, since the changes it held cannot be
+    /// replayed and the working set has to be prepared anew. A failed session cleanup
     /// after one of them needs it too, since the cause stands. A schema change
     /// does not: it moves the source to its next schema generation.
     pub fn requires_destroying_state(&self) -> bool {
@@ -2646,7 +2657,9 @@ impl LocalSourceError {
                 | SourceRuntimeError::EnrolledByEarlierRelease,
             )
             | Self::RegistryStateMismatch
-            | Self::EnrolledByAnotherState => true,
+            | Self::EnrolledByAnotherState
+            | Self::LaterStateFormat(_)
+            | Self::Fence(FenceError::LaterStateFormat(_)) => true,
             Self::SessionCleanupFailedAfter(cause) => cause.requires_destroying_state(),
             _ => false,
         }
@@ -3618,6 +3631,10 @@ mod tests {
                 LocalSourceError::RegistryStateMismatch,
                 LocalSourceError::EnrolledByAnotherState,
                 LocalSourceError::Runtime(SourceRuntimeError::EnrolledByEarlierRelease),
+                LocalSourceError::LaterStateFormat(LaterStateFormat { recorded: 3 }),
+                LocalSourceError::Fence(FenceError::LaterStateFormat(LaterStateFormat {
+                    recorded: 3,
+                })),
             ])
             .chain(slot_gone)
         {
@@ -5944,6 +5961,92 @@ mod tests {
                 "{drift:?}"
             );
         }
+    }
+
+    /// A source whose state a later release wrote is refused before this
+    /// build reads or writes it: by the start's preparation, and under the
+    /// fence lease when a later release stamped the source after that
+    /// preparation read it. The refusal leaves the later stamp in place. A
+    /// source no release stamped, as release 0.4.0 leaves one, is stamped
+    /// with this build's format at its next start.
+    #[test]
+    #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
+    fn a_source_a_later_release_wrote_is_refused_and_an_unstamped_one_is_stamped() {
+        let mut fixture = ReconnectFixture::create("state_format");
+        let source_id = fixture.state.names.source_id.clone();
+        let recorded = |client: &mut Client| -> Option<i32> {
+            client
+                .query_opt(
+                    "SELECT state_format FROM calque_control.source_state_format
+                      WHERE source_id = $1",
+                    &[&source_id.as_str()],
+                )
+                .unwrap()
+                .map(|row| row.get(0))
+        };
+        let stamp = |client: &mut Client, format: i32| {
+            let stamped = client
+                .execute(
+                    "UPDATE calque_control.source_state_format SET state_format = $2
+                      WHERE source_id = $1",
+                    &[&source_id.as_str(), &format],
+                )
+                .unwrap();
+            assert_eq!(stamped, 1);
+        };
+        let written = i32::try_from(source_runtime::STATE_FORMAT).unwrap();
+        let later = written + 1;
+        let prepare = |fixture: &ReconnectFixture| {
+            prepare_local_source(
+                &fixture.database_url,
+                &fixture.state,
+                &LocalSecrets::generate().unwrap(),
+                None,
+            )
+        };
+
+        fixture.start(OperationsMetrics::new()).shutdown().unwrap();
+        assert_eq!(recorded(&mut fixture.client), Some(written));
+        fixture
+            .client
+            .execute(
+                "DELETE FROM calque_control.source_state_format WHERE source_id = $1",
+                &[&source_id.as_str()],
+            )
+            .unwrap();
+        fixture.start(OperationsMetrics::new()).shutdown().unwrap();
+        assert_eq!(recorded(&mut fixture.client), Some(written));
+
+        stamp(&mut fixture.client, later);
+        let error = prepare(&fixture).err().expect("a later format is refused");
+        assert!(
+            matches!(
+                error,
+                LocalSourceError::LaterStateFormat(LaterStateFormat { recorded })
+                    if i64::from(recorded) == i64::from(later)
+            ),
+            "{error:?}"
+        );
+        assert!(error.requires_destroying_state());
+        assert_eq!(recorded(&mut fixture.client), Some(later));
+
+        stamp(&mut fixture.client, written);
+        let prepared = prepare(&fixture).unwrap();
+        stamp(&mut fixture.client, later);
+        let error = fixture
+            .try_start_prepared(prepared, OperationsMetrics::new(), None)
+            .err()
+            .expect("a later format stamped after the preparation is refused");
+        assert!(
+            matches!(
+                error,
+                LocalSourceError::Fence(FenceError::LaterStateFormat(LaterStateFormat { recorded }))
+                    if i64::from(recorded) == i64::from(later)
+            ),
+            "{error:?}"
+        );
+        assert!(error.requires_destroying_state());
+        assert_eq!(recorded(&mut fixture.client), Some(later));
     }
 
     /// An enrollment that records no enum labels was made by an earlier

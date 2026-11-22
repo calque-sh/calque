@@ -28,6 +28,7 @@ mod persistent_ingest;
 mod publication;
 mod schema_generation;
 mod slot_owner;
+mod state_format;
 
 pub use column_versions::ColumnVersion;
 pub use enum_labels::{EnumLabelDrift, SeenEnumVersion, ServedEnumLabel};
@@ -46,6 +47,9 @@ pub use slot_owner::{
     provision_persistent_slot, start_schema_generation, ActiveSourceSession, OpenTransaction,
     SlotEnrollment, SlotMetadata, SlotProvisioningConfig, SourceRuntimeError,
     DEFAULT_OPEN_TRANSACTION_WAIT,
+};
+pub use state_format::{
+    read_state_format, state_upgrade, LaterStateFormat, StateUpgrade, STATE_FORMAT,
 };
 
 /// Cross-thread, single-purpose revocation for source-session startup.
@@ -232,6 +236,12 @@ CREATE TABLE IF NOT EXISTS calque_control.source_schema_generation (
     schema_generation bigint NOT NULL CHECK (schema_generation > 1),
     boundary_sequence bigint NOT NULL CHECK (boundary_sequence >= 0),
     serving_from_lsn pg_lsn
+);
+CREATE TABLE IF NOT EXISTS calque_control.source_state_format (
+    source_id text PRIMARY KEY
+        REFERENCES calque_control.source_slot_enrollment (source_id) ON DELETE CASCADE,
+    source_epoch text NOT NULL,
+    state_format integer NOT NULL CHECK (state_format > 1)
 );
 CREATE TABLE IF NOT EXISTS calque_control.source_column_version (
     source_id text NOT NULL
@@ -535,6 +545,10 @@ pub trait FenceStore: Send + Sync {
         from_lsn: u64,
     ) -> Result<(), FenceError>;
 
+    /// Records that the source's state is at this build's format, refusing
+    /// with [`FenceError::LaterStateFormat`] when a later one is recorded.
+    fn record_state_format(&self, lease: &LeaseIdentity) -> Result<(), FenceError>;
+
     fn transition_active(
         &self,
         lease: &LeaseIdentity,
@@ -827,6 +841,12 @@ where
             self.store
                 .record_schema_move(identity, generation, baseline)
         })
+    }
+
+    /// Records this build's state format before the runtime this lease
+    /// starts writes anything a later or earlier build would misread.
+    pub fn record_state_format(&self, lease: &ProvisionalLease) -> Result<(), FenceError> {
+        self.operate(lease, |identity| self.store.record_state_format(identity))
     }
 
     fn activate(
@@ -1715,6 +1735,50 @@ impl FenceStore for PostgresFenceStore {
         })
     }
 
+    fn record_state_format(&self, lease: &LeaseIdentity) -> Result<(), FenceError> {
+        let writes = i32::try_from(STATE_FORMAT).expect("the state format fits an integer");
+        self.with_owned_lease(lease, |transaction, current| {
+            if current.phase != LeasePhase::Provisional {
+                return Err(FenceError::WrongLeasePhase {
+                    expected: LeasePhase::Provisional,
+                    actual: current.phase,
+                });
+            }
+            let recorded = transaction
+                .query_opt(
+                    "INSERT INTO calque_control.source_state_format (
+                        source_id, source_epoch, state_format
+                     ) VALUES ($1, $2, $3)
+                     ON CONFLICT (source_id) DO UPDATE
+                        SET source_epoch = EXCLUDED.source_epoch,
+                            state_format = EXCLUDED.state_format
+                      WHERE calque_control.source_state_format.state_format
+                            <= EXCLUDED.state_format
+                     RETURNING state_format",
+                    &[
+                        &lease.source_id.as_str(),
+                        &lease.source_epoch.as_str(),
+                        &writes,
+                    ],
+                )
+                .map_err(store_error)?;
+            if recorded.is_some() {
+                return Ok(());
+            }
+            let later: i32 = transaction
+                .query_one(
+                    "SELECT state_format FROM calque_control.source_state_format
+                      WHERE source_id = $1",
+                    &[&lease.source_id.as_str()],
+                )
+                .map_err(store_error)?
+                .get(0);
+            Err(FenceError::LaterStateFormat(LaterStateFormat {
+                recorded: later.unsigned_abs(),
+            }))
+        })
+    }
+
     fn transition_active(
         &self,
         lease: &LeaseIdentity,
@@ -2264,6 +2328,8 @@ pub enum FenceError {
     },
     #[error("the recorded schema generation is not {0}")]
     SchemaGenerationMismatch(u64),
+    #[error(transparent)]
+    LaterStateFormat(#[from] LaterStateFormat),
 }
 
 #[cfg(test)]
@@ -2526,6 +2592,10 @@ mod tests {
             _: u64,
             _: u64,
         ) -> Result<(), FenceError> {
+            unreachable!("not scripted")
+        }
+
+        fn record_state_format(&self, _: &LeaseIdentity) -> Result<(), FenceError> {
             unreachable!("not scripted")
         }
 

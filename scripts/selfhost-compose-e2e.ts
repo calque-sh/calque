@@ -3,8 +3,13 @@
 /**
  * Runs the self-hosted composition end to end from a clean state.
  *
- * Brings `docker-compose.selfhost.yml` up on run-scoped credentials, seeds the
- * source, and drives a headless-Chromium page through `createSyncClient`
+ * Brings `docker-compose.selfhost.yml` up on run-scoped credentials and seeds
+ * the source. The last published release's image serves it first, to a page
+ * built against the client that release published; this tree's image then
+ * replaces it with no `calque destroy`, and the page, still open, follows the
+ * upgraded server and holds PostgreSQL's rows. The published release, started
+ * again, must refuse the state this tree wrote when the two record different
+ * state formats. A headless-Chromium page then drives `createSyncClient`
  * against the Caddy TLS edge: a source change reaches the page, and a write
  * through the generated facade is confirmed by its CDC echo. It then recreates
  * `postgres` under the running server, stops, recreates and kills the server,
@@ -13,8 +18,9 @@
  * and not the container's filesystem, and the page must read them through the
  * edge. It prints one JSON outcome and exits non-zero on any failure.
  *
- * Usage: `pnpm selfhost:e2e`. Requires Docker and a Rust toolchain, and on
- * Linux NSS's `certutil` (Debian and Ubuntu: `libnss3-tools`).
+ * Usage: `pnpm selfhost:e2e`. Requires Docker, a Rust toolchain, npm and the
+ * registries the published image and client come from, and on Linux NSS's
+ * `certutil` (Debian and Ubuntu: `libnss3-tools`).
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -27,7 +33,15 @@ import {
 import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { connect as tlsConnect, type DetailedPeerCertificate } from "node:tls";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, extname, join, normalize, resolve } from "node:path";
 import process from "node:process";
@@ -79,9 +93,17 @@ const CADDY_LOCAL_ROOT = "/data/caddy/pki/authorities/local/root.crt";
 const SEEDED_PROJECTS = 3;
 const SEEDED_TASKS = 9;
 
+interface Upgrade {
+  readonly from: string;
+  readonly fromStateFormat: number;
+  readonly toStateFormat: number;
+  readonly rollback: string;
+}
+
 interface RunOutcome {
   readonly result: "PASS";
   readonly project: string;
+  readonly upgrade: Upgrade;
   readonly edge: string;
   readonly browserTrust: BrowserTrust["mode"];
   readonly browserOrigins: readonly string[];
@@ -388,6 +410,172 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON projects, tasks TO calque_sync;
 `;
 
 const CHANGED_PROJECT_NAME = `Atlas launch ${runId}`;
+
+const UPGRADED_PROJECT_NAME = `Billing reliability ${runId}`;
+
+/** Where the registry publishes each release's image. */
+const RELEASE_IMAGE = "ghcr.io/calque-sh/calque";
+
+/**
+ * The newest release `CHANGELOG.md` records whose image the registry serves,
+ * pulled. Between a release's commit and its publication the newest one is
+ * not there yet, and the one before it is the last published.
+ */
+function lastPublishedRelease(): { version: string; image: string } {
+  const versions = [
+    ...readFileSync(join(root, "CHANGELOG.md"), "utf8").matchAll(
+      /^## (\d+\.\d+\.\d+) \(/gm,
+    ),
+  ].map((match) => match[1] ?? "");
+  for (const version of versions) {
+    const image = `${RELEASE_IMAGE}:${version}`;
+    const pulled = spawnSync("docker", ["pull", "--quiet", image], {
+      encoding: "utf8",
+    });
+    if (pulled.status === 0) return { version, image };
+    if (!/manifest unknown|not found/i.test(pulled.stderr))
+      throw new Error(`docker pull ${image} failed: ${pulled.stderr}`);
+  }
+  throw new Error("no release CHANGELOG.md records has a published image");
+}
+
+/**
+ * This tree's composition page built against `@calque/client@<version>` from
+ * npm, into `previous/` beside this tree's build: a page a browser opened
+ * before an upgrade keeps the client it loaded. The page and its bindings use
+ * only the client API that release published. The project's own packages are
+ * exempt from a minimum release age the npm configuration sets, which would
+ * otherwise refuse a release for its first days; every other package keeps it.
+ */
+function buildPreviousPage(version: string): void {
+  const project = join(workDirectory, "previous-page");
+  const tests = join(root, "client/packages/client/tests");
+  mkdirSync(project, { recursive: true });
+  // The package's layout, so each page's tsconfig finds the one it extends.
+  for (const page of ["selfhost-compose", "demo"])
+    cpSync(join(tests, page), join(project, "tests", page), {
+      recursive: true,
+    });
+  writeFileSync(
+    join(project, "tsconfig.json"),
+    `${JSON.stringify({
+      compilerOptions: {
+        target: "ES2022",
+        module: "ESNext",
+        moduleResolution: "bundler",
+        strict: true,
+      },
+    })}\n`,
+  );
+  const { devDependencies } = JSON.parse(
+    readFileSync(join(root, "client/packages/client/package.json"), "utf8"),
+  ) as { devDependencies: Record<string, string> };
+  writeFileSync(
+    join(project, "package.json"),
+    `${JSON.stringify({
+      private: true,
+      type: "module",
+      dependencies: {
+        "@calque/client": version,
+        vite: devDependencies.vite,
+      },
+    })}\n`,
+  );
+  const packages = join(root, "client/packages");
+  const ownPackages = readdirSync(packages)
+    .map((directory) => join(packages, directory, "package.json"))
+    .filter((manifest) => existsSync(manifest))
+    .map(
+      (manifest) =>
+        (JSON.parse(readFileSync(manifest, "utf8")) as { name: string }).name,
+    )
+    .filter((name) => name.startsWith("@calque/"));
+  run("npm", [
+    "install",
+    "--prefix",
+    project,
+    "--no-audit",
+    "--no-fund",
+    "--ignore-scripts",
+    ...ownPackages.map((name) => `--min-release-age-exclude=${name}`),
+  ]);
+  writeFileSync(
+    join(project, "tests/selfhost-compose/vite.config.mjs"),
+    `import { calque } from "@calque/client/vite";
+export default {
+  plugins: [calque()],
+  base: "./",
+  build: { outDir: ${JSON.stringify(join(pageRoot, "previous"))}, emptyOutDir: true },
+};
+`,
+  );
+  run(
+    join(project, "node_modules/.bin/vite"),
+    ["build", "tests/selfhost-compose"],
+    { cwd: project },
+  );
+}
+
+/**
+ * The state format the source's state is at: 1 when no row records one, as
+ * every release through 0.4.0 leaves it.
+ */
+function stateFormat(): number {
+  const installed = psql(
+    "SELECT to_regclass('calque_control.source_state_format') IS NOT NULL AS installed;",
+  );
+  if (!/(^|\s)t(\s|$)/m.test(installed)) return 1;
+  const recorded = /(^|\s)(\d+)(\s|$)/m.exec(
+    psql(
+      "SELECT coalesce(max(state_format), 1) AS state_format FROM calque_control.source_state_format;",
+    ),
+  );
+  if (!recorded?.[2]) throw new Error("the state format did not read back");
+  return Number(recorded[2]);
+}
+
+/**
+ * One query's rows, as the JSON array `json_agg` makes of them, on one line:
+ * psql's aligned output marks a newline inside a value with `+`.
+ */
+function rowsOf(query: string): unknown {
+  const line = psql(
+    `SELECT 'rows:' || replace(coalesce(json_agg(r)::text, '[]'), chr(10), ' ') FROM (${query}) r;`,
+  )
+    .split("\n")
+    .map((text) => text.trim())
+    .find((text) => text.startsWith("rows:"));
+  if (line === undefined) throw new Error(`no rows read back for ${query}`);
+  return JSON.parse(line.slice("rows:".length));
+}
+
+/**
+ * The page's rows and PostgreSQL's, as the same arrays: projects as
+ * `[id, name, status]` and tasks as `[id, title, done]`, by id.
+ */
+function sourceRows(): {
+  projects: readonly (readonly [number, string, string])[];
+  tasks: readonly (readonly [number, string, boolean])[];
+} {
+  const values = (rows: unknown) =>
+    (rows as Record<string, unknown>[]).map((row) => Object.values(row));
+  return {
+    projects: values(
+      rowsOf("SELECT id, name, status FROM projects ORDER BY id"),
+    ) as [number, string, string][],
+    tasks: values(rowsOf("SELECT id, title, done FROM tasks ORDER BY id")) as [
+      number,
+      string,
+      boolean,
+    ][],
+  };
+}
+
+function byId<T extends readonly [number, ...unknown[]]>(
+  rows: readonly T[],
+): T[] {
+  return [...rows].sort((left, right) => left[0] - right[0]);
+}
 
 /**
  * The page's own origin, a plain static server rather than a proxy, so every
@@ -741,121 +929,12 @@ async function main(): Promise<RunOutcome> {
     }
   };
 
-  compose("up", "-d", "calque");
-  const startupLines: string[] = [];
-  await waitFor(
-    "the server to report readiness",
-    READY_TIMEOUT_MS,
-    async () => {
-      const logs = compose("logs", "--no-log-prefix", "calque");
-      startupLines.length = 0;
-      startupLines.push(...logs.split("\n").map((line) => line.trim()));
-      return startupLines.some((line) =>
-        line.startsWith("Calque serve is ready"),
-      );
-    },
-  );
-
-  const contract = new Map(
-    startupLines
-      .filter((line) => line.includes("="))
-      .map((line) => {
-        const at = line.indexOf("=");
-        return [line.slice(0, at), line.slice(at + 1)] as const;
-      }),
-  );
-  assert.equal(
-    contract.get("object_store"),
-    "s3",
-    `the startup contract must report the S3 store; got ${JSON.stringify(startupLines)}`,
-  );
-  assert.equal(contract.get("artifact"), "published");
-  assert.equal(contract.get("ready"), "true");
-  assert.equal(contract.get("expected_host"), PUBLIC_HOST);
-  const metricsHost = `127.0.0.1:${String(metricsPort)}`;
-  assert.equal(contract.get("metrics_listener"), "configured-bind-address");
-  assert.equal(contract.get("metrics_expected_host"), metricsHost);
-  assert.equal(
-    contract.get("mutations"),
-    "mounted-per-collection-command-grant",
-  );
-  assert.equal(
-    contract.get("mutation_commands"),
-    "projects:insert+update+delete,tasks:insert+update+delete",
-  );
-  const startupMillis = Number(contract.get("startup_millis"));
-  assert.ok(Number.isFinite(startupMillis));
-  assert.ok(
-    startupLines.includes(`Calque serve is ready at ${serverBase}/`),
-    `the server must name the edge as its public address; got ${JSON.stringify(startupLines)}`,
-  );
-
-  await waitFor(
-    "readiness through the edge",
-    60_000,
-    async () => (await probe("/readyz")) === 204,
-  );
-  // Nothing the edge forwards to serves the scrape: the HTTP listener has no
-  // `/metrics`, and the metrics listener answers only on its loopback port,
-  // to the `Host` that port carries.
-  assert.equal((await edge(caddyRoot, httpsPort, "/metrics")).status, 404);
-  assert.equal(await plaintext(httpPort, "/metrics", PUBLIC_HOST), 404);
-  const scrape = await plaintextResponse(metricsPort, "/metrics", metricsHost);
-  assert.equal(scrape.status, 200);
-  assert.ok(
-    scrape.body.endsWith("# EOF\n"),
-    `the scrape must be OpenMetrics; got ${scrape.body.slice(-200)}`,
-  );
-  assert.equal(await plaintext(metricsPort, "/metrics", PUBLIC_HOST), 421);
-
-  // The server's own plaintext listener answers an operator who names the
-  // public host, and refuses the `Host` any browser sent there would carry.
-  assert.equal(await plaintext(httpPort, "/readyz", PUBLIC_HOST), 204);
-  const plaintextListenerBrowserHostStatus = await plaintext(
-    httpPort,
-    "/readyz",
-    `${PUBLIC_HOST}:${String(httpPort)}`,
-  );
-  assert.equal(plaintextListenerBrowserHostStatus, 421);
-  assert.equal(
-    await plaintext(httpPort, "/readyz", `127.0.0.1:${String(httpPort)}`),
-    421,
-  );
-
-  // The artifact bytes are in the object store, and nowhere else. A run that
-  // fell back to the filesystem store would pass every browser assertion
-  // below, so this is checked before any of them.
-  const listing = mc(
-    "ls",
-    "--recursive",
-    `selfhost/${environment.CALQUE_S3_BUCKET ?? ""}`,
-  )
-    .split("\n")
-    .filter((line) =>
-      line.includes(`${environment.CALQUE_S3_PREFIX}/objects/`),
-    );
-  assert.ok(
-    listing.length > 0,
-    "the composition's bucket holds no artifact objects; the server fell back to the filesystem store",
-  );
-  const containerObjects = compose(
-    "exec",
-    "-T",
-    "calque",
-    "sh",
-    "-c",
-    "find /var/lib/calque/state/objects -type f | wc -l",
-  ).trim();
-  assert.equal(
-    Number(containerObjects),
-    0,
-    `the container's filesystem object tree holds ${containerObjects} files; the server did not use the object store`,
-  );
-
   // The client packages the page imports, then the page, so neither is built
   // against a stale `dist/`.
   run("pnpm", ["--filter", "@calque/client...", "build"]);
   run("pnpm", ["--filter", "@calque/client", "selfhost:build"]);
+  const published = lastPublishedRelease();
+  buildPreviousPage(published.version);
   const pageServer = servePage(pagePort);
   const requireFromClient = createRequire(
     join(root, "client/packages/client/package.json"),
@@ -877,7 +956,9 @@ async function main(): Promise<RunOutcome> {
     // served to the next out of its storage. The context records the origin
     // of every request sent anywhere but the page's own origin, including
     // the ones a worker sends, which the page's fetch wrapper cannot see.
-    const openPage = async (): Promise<{
+    const openPage = async (
+      path = "/",
+    ): Promise<{
       readonly page: Page;
       readonly errors: string[];
       readonly origins: Set<string>;
@@ -914,9 +995,299 @@ async function main(): Promise<RunOutcome> {
         },
         [`${serverBase}/`, minted.token] as const,
       );
-      await opened.goto(pageOrigin, { waitUntil: "load", timeout: 60_000 });
+      await opened.goto(`${pageOrigin}${path}`, {
+        waitUntil: "load",
+        timeout: 60_000,
+      });
       return { page: opened, errors, origins, failedRequests };
     };
+    // ---- An upgrade from the last published release ----
+    //
+    // The published release prepares the source and serves a page built
+    // against the client it published. This tree's image then replaces it on
+    // the same volumes and database, as an operator's upgrade does, with no
+    // `calque destroy`, and the page, still open, follows the upgraded server.
+    const treeImage = environment.CALQUE_SELFHOST_IMAGE ?? "";
+    // Built first, so the upgrade below is a restart on an image at hand.
+    compose("build", "calque");
+    environment.CALQUE_SELFHOST_IMAGE = published.image;
+    compose("up", "-d", "--no-build", "calque");
+    await waitFor(
+      `release ${published.version} to serve`,
+      READY_TIMEOUT_MS,
+      async () => (await probe("/readyz")) === 204,
+    );
+    const publishedContainer = compose("ps", "-q", "calque").trim();
+    const fromStateFormat = stateFormat();
+    const before = await openPage("/previous/index.html");
+    const pageState = async () => {
+      const state = await before.page.evaluate(() =>
+        globalThis.__calqueSelfhostState(),
+      );
+      if (state.state === "error")
+        throw new Error(
+          `the page opened before the upgrade failed: ${state.failure ?? "unknown"}; failed requests: ${JSON.stringify(before.failedRequests)}`,
+        );
+      return state;
+    };
+    const canonical = async (id: number, title: string) => {
+      const write = await before.page.evaluate(
+        ([taskId, taskTitle]) =>
+          globalThis.__calqueSelfhostUpdateTask(taskId, taskTitle),
+        [id, title] as const,
+      );
+      assert.equal(
+        write.state,
+        "awaiting_canonical_echo",
+        JSON.stringify(write),
+      );
+      await waitFor(
+        `the write of task ${String(id)} to become canonical`,
+        CHANGE_TIMEOUT_MS,
+        async () => {
+          const state = await before.page.evaluate(
+            (mutationId) =>
+              globalThis.__calqueSelfhostMutationState(mutationId),
+            write.mutationId,
+          );
+          if (state !== "canonical" && state !== "awaiting_canonical_echo")
+            throw new Error(`the write settled as ${String(state)}`);
+          return state === "canonical";
+        },
+      );
+      return write.mutationId;
+    };
+    await waitFor(
+      `release ${published.version} to mount the working set`,
+      120_000,
+      async () => {
+        const state = await pageState();
+        return (
+          state.state === "ready" &&
+          state.projects.length === SEEDED_PROJECTS &&
+          state.tasks.length === SEEDED_TASKS
+        );
+      },
+    );
+    const writtenBefore = await canonical(
+      1002,
+      `Validate the data migration ${runId}`,
+    );
+
+    environment.CALQUE_SELFHOST_IMAGE = treeImage;
+    compose("up", "-d", "--no-build", "calque");
+    const upgradedContainer = compose("ps", "-q", "calque").trim();
+    assert.notEqual(
+      upgradedContainer,
+      publishedContainer,
+      "this tree's image did not replace the published release's container",
+    );
+    await waitFor(
+      "the upgraded server to serve",
+      READY_TIMEOUT_MS,
+      async () => (await probe("/readyz")) === 204,
+    );
+    const upgradedLogs = compose("logs", "--no-log-prefix", "calque");
+    assert.ok(
+      !upgradedLogs.includes("calque destroy"),
+      `the upgraded server asked for calque destroy:\n${upgradedLogs}`,
+    );
+    const toStateFormat = stateFormat();
+    assert.ok(
+      toStateFormat >= fromStateFormat && toStateFormat > 1,
+      `the upgraded server recorded state format ${String(toStateFormat)} over ${String(fromStateFormat)}`,
+    );
+    assert.match(
+      psql(
+        `SELECT count(*) AS kept FROM calque_internal.mutation_receipts WHERE mutation_id = '${writtenBefore}';`,
+      ),
+      /(^|\s)1(\s|$)/m,
+      "the receipt of the write applied before the upgrade was lost",
+    );
+    psql(
+      `UPDATE projects SET name = '${UPGRADED_PROJECT_NAME}' WHERE id = 102;`,
+    );
+    await waitFor(
+      "the page opened before the upgrade to follow the upgraded server",
+      CHANGE_TIMEOUT_MS,
+      async () =>
+        (await pageState()).projects.some(
+          ([id, name]) => id === 102 && name === UPGRADED_PROJECT_NAME,
+        ),
+    );
+    await canonical(1003, `Review launch telemetry ${runId}`);
+    const followed = await pageState();
+    assert.deepEqual(
+      { projects: byId(followed.projects), tasks: byId(followed.tasks) },
+      sourceRows(),
+      "the page opened before the upgrade does not hold PostgreSQL's rows",
+    );
+    assert.deepEqual(before.errors, []);
+    await before.page.context().close();
+
+    // The published release, started again on the upgraded state, refuses it
+    // and names the remedy when this tree records a later format. One that
+    // records none predates the refusal, and is not started again.
+    let rollback: string;
+    if (fromStateFormat === 1) {
+      rollback = `not run: ${published.version} records no state format`;
+    } else if (toStateFormat === fromStateFormat) {
+      rollback = `not run: ${published.version} writes this tree's state format`;
+    } else {
+      compose("stop", "calque");
+      environment.CALQUE_SELFHOST_IMAGE = published.image;
+      compose("up", "-d", "--no-build", "calque");
+      await waitFor(
+        `release ${published.version} to refuse the upgraded state`,
+        READY_TIMEOUT_MS,
+        async () =>
+          compose("logs", "--no-log-prefix", "calque").includes(
+            "written by a later release of calque",
+          ),
+      );
+      const refusal = compose("logs", "--no-log-prefix", "calque");
+      assert.ok(
+        refusal.includes("calque destroy"),
+        `the refusal names no remedy:\n${refusal}`,
+      );
+      environment.CALQUE_SELFHOST_IMAGE = treeImage;
+      compose("up", "-d", "calque");
+      await waitFor(
+        "this tree's server to serve again",
+        READY_TIMEOUT_MS,
+        async () => (await probe("/readyz")) === 204,
+      );
+      rollback = "refused, naming the remedy";
+    }
+    const upgrade: Upgrade = {
+      from: published.version,
+      fromStateFormat,
+      toStateFormat,
+      rollback,
+    };
+
+    const startupLines: string[] = [];
+    await waitFor(
+      "the server to report readiness",
+      READY_TIMEOUT_MS,
+      async () => {
+        const logs = compose("logs", "--no-log-prefix", "calque");
+        startupLines.length = 0;
+        startupLines.push(...logs.split("\n").map((line) => line.trim()));
+        return startupLines.some((line) =>
+          line.startsWith("Calque serve is ready"),
+        );
+      },
+    );
+
+    const contract = new Map(
+      startupLines
+        .filter((line) => line.includes("="))
+        .map((line) => {
+          const at = line.indexOf("=");
+          return [line.slice(0, at), line.slice(at + 1)] as const;
+        }),
+    );
+    assert.equal(
+      contract.get("object_store"),
+      "s3",
+      `the startup contract must report the S3 store; got ${JSON.stringify(startupLines)}`,
+    );
+    // The upgraded server serves the artifact the published release prepared,
+    // unless the upgrade moved a format this tree no longer reads, which
+    // prepares the working set again.
+    assert.ok(
+      ["published-existing", "published"].includes(
+        contract.get("artifact") ?? "",
+      ),
+      `the upgraded server reported artifact=${String(contract.get("artifact"))}`,
+    );
+    assert.equal(contract.get("ready"), "true");
+    assert.equal(contract.get("expected_host"), PUBLIC_HOST);
+    const metricsHost = `127.0.0.1:${String(metricsPort)}`;
+    assert.equal(contract.get("metrics_listener"), "configured-bind-address");
+    assert.equal(contract.get("metrics_expected_host"), metricsHost);
+    assert.equal(
+      contract.get("mutations"),
+      "mounted-per-collection-command-grant",
+    );
+    assert.equal(
+      contract.get("mutation_commands"),
+      "projects:insert+update+delete,tasks:insert+update+delete",
+    );
+    const startupMillis = Number(contract.get("startup_millis"));
+    assert.ok(Number.isFinite(startupMillis));
+    assert.ok(
+      startupLines.includes(`Calque serve is ready at ${serverBase}/`),
+      `the server must name the edge as its public address; got ${JSON.stringify(startupLines)}`,
+    );
+
+    await waitFor(
+      "readiness through the edge",
+      60_000,
+      async () => (await probe("/readyz")) === 204,
+    );
+    // Nothing the edge forwards to serves the scrape: the HTTP listener has no
+    // `/metrics`, and the metrics listener answers only on its loopback port,
+    // to the `Host` that port carries.
+    assert.equal((await edge(caddyRoot, httpsPort, "/metrics")).status, 404);
+    assert.equal(await plaintext(httpPort, "/metrics", PUBLIC_HOST), 404);
+    const scrape = await plaintextResponse(
+      metricsPort,
+      "/metrics",
+      metricsHost,
+    );
+    assert.equal(scrape.status, 200);
+    assert.ok(
+      scrape.body.endsWith("# EOF\n"),
+      `the scrape must be OpenMetrics; got ${scrape.body.slice(-200)}`,
+    );
+    assert.equal(await plaintext(metricsPort, "/metrics", PUBLIC_HOST), 421);
+
+    // The server's own plaintext listener answers an operator who names the
+    // public host, and refuses the `Host` any browser sent there would carry.
+    assert.equal(await plaintext(httpPort, "/readyz", PUBLIC_HOST), 204);
+    const plaintextListenerBrowserHostStatus = await plaintext(
+      httpPort,
+      "/readyz",
+      `${PUBLIC_HOST}:${String(httpPort)}`,
+    );
+    assert.equal(plaintextListenerBrowserHostStatus, 421);
+    assert.equal(
+      await plaintext(httpPort, "/readyz", `127.0.0.1:${String(httpPort)}`),
+      421,
+    );
+
+    // The artifact bytes are in the object store, and nowhere else. A run that
+    // fell back to the filesystem store would pass every browser assertion
+    // below, so this is checked before any of them.
+    const listing = mc(
+      "ls",
+      "--recursive",
+      `selfhost/${environment.CALQUE_S3_BUCKET ?? ""}`,
+    )
+      .split("\n")
+      .filter((line) =>
+        line.includes(`${environment.CALQUE_S3_PREFIX}/objects/`),
+      );
+    assert.ok(
+      listing.length > 0,
+      "the composition's bucket holds no artifact objects; the server fell back to the filesystem store",
+    );
+    const containerObjects = compose(
+      "exec",
+      "-T",
+      "calque",
+      "sh",
+      "-c",
+      "find /var/lib/calque/state/objects -type f | wc -l",
+    ).trim();
+    assert.equal(
+      Number(containerObjects),
+      0,
+      `the container's filesystem object tree holds ${containerObjects} files; the server did not use the object store`,
+    );
+
     const first = await openPage();
     const { page } = first;
 
@@ -1391,6 +1762,7 @@ async function main(): Promise<RunOutcome> {
     outcome = {
       result: "PASS",
       project,
+      upgrade,
       edge: serverBase,
       browserTrust: trust.mode,
       browserOrigins: [...new Set([...first.origins, ...second.origins])],
@@ -1434,14 +1806,10 @@ try {
     // The composition may never have started; the original error stands.
   }
 } finally {
-  // Always: no container, no volume, no image left behind.
+  // Always: no container, no volume, no image this run built left behind. The
+  // published release's image stays pulled for the next run.
   composeQuiet("down", "-v", "--remove-orphans");
-  spawnSync("docker", [
-    "image",
-    "rm",
-    "-f",
-    environment.CALQUE_SELFHOST_IMAGE ?? "",
-  ]);
+  spawnSync("docker", ["image", "rm", "-f", `calque:selfhost-e2e-${runId}`]);
   rmSync(workDirectory, { recursive: true, force: true });
 }
 process.exit(status);
