@@ -68,6 +68,11 @@ export interface BenchOptions {
    */
   readonly bootstrapProbe?: number;
   /**
+   * `--cold-under-load`: after its probes, the realtime session takes cold
+   * samples while its writes go on (`bench-under-load.ts`).
+   */
+  readonly coldUnderLoad?: true;
+  /**
    * `--tail <transactions>`: the load's transactions committed after the hold
    * and before the reference pass, so every page catches up through them from
    * the artifact's cut.
@@ -182,6 +187,7 @@ export function unjudgedReasons(options: BenchOptions): string[] {
     ...(options.bootstrapProbe === undefined
       ? []
       : [`bootstrap probe with ${String(options.bootstrapProbe)} narrow sets`]),
+    ...(options.coldUnderLoad ? ["cold samples under the load"] : []),
     ...(options.tail === undefined
       ? []
       : [
@@ -232,7 +238,7 @@ export function rendersPlan(options: Pick<BenchOptions, "network">): boolean {
 }
 
 const USAGE =
-  "usage: pnpm bench [-- --smoke] [--calque <path>] [--dataset <content-v1|v1>] [--network <off|Mbit/s/latency ms|shaped:Mbit/s/RTT ms>] [--diagnostic] [--hold-until-logged <text>] [--realtime-only] [--postgres-bin <dir>] [--no-edge] [--background-clients <n>] [--background-qos utility] [--load-rate <tx/s>] [--bootstrap-probe <narrow sets>] [--tail <transactions>] [--recut-tail-ratio <ratio>] [--recut-min-interval <seconds>] [--recut-keep-ratio <ratio>] [--no-stored-rows] [--returning] [--between-visits <transactions>] [--schema-change <config-add|rewrite-whole|rename-suspend>]";
+  "usage: pnpm bench [-- --smoke] [--calque <path>] [--dataset <content-v1|v1>] [--network <off|Mbit/s/latency ms|shaped:Mbit/s/RTT ms>] [--diagnostic] [--hold-until-logged <text>] [--realtime-only] [--postgres-bin <dir>] [--no-edge] [--background-clients <n>] [--background-qos utility] [--load-rate <tx/s>] [--bootstrap-probe <narrow sets>] [--cold-under-load] [--tail <transactions>] [--recut-tail-ratio <ratio>] [--recut-min-interval <seconds>] [--recut-keep-ratio <ratio>] [--no-stored-rows] [--returning] [--between-visits <transactions>] [--schema-change <config-add|rewrite-whole|rename-suspend>]";
 
 export function parseBenchArguments(
   arguments_: readonly string[],
@@ -251,6 +257,7 @@ export function parseBenchArguments(
   let backgroundQos: BackgroundQos | null = null;
   let loadRate: number | null = null;
   let bootstrapProbe: number | null = null;
+  let coldUnderLoad = false;
   let tail: number | null = null;
   let recutTailRatio: number | null = null;
   let recutMinIntervalSeconds: number | null = null;
@@ -308,7 +315,9 @@ export function parseBenchArguments(
     } else if (argument === "--bootstrap-probe" && bootstrapProbe === null) {
       bootstrapProbe = parseBootstrapProbe(value(index));
       index += 1;
-    } else if (argument === "--tail" && tail === null) {
+    } else if (argument === "--cold-under-load" && !coldUnderLoad)
+      coldUnderLoad = true;
+    else if (argument === "--tail" && tail === null) {
       tail = parseTail(value(index));
       index += 1;
     } else if (argument === "--recut-tail-ratio" && recutTailRatio === null) {
@@ -354,6 +363,10 @@ export function parseBenchArguments(
     throw new Error(
       "--bootstrap-probe posts beside the realtime session, so it needs --realtime-only",
     );
+  if (coldUnderLoad && !realtimeOnly)
+    throw new Error(
+      "--cold-under-load samples during the realtime session's writes, so it needs --realtime-only",
+    );
   if (tail !== null && realtimeOnly)
     throw new Error(
       "--tail is caught up by the cold samples, so it takes no --realtime-only",
@@ -384,6 +397,7 @@ export function parseBenchArguments(
     ...(backgroundQos === null ? {} : { backgroundQos }),
     ...(loadRate === null ? {} : { loadRate }),
     ...(bootstrapProbe === null ? {} : { bootstrapProbe }),
+    ...(coldUnderLoad ? { coldUnderLoad: true as const } : {}),
     ...(tail === null ? {} : { tail }),
     ...(recutTailRatio === null ? {} : { recutTailRatio }),
     ...(recutMinIntervalSeconds === null ? {} : { recutMinIntervalSeconds }),
@@ -513,13 +527,19 @@ export interface BenchPlan {
   readonly probes: number;
   /** Blank-page sessions that measure the browser's memory without calque. */
   readonly emptyPages: number;
+  /** Cold samples the realtime session takes under its writes. */
+  readonly underLoad: number;
 }
 
 /**
  * A full run's sample counts, or `--smoke`'s. A realtime-only run keeps the
  * probes and prepares once.
  */
-export function benchPlan(smoke: boolean, realtimeOnly = false): BenchPlan {
+export function benchPlan(
+  smoke: boolean,
+  realtimeOnly = false,
+  coldUnderLoad = false,
+): BenchPlan {
   if (realtimeOnly)
     return {
       ...benchPlan(smoke),
@@ -528,6 +548,7 @@ export function benchPlan(smoke: boolean, realtimeOnly = false): BenchPlan {
       cold: 0,
       traced: 0,
       emptyPages: 0,
+      underLoad: coldUnderLoad ? benchPlan(smoke).cold : 0,
     };
   return smoke
     ? {
@@ -538,6 +559,7 @@ export function benchPlan(smoke: boolean, realtimeOnly = false): BenchPlan {
         probeWarmups: 1,
         probes: 5,
         emptyPages: 1,
+        underLoad: 0,
       }
     : {
         preparations: 3,
@@ -547,6 +569,7 @@ export function benchPlan(smoke: boolean, realtimeOnly = false): BenchPlan {
         probeWarmups: 3,
         probes: 30,
         emptyPages: 5,
+        underLoad: 0,
       };
 }
 

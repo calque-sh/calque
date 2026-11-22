@@ -133,18 +133,27 @@ function committedProjects(): readonly (readonly [number, string, string])[] {
     });
 }
 
-/** The plan of the first bootstrap any page of `context` makes. */
-function firstPlan(context: BrowserContext): Promise<PlannedBootstrap> {
-  return new Promise((resolve, reject) => {
-    context.on("response", (response) => {
-      if (!new URL(response.url()).pathname.endsWith("/v1/bootstrap")) return;
-      if (response.request().method() !== "POST") return;
-      response
-        .json()
-        .then((plan) => resolve(plan as PlannedBootstrap))
-        .catch(reject);
-    });
+/**
+ * The plan of the first bootstrap any page of `context` is answered, read as
+ * the route passes the response on: Chrome may drop a body before a
+ * `response` listener asks DevTools for it.
+ */
+async function firstPlan(
+  context: BrowserContext,
+): Promise<{ readonly plan: Promise<PlannedBootstrap> }> {
+  const planned = Promise.withResolvers<PlannedBootstrap>();
+  await context.route("**/v1/bootstrap", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    const response = await route.fetch();
+    const body = await response.body();
+    if (response.ok())
+      planned.resolve(JSON.parse(body.toString("utf8")) as PlannedBootstrap);
+    await route.fulfill({ response, body });
   });
+  return { plan: planned.promise };
 }
 
 /** The tables the plan installs, which must be exactly the ones it needs. */
@@ -248,7 +257,7 @@ async function main(): Promise<Record<string, unknown>> {
       const context = await openedBrowser.newContext({
         viewport: { width: 1280, height: 900 },
       });
-      const plan = firstPlan(context);
+      const { plan } = await firstPlan(context);
       const page = await context.newPage();
       page.on("pageerror", (error) => pageErrors.push(String(error)));
       await page.addInitScript(

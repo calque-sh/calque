@@ -113,13 +113,17 @@ async function main(arguments_: readonly string[]): Promise<void> {
       : null;
   shaper?.preflight();
   const browser = await launchTarget();
-  const plan = benchPlan(options.smoke, options.realtimeOnly);
+  const plan = benchPlan(
+    options.smoke,
+    options.realtimeOnly,
+    options.coldUnderLoad === true,
+  );
   const mode = options.smoke ? "smoke" : "full";
   const postgresPort = parsePort(
     process.env.CALQUE_BENCH_POSTGRES_PORT ?? DEFAULT_POSTGRES_PORT,
     "CALQUE_BENCH_POSTGRES_PORT",
   );
-  const id = `${new Date().toISOString().replace(/[:.]/gu, "-")}${options.smoke ? "-smoke" : ""}${options.diagnostic ? "-diagnostic" : ""}${options.realtimeOnly ? "-realtime" : ""}${shaper ? "-shaped" : ""}${options.postgresBin === null ? "" : "-native-postgres"}${options.edge ? "" : "-no-edge"}${options.backgroundClients === undefined ? "" : `-background-${String(options.backgroundClients)}`}${options.backgroundQos === undefined ? "" : `-${options.backgroundQos}`}${options.loadRate === undefined ? "" : `-load-${String(options.loadRate)}`}${options.tail === undefined ? "" : `-tail-${String(options.tail)}`}${options.recutTailRatio === undefined ? "" : `-recut-ratio-${String(options.recutTailRatio)}`}${options.recutMinIntervalSeconds === undefined ? "" : `-recut-interval-${String(options.recutMinIntervalSeconds)}`}${options.recutKeepRatio === undefined ? "" : `-keep-ratio-${String(options.recutKeepRatio)}`}${options.storedRows ? "" : "-no-stored-rows"}${options.returning ? "-returning" : ""}${options.betweenVisits === undefined ? "" : `-between-${String(options.betweenVisits)}`}${options.schemaChange === undefined ? "" : `-schema-${options.schemaChange}`}`;
+  const id = `${new Date().toISOString().replace(/[:.]/gu, "-")}${options.smoke ? "-smoke" : ""}${options.diagnostic ? "-diagnostic" : ""}${options.realtimeOnly ? "-realtime" : ""}${options.coldUnderLoad ? "-under-load" : ""}${shaper ? "-shaped" : ""}${options.postgresBin === null ? "" : "-native-postgres"}${options.edge ? "" : "-no-edge"}${options.backgroundClients === undefined ? "" : `-background-${String(options.backgroundClients)}`}${options.backgroundQos === undefined ? "" : `-${options.backgroundQos}`}${options.loadRate === undefined ? "" : `-load-${String(options.loadRate)}`}${options.tail === undefined ? "" : `-tail-${String(options.tail)}`}${options.recutTailRatio === undefined ? "" : `-recut-ratio-${String(options.recutTailRatio)}`}${options.recutMinIntervalSeconds === undefined ? "" : `-recut-interval-${String(options.recutMinIntervalSeconds)}`}${options.recutKeepRatio === undefined ? "" : `-keep-ratio-${String(options.recutKeepRatio)}`}${options.storedRows ? "" : "-no-stored-rows"}${options.returning ? "-returning" : ""}${options.betweenVisits === undefined ? "" : `-between-${String(options.betweenVisits)}`}${options.schemaChange === undefined ? "" : `-schema-${options.schemaChange}`}`;
   const directory = join(root, "target/bench", id);
   mkdirSync(join(directory, "samples"), { recursive: true });
   mkdirSync(join(directory, "logs"), { recursive: true });

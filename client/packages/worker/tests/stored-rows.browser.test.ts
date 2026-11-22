@@ -136,16 +136,23 @@ async function storeFiles(): Promise<string[]> {
   return names.sort();
 }
 
-async function overwrite(
-  name: string,
-  at: number,
-  bytes: Uint8Array<ArrayBuffer>,
-) {
+/**
+ * Inverts the byte at `at`. Writing a fixed value would leave a random
+ * ciphertext byte that already held it unchanged, one run in 256.
+ */
+async function flipByte(name: string, at: number) {
   const root = await navigator.storage.getDirectory();
   const directory = await root.getDirectoryHandle(STORED_ROWS_DIRECTORY);
   const file = await directory.getFileHandle(name);
+  const [byte = 0] = new Uint8Array(
+    await (await file.getFile()).slice(at, at + 1).arrayBuffer(),
+  );
   const writable = await file.createWritable({ keepExistingData: true });
-  await writable.write({ type: "write", position: at, data: bytes });
+  await writable.write({
+    type: "write",
+    position: at,
+    data: Uint8Array.of(byte ^ 0xff),
+  });
   await writable.close();
 }
 
@@ -400,11 +407,7 @@ describe("the stored copy", () => {
     const artifact = await artifactOf(BODY);
     await storeBody(key, artifact, BODY);
     const dataFile = await recordedDataFile();
-    await overwrite(
-      dataFile,
-      sealedChunkOffset(CHUNK_BYTES, 1) + 12,
-      Uint8Array.of(0xff),
-    );
+    await flipByte(dataFile, sealedChunkOffset(CHUNK_BYTES, 1) + 12);
 
     const copy = await openStoredCopy(key, artifact);
     expect(copy).toBeDefined();

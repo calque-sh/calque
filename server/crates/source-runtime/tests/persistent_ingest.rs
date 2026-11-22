@@ -70,12 +70,14 @@ fn unique_suffix() -> String {
     )
 }
 
+const LEASE_TTL: Duration = Duration::from_secs(2);
+
 fn acquire_request(source_id: &SourceId, epoch: &SourceEpoch, owner: &str) -> AcquireRequest {
     AcquireRequest {
         source_id: source_id.clone(),
         source_epoch: epoch.clone(),
         owner_id: OwnerId::new(owner).unwrap(),
-        ttl: Duration::from_secs(2),
+        ttl: LEASE_TTL,
     }
 }
 
@@ -719,6 +721,19 @@ impl GroupFixture {
         .unwrap()
     }
 
+    /// Renews the lease the fixture holds until a session takes it, so its age
+    /// counts from here and not from the slot's provisioning.
+    fn renew_lease(&self) {
+        self.authority
+            .renew(
+                self.provisional
+                    .as_ref()
+                    .expect("the lease is not yet taken"),
+                LEASE_TTL,
+            )
+            .unwrap();
+    }
+
     /// Commits one row per id, each in its own source transaction, and returns
     /// their xids in commit order.
     fn commit_each(&mut self, ids: &[i64]) -> Vec<i64> {
@@ -1105,15 +1120,17 @@ const LATE_SEND: Duration = Duration::from_millis(1_200);
 /// session started were sent at least `LATE_SEND` after their commits, and
 /// both cycles say so.
 ///
-/// The fixture's lease waits out `LATE_SEND` unrenewed, so the session also
-/// starts under a lease older than one renewal interval, which a watchdog
-/// that waited a whole interval before renewing would let expire.
+/// The fixture's lease, renewed once the transactions commit, waits out
+/// `LATE_SEND` unrenewed, so the session also starts under a lease older than
+/// one renewal interval, which a watchdog that waited a whole interval before
+/// renewing would let expire.
 #[test]
 #[ignore = "requires CALQUE_SOURCE_DATABASE_URL or TEST_DATABASE_URL"]
 fn a_cycle_that_fills_its_bound_has_not_caught_up_and_a_backlog_reads_late() {
     let _logical_stream = LogicalStreamLock::acquire(&database_url().unwrap());
     let mut fixture = GroupFixture::start("backlog");
     fixture.commit_each(&[1, 2, 3]);
+    fixture.renew_lease();
     thread::sleep(LATE_SEND);
     let mut session = fixture.establish();
 

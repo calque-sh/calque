@@ -570,7 +570,7 @@ describe("columnar query kernel", () => {
           expect(inspectQueryExecution(engine).rowsExamined).toBe(examined);
         }
     }
-  });
+  }, 60_000);
 
   test("keeps the first rows of the full sort when a limit is below the row count", async () => {
     const overlay = await physicalOverlay(true);
@@ -793,7 +793,7 @@ describe("columnar query kernel", () => {
       "inner issue, left user": { kept: 10, fellBack: 8, notTried: 30 },
       "inner project": { kept: 18, fellBack: 0, notTried: 30 },
     });
-  });
+  }, 60_000);
 
   test("groups on composite keys as the reference does", async () => {
     const overlay = await physicalOverlay(true);

@@ -501,6 +501,21 @@ impl Entry {
         self.changed
             .send_modify(|version| *version = version.wrapping_add(1));
     }
+
+    /// The build a row's move queues: one a page waits on, or a refresh of a
+    /// warm tenant, until the tenant's builds have met the bound on moves.
+    /// Past it, the tenant is built only once it is opened again.
+    fn build_after_move(&self, now_ms: i64, warm_days: u32) -> Option<Priority> {
+        if self.moved_builds > MAX_MOVED_BUILDS {
+            None
+        } else if self.changed.receiver_count() > 0 {
+            Some(Priority::Waiting)
+        } else if self.warm(now_ms, warm_days) {
+            Some(Priority::Refresh)
+        } else {
+            None
+        }
+    }
 }
 
 struct TenantState {
@@ -2448,8 +2463,7 @@ impl Tenants {
                 let entry = state.entry(&value);
                 entry.moved_at = Some(entry.moved_at.map_or(sequence, |moved| moved.max(sequence)));
                 let had_cut = entry.cut.take().is_some();
-                let waiting = entry.changed.receiver_count() > 0;
-                let warm = entry.warm(now, warm_days) && entry.moved_builds <= MAX_MOVED_BUILDS;
+                let build = entry.build_after_move(now, warm_days);
                 entry.notify();
                 self.write(DirectoryWrite::Moved {
                     tenant: value.to_string(),
@@ -2463,15 +2477,8 @@ impl Tenants {
                         reason: "a row moved into or out of the tenant",
                     });
                 }
-                if warm || waiting {
-                    state.request_build(
-                        &value,
-                        if waiting {
-                            Priority::Waiting
-                        } else {
-                            Priority::Refresh
-                        },
-                    );
+                if let Some(priority) = build {
+                    state.request_build(&value, priority);
                 }
             }
         }
@@ -2845,6 +2852,22 @@ mod tests {
         state.running_builds += 1;
         state.retune_waited_builds();
         class
+    }
+
+    #[test]
+    fn a_move_past_the_bound_queues_no_build_even_while_a_page_waits() {
+        let mut entry = Entry::new(0);
+        entry.last_opened_ms = Some(0);
+        assert_eq!(entry.build_after_move(0, 1), Some(Priority::Refresh));
+        let waiting = entry.changed.subscribe();
+        assert_eq!(entry.build_after_move(0, 1), Some(Priority::Waiting));
+        entry.moved_builds = MAX_MOVED_BUILDS + 1;
+        assert_eq!(entry.build_after_move(0, 1), None);
+        drop(waiting);
+        assert_eq!(entry.build_after_move(0, 1), None);
+        entry.moved_builds = MAX_MOVED_BUILDS;
+        entry.last_opened_ms = None;
+        assert_eq!(entry.build_after_move(0, 1), None);
     }
 
     #[test]

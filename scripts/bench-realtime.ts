@@ -98,6 +98,7 @@ import {
   shapeNetwork,
   shapingWitness,
 } from "./bench-session.ts";
+import { type UnderLoadResult, underLoadSamples } from "./bench-under-load.ts";
 import { delay } from "./demo-process.ts";
 
 const PROBE_TIMEOUT_MS = 30_000;
@@ -237,6 +238,8 @@ interface RealtimeResult {
    * the background clients, or null.
    */
   readonly voidReason: string | null;
+  /** `--cold-under-load`'s first visits, taken after the probes. */
+  readonly underLoad: readonly UnderLoadResult[];
 }
 
 /** The realtime session's half of a run's pass: its final state and its link. */
@@ -284,6 +287,7 @@ export async function realtimeSession(run: Run): Promise<RealtimeResult> {
   const probes: ProbeResult[] = [];
   const probeRecords: object[] = [];
   const retaken: Retaken[] = [];
+  const underLoad: UnderLoadResult[] = [];
   let clock: ClockCheck | null = null;
   let wallDriftAtLoadMs: number | null = null;
   let load: Awaited<ReturnType<LoadWriter["stop"]>> | null = null;
@@ -406,6 +410,7 @@ export async function realtimeSession(run: Run): Promise<RealtimeResult> {
         ms: hrtimeMs(),
       };
       writer.start();
+      const loadStartedMs = hrtimeMs();
       const clockPassed = clock.passed;
       const driftAtLoad = wallDriftAtLoadMs;
       let engagementStart: EngagementStart | null = null;
@@ -480,6 +485,21 @@ export async function realtimeSession(run: Run): Promise<RealtimeResult> {
             if (!warmup) probes.push({ verdict: "DNC", upperMs: null });
           }
           log(reason);
+        }
+        if (run.plan.underLoad > 0 && ran.timedOutAt === null) {
+          const grid = await lastGrid(session);
+          try {
+            underLoad.push(
+              ...(await underLoadSamples(
+                run,
+                grid,
+                loadStartedMs,
+                run.plan.underLoad,
+              )),
+            );
+          } catch (error) {
+            sessionFailure = `a first visit under the load failed: ${error instanceof Error ? error.message : String(error)}`;
+          }
         }
       } catch (error) {
         if (!(error instanceof NetworkMemoryVoid))
@@ -588,6 +608,7 @@ export async function realtimeSession(run: Run): Promise<RealtimeResult> {
       shapingFailure,
       engagement,
       voidReason: voiding.reason,
+      underLoad,
     };
   } finally {
     // Written on every path: a failed session's load, probes and series
@@ -741,6 +762,16 @@ export async function awaitQuietPublications(
     publicationsAtLoadStop: atLoadStop,
     publicationsAtEnd: last,
   };
+}
+
+/** The grid's hash in the page's latest frame, once its capture caught up. */
+async function lastGrid(session: Session): Promise<string> {
+  const capture = session.capture;
+  const drainDeadline = hrtimeMs() + 5_000;
+  while (!capture.complete && hrtimeMs() < drainDeadline) await delay(10);
+  const grid = capture.prefix().at(-1)?.grid;
+  if (!grid) throw new Error("no grid hash after the probes");
+  return grid;
 }
 
 async function probe(

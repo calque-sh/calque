@@ -622,7 +622,7 @@ fn artifact_bytes(port: u16, artifact: &Value) -> Vec<u8> {
 /// them as PostgreSQL does. A value added to the enum is served with no
 /// rebuild, and the next plans name it in its declared place. Renaming a
 /// value then stops CDC, since it changes every row holding the value without
-/// a row change.
+/// a row change, and serve moves the source to its next schema generation.
 #[test]
 #[ignore = "requires TEST_DATABASE_URL"]
 fn a_column_list_keeps_hidden_values_in_postgres_and_enums_arrive_as_labels() {
@@ -863,9 +863,26 @@ fn a_column_list_keeps_hidden_values_in_postgres_and_enums_arrive_as_labels() {
                 .any(|line| line.contains("CDC runtime stopped without reconnecting"))
         },
     );
+    // A renamed label is a schema change, so serve moves the source to its
+    // next schema generation, whose plans name the new label.
+    let renamed_labels = serde_json::json!(["idle", "calm", "away", "swamped"]);
+    wait_until("a plan names the renamed label", &serving.stderr, || {
+        let response = bootstrap(
+            serving.port,
+            &fixture.grant(1, 600),
+            &format!("public.{}", fixture.table()),
+            "identity",
+        );
+        if response.status != 200 {
+            return false;
+        }
+        let plan = response.json();
+        let columns = &plan["artifacts"][0]["runtime"]["tables"][0]["columns"];
+        columns[3]["enumLabels"] == renamed_labels && columns[5]["enumLabels"] == renamed_labels
+    });
     assert!(
-        !serving.shutdown(),
-        "serve must exit failing once CDC stopped"
+        serving.shutdown(),
+        "serve must stop cleanly once the next generation serves"
     );
     fixture.drop_source();
     let _ = client.batch_execute(&format!(

@@ -667,6 +667,7 @@ test("the plan is the benchmark's sample counts in full, fewer in a smoke", () =
     probeWarmups: 3,
     probes: 30,
     emptyPages: 5,
+    underLoad: 0,
   });
   assert.deepEqual(benchPlan(true), {
     preparations: 1,
@@ -676,6 +677,7 @@ test("the plan is the benchmark's sample counts in full, fewer in a smoke", () =
     probeWarmups: 1,
     probes: 5,
     emptyPages: 1,
+    underLoad: 0,
   });
   // A realtime-only run prepares once and keeps the probes.
   assert.deepEqual(benchPlan(false, true), {
@@ -686,6 +688,7 @@ test("the plan is the benchmark's sample counts in full, fewer in a smoke", () =
     probeWarmups: 3,
     probes: 30,
     emptyPages: 0,
+    underLoad: 0,
   });
   assert.deepEqual(benchPlan(true, true), {
     ...benchPlan(true),
@@ -694,6 +697,29 @@ test("the plan is the benchmark's sample counts in full, fewer in a smoke", () =
     traced: 0,
     emptyPages: 0,
   });
+  // Under the load it takes as many first visits as a run takes cold samples.
+  assert.equal(benchPlan(false, true, true).underLoad, 30);
+  assert.equal(benchPlan(true, true, true).underLoad, 3);
+});
+
+test("--cold-under-load needs --realtime-only", () => {
+  assert.equal(
+    parseBenchArguments(["--realtime-only", "--cold-under-load"]).coldUnderLoad,
+    true,
+  );
+  assert.throws(
+    () => parseBenchArguments(["--cold-under-load"]),
+    /needs --realtime-only/u,
+  );
+  assert.throws(
+    () =>
+      parseBenchArguments([
+        "--realtime-only",
+        "--cold-under-load",
+        "--cold-under-load",
+      ]),
+    /usage/u,
+  );
 });
 
 // The cut and its seed ---------------------------------------------------------

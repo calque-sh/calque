@@ -52,6 +52,7 @@ import {
 import { requestPlan } from "./bench-page-server.ts";
 import { runSql } from "./bench-postgres.ts";
 import { realtimePasses, realtimeSession } from "./bench-realtime.ts";
+import { underLoadSummary } from "./bench-under-load.ts";
 import { log, redactedUrl, writeRecord } from "./bench-record.ts";
 import {
   aboveWireMs,
@@ -439,6 +440,7 @@ async function measure(run: Run) {
     cold.some((sample) => sample.query?.verdict === "INCORRECT") ||
     traced.some((sample) => sample.verdict === "INCORRECT") ||
     realtime.probes.some((sample) => sample.verdict === "INCORRECT") ||
+    realtime.underLoad.some((sample) => sample.verdict === "INCORRECT") ||
     schema.some((sample) => sample.verdict === "INCORRECT") ||
     realtime.finalProblems.length > 0;
   const correctnessFailed = incorrect || movedTables.length > 0;
@@ -519,6 +521,7 @@ async function measure(run: Run) {
       traced: traced.map((sample) => sample.verdict),
       probes: realtime.probes.map((sample) => sample.verdict),
       schema: schema.map((sample) => sample.verdict),
+      underLoad: realtime.underLoad.map((sample) => sample.verdict),
     },
     retaken: {
       cold: taken.retaken,
@@ -554,6 +557,10 @@ async function measure(run: Run) {
           },
     complete_stable_paint_ms: distribution(measurements.coldMs),
     commit_to_stable_paint_ms: distribution(measurements.commitMs),
+    // First visits taken while the load ran; reported, not judged.
+    ...(run.plan.underLoad === 0
+      ? {}
+      : { cold_under_load: underLoadSummary(realtime.underLoad) }),
     // Each cold sample's paint minus the time its bytes need on the link;
     // reported, not judged: no threshold reads it.
     above_wire_ms:

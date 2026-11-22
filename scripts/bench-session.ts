@@ -17,6 +17,7 @@ import {
   type HashedFrame,
   judgeStablePaint,
   mapEpochSecondsToMonotonicMilliseconds,
+  type RoiName,
   STABLE_PAINT_RULE,
   VIEWPORT,
 } from "./bench-frames.ts";
@@ -339,13 +340,14 @@ export class DriftAtChanges {
 }
 
 /**
- * Wait for the first frame at or after the document request whose full
- * viewport hashes to `expected`, then W + 250 ms of wall time. Returns the
- * failure that ended the wait instead, if one did.
+ * Wait for the first frame at or after the document request whose `roi`,
+ * the full viewport unless named, hashes to `expected`, then W + 250 ms of
+ * wall time. Returns the failure that ended the wait instead, if one did.
  */
 export async function awaitStablePaint(
   session: Session,
   expected: string,
+  roi: RoiName = "full",
 ): Promise<string | null> {
   const started = hrtimeMs();
   let matchSeenAt: number | null = null;
@@ -363,7 +365,7 @@ export async function awaitStablePaint(
     }
     const judgement = judgeStablePaint(
       session.capture.prefix(),
-      "full",
+      roi,
       expected,
       { fromMs: from },
     );

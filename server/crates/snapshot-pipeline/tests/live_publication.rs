@@ -3600,9 +3600,18 @@ fn snapshot_retention_expiry(canonical_root: &Path, build_id: &SnapshotBuildId) 
         .expect("snapshot retention lease remains until authoritative expiry")
 }
 
+/// No test proves this watchdog's budgets (`short_no_progress_policy` and the
+/// forced failures do), so `CALQUE_TEST_TIME_SCALE` multiplies them: a shared
+/// runner's I/O stall in a build that is being cancelled must not become a
+/// `NoProgress` failure.
 fn test_safety_policy() -> SnapshotBuildSafetyPolicy {
+    let scale = test_time_scale();
     SnapshotBuildSafetyPolicy::new(
-        SnapshotWatchdogConfig::new(Duration::from_secs(30), Duration::from_secs(10)).unwrap(),
+        SnapshotWatchdogConfig::new(
+            Duration::from_secs(30) * scale,
+            Duration::from_secs(10) * scale,
+        )
+        .unwrap(),
         Duration::from_millis(50),
         Duration::from_secs(2),
         test_pressure_policy(),
