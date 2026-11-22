@@ -39,13 +39,13 @@ import {
   psqlIn,
   removePostgresContainer,
   repositoryRoot as root,
-  reservedPort,
   run,
   servePage,
   startServe,
   stopServe,
   waitFor,
 } from "./lib/serve-e2e.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 /** What the page exposes; see `tests/serve-revocation/main.ts`. */
 interface StatusRecord {

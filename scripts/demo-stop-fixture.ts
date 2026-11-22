@@ -30,7 +30,7 @@ import {
   superviseChildren,
   waitForHttp,
 } from "./demo.ts";
-import { availablePort } from "./demo-process.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 const [directory, mode] = process.argv.slice(2);
 if (
@@ -72,7 +72,7 @@ process.on("exit", (code) =>
   writeFileSync(join(directory, "record"), String(code)),
 );
 
-const uiPort = await availablePort();
+const uiPort = await reservedPort();
 await superviseChildren("Demo", async ({ adopt, stopping }) => {
   const calque = adopt(
     startChild(

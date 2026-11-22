@@ -44,7 +44,6 @@ import type { Page } from "playwright";
 
 import {
   appendBounded,
-  availablePort,
   delay,
   demoPsql,
   exitWithin,
@@ -52,6 +51,7 @@ import {
 } from "./demo-process.ts";
 import { announcedUrl } from "./incidents-e2e.ts";
 import { CUT_ROWS, incidentsComposeEnvironment } from "./incidents.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const OUTPUT = join(root, "docs/assets/calque-incidents-100k.gif");
@@ -93,9 +93,9 @@ const TERMINAL_LINES = [
 ] as const;
 
 const [uiPort, serverPort, postgresPort] = await Promise.all([
-  availablePort(),
-  availablePort(),
-  availablePort(),
+  reservedPort(),
+  reservedPort(),
+  reservedPort(),
 ]);
 const environment: NodeJS.ProcessEnv = {
   ...process.env,

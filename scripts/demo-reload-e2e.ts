@@ -24,13 +24,13 @@ import type { Browser, Page } from "playwright";
 import {
   demoBrowserChannel,
   demoPsql,
-  availablePort,
   launchDemoBrowser,
   startDemo,
   stopDemo,
   type DemoProcess,
 } from "./demo-process.ts";
 import { sanitizePostgresRoutingEnvironment } from "./demo.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 /** What `__calqueDemoMutate` in the page reports back. */
 interface DemoMutation {
@@ -68,8 +68,8 @@ const output = join(root, "target/demo-reload");
 mkdirSync(output, { recursive: true });
 
 const [uiPort, serverPort] = await Promise.all([
-  availablePort(),
-  availablePort(),
+  reservedPort(),
+  reservedPort(),
 ]);
 /** `chromium` or `chrome` as the other harnesses run it, or `firefox`. */
 const browserName = process.env.CALQUE_DEMO_BROWSER ?? demoBrowserChannel();

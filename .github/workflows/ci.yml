@@ -112,10 +112,12 @@ jobs:
   # Docker: `calque dev`'s commit-to-paint timing in Chromium, its mutations
   # from a Node client, and `calque serve`'s writes and revocation in
   # Chromium. Each script starts and removes its own database: the latency run
-  # through docker-compose.yml on 55432, the mutation run under its own
-  # compose project on 55453, and the serve runs in one `postgres:18`
-  # container on 55491. Their timings on a shared runner are directional; the
-  # job is here for the pass or fail.
+  # through docker-compose.yml, the mutation run under its own compose
+  # project, and the serve runs in one `postgres:18` container. Their default
+  # ports are in Linux's ephemeral range, where an outgoing connection can
+  # hold one when Docker publishes it, so each step names a port below it.
+  # Their timings on a shared runner are directional; the job is here for the
+  # pass or fail.
   browser-e2e:
     name: Browser end-to-end (calque dev, calque serve, getting started)
     runs-on: ubuntu-latest
@@ -168,12 +170,19 @@ jobs:
 
       - name: calque dev commit-to-paint latency
         run: pnpm demo:e2e:latency
+        env:
+          CALQUE_POSTGRES_PORT: "25432"
 
       - name: calque dev mutations
         run: pnpm demo:e2e:mutation
+        env:
+          CALQUE_POSTGRES_PORT: "25453"
 
       - name: calque serve writes and revocation
         run: pnpm serve:e2e
+        env:
+          CALQUE_SERVE_E2E_POSTGRES_PORT: "25491"
+          CALQUE_SERVE_TENANTS_E2E_POSTGRES_PORT: "25493"
 
       # docs/getting-started.md walked from its own text, ending on the page it
       # builds. Its blocks run psql on the host.
@@ -312,8 +321,10 @@ jobs:
           # four before creating anything, so a regression here fails at setup
           # with the setting named rather than as a slot error deep in a test.
           POSTGRES_INITDB_ARGS: -c wal_level=logical -c max_replication_slots=64 -c max_wal_senders=64 -c max_connections=400
+        # Below Linux's ephemeral range (32768 up): a port in it can be held
+        # by an outgoing connection when the container publishes it.
         ports:
-          - 55444:5432
+          - 25444:5432
         # Over TCP: the image's temporary initdb server answers on the socket
         # only, and this must not report it (see the script's bootstrap).
         options: >-
@@ -376,7 +387,7 @@ jobs:
           # declared deadline outright (the test file records the failed try).
           CALQUE_TEST_TIME_SCALE: "10"
         run: >-
-          scripts/live-postgres-suite.sh run 55444 --exact
+          scripts/live-postgres-suite.sh run 25444 --exact
           --skip recovery::tests::a_filesystem_unit_restores_into_a_provider_store_and_serves_from_it
 
       # The same digest-pinned MinIO the blob-store job runs against, from its
@@ -416,7 +427,7 @@ jobs:
         run: >-
           CALQUE_S3_ACCESS_KEY="$CALQUE_MINIO_ROOT_USER"
           CALQUE_S3_SECRET_KEY="$CALQUE_MINIO_ROOT_PASSWORD"
-          scripts/live-postgres-suite.sh run 55444 --exact
+          scripts/live-postgres-suite.sh run 25444 --exact
           recovery::tests::a_filesystem_unit_restores_into_a_provider_store_and_serves_from_it
 
   # blob-store's two `#[ignore]`d S3 conformance tests, against a digest-pinned

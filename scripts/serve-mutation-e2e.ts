@@ -31,7 +31,6 @@ import {
   psqlIn,
   removePostgresContainer,
   repositoryRoot as root,
-  reservedPort,
   run,
   servePage,
   startServe as spawnServe,
@@ -39,6 +38,7 @@ import {
   waitFor,
   type Serving,
 } from "./lib/serve-e2e.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 /** One `POST /v1/mutations`, as the page's own `fetch` saw it. */
 interface MutationRequestRecord {

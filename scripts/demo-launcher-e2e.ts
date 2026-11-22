@@ -16,13 +16,13 @@ import type { Browser, Page } from "playwright";
 
 import {
   appendBounded,
-  availablePort,
   delay,
   exitWithin,
   recordDemo,
   restoreDemo,
   type DemoExit,
 } from "./demo-process.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const clientRoot = join(root, "client/packages/client");
@@ -37,8 +37,8 @@ const screenshotPath = join(screenshotDirectory, "automatic-sync.png");
 mkdirSync(screenshotDirectory, { recursive: true });
 const profile = mkdtempSync(join(target, "demo-launcher-chrome-"));
 const [uiPort, serverPort] = await Promise.all([
-  availablePort(),
-  availablePort(),
+  reservedPort(),
+  reservedPort(),
 ]);
 
 // This harness runs the launcher itself rather than through `startDemo`, so

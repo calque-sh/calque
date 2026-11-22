@@ -20,7 +20,6 @@ import type { CDPSession, Page } from "playwright";
 
 import {
   demoBrowserChannel,
-  availablePort,
   type PagePublication,
   delay,
   launchDemoBrowser,
@@ -31,6 +30,7 @@ import {
   summarizeSamples,
   type DemoProcess,
 } from "./demo-process.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const measuredChanges = parseSampleCount(
@@ -74,8 +74,8 @@ const output = join(root, "target/demo-latency");
 mkdirSync(output, { recursive: true });
 
 const [uiPort, serverPort] = await Promise.all([
-  availablePort(),
-  availablePort(),
+  reservedPort(),
+  reservedPort(),
 ]);
 const browser = await launchDemoBrowser();
 let demo: DemoProcess | undefined;

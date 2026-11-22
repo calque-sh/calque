@@ -27,7 +27,6 @@ import type { Page } from "playwright";
 
 import {
   demoBrowserChannel,
-  availablePort,
   delay,
   launchDemoBrowser,
   publicationCount,
@@ -41,6 +40,7 @@ import {
   demoChangeSql,
   sanitizePostgresRoutingEnvironment,
 } from "./demo.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const composeEnvironment: NodeJS.ProcessEnv = {
@@ -70,9 +70,9 @@ const changeFailures: string[] = [];
 const changeFailureChecks: Promise<void>[] = [];
 
 const [uiPort, serverPort, metricsPort] = await Promise.all([
-  availablePort(),
-  availablePort(),
-  availablePort(),
+  reservedPort(),
+  reservedPort(),
+  reservedPort(),
 ]);
 const endpoint = `http://127.0.0.1:${serverPort}`;
 const metricsEndpoint = `http://127.0.0.1:${metricsPort}`;

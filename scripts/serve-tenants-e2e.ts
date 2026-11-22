@@ -44,7 +44,6 @@ import {
   psqlIn,
   removePostgresContainer,
   repositoryRoot as root,
-  reservedPort,
   run,
   servePage,
   startServe,
@@ -52,6 +51,7 @@ import {
   waitFor,
   type Serving,
 } from "./lib/serve-e2e.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 /** What the page exposes; see `tests/serve-tenants/main.ts`. */
 interface StatusRecord {

@@ -47,8 +47,9 @@ import { dirname, extname, join, normalize, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import type { Browser, Page } from "playwright";
-import { MIME, reservedPort, run } from "./lib/serve-e2e.ts";
+import { MIME, run } from "./lib/serve-e2e.ts";
 import { CARGO_TARGET_ARGUMENTS } from "./lib/cargo-target.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 /** What the page under test exposes; see the page's own `main.ts`. */
 interface SelfhostPageState {

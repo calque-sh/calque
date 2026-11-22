@@ -10,7 +10,6 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
-import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Browser, Page } from "playwright";
@@ -379,21 +378,6 @@ function composePostgresListed(...filters: string[]): boolean {
       "postgres",
     ]).stdout.trim() !== ""
   );
-}
-
-export async function availablePort(): Promise<number> {
-  const server = createServer();
-  await new Promise<void>((resolveListen, rejectListen) => {
-    server.once("error", rejectListen);
-    server.listen({ host: "127.0.0.1", port: 0 }, resolveListen);
-  });
-  const address = server.address();
-  assert(address && typeof address === "object");
-  const port = address.port;
-  await new Promise<void>((resolveClose, rejectClose) =>
-    server.close((error) => (error ? rejectClose(error) : resolveClose())),
-  );
-  return port;
 }
 
 export function delay(milliseconds: number): Promise<void> {

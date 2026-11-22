@@ -23,7 +23,6 @@ import type { Page } from "playwright";
 
 import {
   demoBrowserChannel,
-  availablePort,
   delay,
   importBuilt,
   launchDemoBrowser,
@@ -34,6 +33,7 @@ import {
   type DemoProcess,
 } from "./demo-process.ts";
 import { runChecked } from "./demo.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const protocolRoot = join(root, "client/packages/protocol");
@@ -86,8 +86,8 @@ const { create } = (await importBuilt(
 )) as ProtobufRuntime;
 
 const [uiPort, serverPort] = await Promise.all([
-  availablePort(),
-  availablePort(),
+  reservedPort(),
+  reservedPort(),
 ]);
 const browser = await launchDemoBrowser();
 const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });

@@ -18,13 +18,9 @@ import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import {
-  availablePort,
-  startDemo,
-  stopDemo,
-  type DemoProcess,
-} from "./demo-process.ts";
+import { startDemo, stopDemo, type DemoProcess } from "./demo-process.ts";
 import { runChecked } from "./demo.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -53,8 +49,8 @@ const containers = (all: boolean, serverPort: number): string[] =>
     .filter((line) => line !== "");
 
 const [uiPort, serverPort] = await Promise.all([
-  availablePort(),
-  availablePort(),
+  reservedPort(),
+  reservedPort(),
 ]);
 let demo: DemoProcess | undefined;
 try {

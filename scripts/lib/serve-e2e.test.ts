@@ -6,9 +6,9 @@ import { join } from "node:path";
 import test from "node:test";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
 
+import { reservedPort } from "./ports.ts";
 import {
   renderConnection,
-  reservedPort,
   servePage,
   type ServedPage,
   staticCoding,

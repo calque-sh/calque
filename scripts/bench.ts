@@ -68,7 +68,6 @@ import {
 import { log, scrubRunLogs } from "./bench-record.ts";
 import { runBench } from "./bench-run.ts";
 import { listenForStop, runStop } from "./bench-stop.ts";
-import { availablePort } from "./demo-process.ts";
 import {
   calqueExecutable,
   type ChildHandle,
@@ -79,6 +78,7 @@ import {
   stopChild,
 } from "./demo.ts";
 import { CARGO_TARGET_ARGUMENTS } from "./lib/cargo-target.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -256,16 +256,14 @@ async function main(arguments_: readonly string[]): Promise<void> {
     // Behind the edge the browser connects only to the edge's ports, so
     // those are the shaped ones and the page and calque listen unshaped.
     const shapedPort = async (taken: ReadonlySet<number>) =>
-      shaper
-        ? await availableShapedPort(new Set(taken))
-        : await availablePort();
+      shaper ? await availableShapedPort(new Set(taken)) : await reservedPort();
     const pagePort = options.edge
-      ? await availablePort()
+      ? await reservedPort()
       : await shapedPort(new Set());
     const calquePort = options.edge
-      ? await availablePort()
+      ? await reservedPort()
       : await shapedPort(new Set([pagePort]));
-    const calqueMetricsPort = await availablePort();
+    const calqueMetricsPort = await reservedPort();
     let edgePlan: EdgePlan | null = null;
     if (caddy !== null) {
       const pageEdge = await shapedPort(new Set([pagePort, calquePort]));

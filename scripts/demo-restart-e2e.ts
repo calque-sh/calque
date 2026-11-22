@@ -5,7 +5,6 @@ import type { Page, Request } from "playwright";
 
 import {
   demoBrowserChannel,
-  availablePort,
   delay,
   launchDemoBrowser,
   type PagePublication,
@@ -16,11 +15,12 @@ import {
   stopDemo,
   type DemoProcess,
 } from "./demo-process.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 const [uiPort, firstServerPort, secondServerPort] = await Promise.all([
-  availablePort(),
-  availablePort(),
-  availablePort(),
+  reservedPort(),
+  reservedPort(),
+  reservedPort(),
 ]);
 
 const browser = await launchDemoBrowser();

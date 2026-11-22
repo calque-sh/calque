@@ -9,7 +9,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { createServer, type ServerResponse } from "node:http";
-import { createServer as createSocketServer } from "node:net";
 import { dirname, extname, join, normalize, resolve, sep } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -163,24 +162,6 @@ export function buildServeBinaries(): string {
     "dataset-grant-issuer",
   ]);
   return join(CARGO_TARGET_DIRECTORY, "debug");
-}
-
-/** A free loopback TCP port, released immediately. */
-export async function reservedPort(): Promise<number> {
-  return await new Promise((resolvePort, rejectPort) => {
-    const server = createSocketServer();
-    server.on("error", rejectPort);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (typeof address === "string" || address === null) {
-        server.close();
-        rejectPort(new Error("the reservation socket has no port"));
-        return;
-      }
-      const { port } = address;
-      server.close(() => resolvePort(port));
-    });
-  });
 }
 
 /** The content type a static page server sends for each extension it knows. */

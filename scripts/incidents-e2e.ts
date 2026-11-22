@@ -42,7 +42,6 @@ import {
   demoBrowserChannel,
   demoPsql,
   appendBounded,
-  availablePort,
   delay,
   exitWithin,
   launchDemoBrowser,
@@ -50,6 +49,7 @@ import {
   summarizeSamples,
 } from "./demo-process.ts";
 import { DEVELOPMENT_SOURCE_ROLE, parsePort } from "./demo.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = join(root, "target/incidents-e2e");
@@ -964,9 +964,9 @@ async function main(): Promise<void> {
     ...process.env,
     CALQUE_INCIDENTS_POSTGRES_PORT: String(postgresPort),
     CALQUE_INCIDENTS_PORT:
-      process.env.CALQUE_INCIDENTS_PORT ?? String(await availablePort()),
+      process.env.CALQUE_INCIDENTS_PORT ?? String(await reservedPort()),
     CALQUE_INCIDENTS_UI_PORT:
-      process.env.CALQUE_INCIDENTS_UI_PORT ?? String(await availablePort()),
+      process.env.CALQUE_INCIDENTS_UI_PORT ?? String(await reservedPort()),
   };
   const composeEnvironment = incidentsComposeEnvironment(
     process.env,

@@ -31,13 +31,13 @@ import {
   psqlIn,
   removePostgresContainer,
   repositoryRoot as root,
-  reservedPort,
   run,
   servePage,
   startServe,
   stopServe,
   waitFor,
 } from "./lib/serve-e2e.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 interface NarrowPageState {
   readonly state: string;

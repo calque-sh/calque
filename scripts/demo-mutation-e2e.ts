@@ -32,7 +32,6 @@ import { Worker as NodeWorker } from "node:worker_threads";
 import {
   demoPsql,
   appendBounded,
-  availablePort,
   delay,
   exitWithin,
   parseSampleCount,
@@ -47,6 +46,7 @@ import {
   sanitizePostgresRoutingEnvironment,
 } from "./demo.ts";
 import { CARGO_TARGET_ARGUMENTS } from "./lib/cargo-target.ts";
+import { reservedPort } from "./lib/ports.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const bindingsModule = pathToFileURL(join(root, DEMO_BINDINGS.output)).href;
@@ -186,7 +186,7 @@ mkdirSync(output, { recursive: true });
 provideBrowserFeatures();
 
 const postgresPort = process.env.CALQUE_POSTGRES_PORT ?? "55453";
-const serverPort = await availablePort();
+const serverPort = await reservedPort();
 // Every compose call below runs under this run's own project. Without it
 // compose names the project after the checkout's directory, as `pnpm demo`
 // does for the developer's database, and this harness's `down --volumes`
