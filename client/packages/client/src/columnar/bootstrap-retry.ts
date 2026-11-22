@@ -2,8 +2,10 @@ import type { SyncError } from "../error.js";
 
 /**
  * Delays between bootstrap requests whose `fetch` rejected, as while the
- * service starts or a proxy is between upstreams. A response with any status,
- * 5xx included, is reported without a second request. Every retry resends the
+ * service starts or a proxy is between upstreams, or that the server answered
+ * `503 INTERNAL_RETRYABLE`, as while it re-establishes its replication
+ * session. A response with any other status, 5xx included, is reported
+ * without a second request. Every retry resends the
  * grant the first attempt took, so the 9.75 s total stays well inside a
  * short-lived grant's lifetime. The artifact download uses the same schedule
  * for a request or body the network cut.

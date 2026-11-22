@@ -2141,7 +2141,15 @@ fn store_error(error: postgres::Error) -> FenceError {
     // the SQLSTATE is read.
     match PostgresRefusal::of(&error) {
         Some(refusal) => FenceError::ControlStoreRefused(refusal),
-        None => FenceError::ControlStoreUnavailable,
+        None => {
+            match error.code() {
+                Some(code) => {
+                    tracing::warn!(sqlstate = code.code(), "a control store statement failed")
+                }
+                None => tracing::warn!(%error, "a control store statement failed"),
+            }
+            FenceError::ControlStoreUnavailable
+        }
     }
 }
 

@@ -118,9 +118,10 @@ export type SyncErrorCode =
   /**
    * The bootstrap request or the artifact download failed with an HTTP status
    * other than 401, 403, the bootstrap's preparing 503 or its 422
-   * `CAPACITY_EXCEEDED`. Recovery `retry`; `none` when the server refused the
-   * bootstrap request itself with a 400, 413 or 422, since the same request
-   * meets the same refusal.
+   * `CAPACITY_EXCEEDED`. A bootstrap answered `503 INTERNAL_RETRYABLE` is
+   * asked again for up to 9.75 s first. Recovery `retry`; `none` when the
+   * server refused the bootstrap request itself with a 400, 413 or 422, since
+   * the same request meets the same refusal.
    */
   | "SERVER_ERROR"
   /**

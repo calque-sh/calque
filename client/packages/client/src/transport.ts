@@ -343,9 +343,9 @@ export const MAX_PREPARING_WAIT_MS = 120_000;
  * its body names.
  *
  * The status alone is not enough: 503 is also how an ordinary unavailable
- * server answers, and that one is reported rather than waited out. A 400, 413
- * or 422 refuses the request itself, which the same request would meet again,
- * so none of them is reported as retryable.
+ * server answers, and that one is reported rather than waited out or
+ * retried. A 400, 413 or 422 refuses the request itself, which the same
+ * request would meet again, so none of them is reported as retryable.
  */
 async function bootstrapRefusal(response: Response): Promise<SyncError> {
   const { status } = response;
@@ -369,10 +369,24 @@ async function bootstrapRefusal(response: Response): Promise<SyncError> {
       "the server refused the bootstrap: the working set does not fit memoryBudgetBytes",
     );
   const message = `bootstrap failed with HTTP ${status}${code === undefined ? "" : ` ${code}`}`;
+  if (status === 503 && code === "INTERNAL_RETRYABLE")
+    return new BootstrapUnavailableError(message);
   if (status === 400 || status === 413 || status === 422)
     return new SyncError("SERVER_ERROR", "sync", "none", message);
   if (status === 409) return new BootstrapConflictError(message);
   return responseError(status, "sync", message);
+}
+
+/**
+ * A bootstrap the server answered `503 INTERNAL_RETRYABLE`: it could not plan
+ * for a moment, as while it re-establishes its replication session. The
+ * bootstrap asks again on the schedule it retries a network failure on.
+ */
+export class BootstrapUnavailableError extends SyncError {
+  constructor(message: string) {
+    super("SERVER_ERROR", "sync", "retry", message);
+    this.name = "BootstrapUnavailableError";
+  }
 }
 
 /**

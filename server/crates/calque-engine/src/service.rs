@@ -235,9 +235,10 @@ impl GenerationRoutes {
     }
 }
 
-/// One generation's application routes, the mutation route included. Every
-/// `/v1/` route answers `503` while the runtime's replication session is not
-/// connected.
+/// One generation's application routes, the mutation route included. While
+/// the runtime's replication session is not connected, the bootstrap answers
+/// `503 INTERNAL_RETRYABLE`, which the client asks again for, artifact objects
+/// are served, and every other `/v1/` route answers an empty `503`.
 pub fn generation_routes(
     backend: LocalBackend,
     mutations: LocalMutationBackend,
@@ -255,8 +256,16 @@ async fn refuse_unconnected(
     request: Request,
     next: Next,
 ) -> Response {
-    if request.uri().path().starts_with("/v1/") && !health.is_connected() {
-        return empty_response(StatusCode::SERVICE_UNAVAILABLE);
+    let path = request.uri().path();
+    if path.starts_with("/v1/")
+        && !path.starts_with(crate::artifacts::ARTIFACT_OBJECTS_PREFIX)
+        && !health.is_connected()
+    {
+        return if path == bootstrap_http::BOOTSTRAP_PATH {
+            bootstrap_http::unavailable_response()
+        } else {
+            empty_response(StatusCode::SERVICE_UNAVAILABLE)
+        };
     }
     next.run(request).await
 }
@@ -718,6 +727,23 @@ mod tests {
             response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
             Some(&HeaderValue::from_static("http://127.0.0.1:5173"))
         );
+        // The client asks again for a bootstrap answered with this code.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "INTERNAL_RETRYABLE");
+
+        let response = router(false).oneshot(request("/v1/changes")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // An artifact object is served without the replication session: the
+        // control router has no `/v1/` routes, so the gate let it through to
+        // the 404 behind it.
+        let response = router(false)
+            .oneshot(request("/v1/artifact-objects/sha256:00"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// A source whose last CDC cycle did not catch up is behind: not ready,

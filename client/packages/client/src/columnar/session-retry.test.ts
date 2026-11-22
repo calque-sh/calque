@@ -26,6 +26,18 @@ function preparing(
   );
 }
 
+/** The bootstrap's answer while the server re-establishes its replication session. */
+function retryable(): Response {
+  return new Response(
+    JSON.stringify({
+      code: "INTERNAL_RETRYABLE",
+      message: "bootstrap planning is temporarily unavailable",
+      resnapshotRequired: false,
+    }),
+    { status: 503, headers: { "content-type": "application/json" } },
+  );
+}
+
 describe("direct-columnar session", () => {
   beforeEach(() => {
     stubBrowserFeatures();
@@ -77,6 +89,55 @@ describe("direct-columnar session", () => {
           : inner(input, init),
     );
     expect(await settled(refused.client)).toMatchObject({ state: "error" });
+    expect(
+      refused.fetcher.mock.calls.filter(([input]) =>
+        String(input).endsWith("/v1/bootstrap"),
+      ),
+    ).toHaveLength(1);
+    await refused.client.close();
+  });
+
+  it("asks again for a bootstrap answered 503 INTERNAL_RETRYABLE, and reports a bare 503 at once", async () => {
+    // calque answers 503 INTERNAL_RETRYABLE for the seconds it takes to
+    // re-establish its replication session, and the bootstrap asks again on
+    // the schedule it retries a network failure on.
+    let refusals = 0;
+    const { client, fetcher } = makeClient(
+      plan(),
+      undefined,
+      undefined,
+      (inner) => async (input, init) => {
+        if (String(input).endsWith("/v1/bootstrap") && refusals < 2) {
+          refusals += 1;
+          return retryable();
+        }
+        return inner(input, init);
+      },
+    );
+    expect(await settled(client)).toEqual({ state: "ready" });
+    expect(refusals).toBe(2);
+    expect(
+      fetcher.mock.calls.filter(([input]) =>
+        String(input).endsWith("/v1/bootstrap"),
+      ),
+    ).toHaveLength(3);
+    await client.close();
+
+    // A 503 that names no code can come from anything in front of the
+    // server, and is reported without a second request.
+    const refused = makeClient(
+      plan(),
+      undefined,
+      undefined,
+      (inner) => async (input, init) =>
+        String(input).endsWith("/v1/bootstrap")
+          ? new Response(null, { status: 503 })
+          : inner(input, init),
+    );
+    expect(await settled(refused.client)).toMatchObject({
+      state: "error",
+      error: { code: "SERVER_ERROR", recovery: "retry" },
+    });
     expect(
       refused.fetcher.mock.calls.filter(([input]) =>
         String(input).endsWith("/v1/bootstrap"),

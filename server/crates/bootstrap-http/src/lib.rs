@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sync_types::{OpaqueCursor, TableId};
 use tracing::{info_span, Instrument};
 
-const BOOTSTRAP_PATH: &str = "/v1/bootstrap";
+pub const BOOTSTRAP_PATH: &str = "/v1/bootstrap";
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_RESIDENT_PROOF_BYTES: usize = 1024 * 1024;
 const MAX_CACHE_HINTS: usize = 4096;
@@ -439,6 +439,13 @@ struct ErrorBody {
     code: &'static str,
     message: &'static str,
     resnapshot_required: bool,
+}
+
+/// The bootstrap's `503 INTERNAL_RETRYABLE`, for a server that cannot plan
+/// for a moment, as while it re-establishes its replication session. The
+/// client asks again.
+pub fn unavailable_response() -> Response {
+    error_response(BootstrapHttpError::Unavailable)
 }
 
 fn error_response(error: BootstrapHttpError) -> Response {

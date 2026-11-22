@@ -73,6 +73,7 @@ import {
 import {
   ArtifactPreparingError,
   ArtifactCapabilityError,
+  BootstrapUnavailableError,
   MAX_PREPARING_WAIT_MS,
   artifactTransportProfile,
   DIRECT_COLUMNAR_ARTIFACT_MEDIA_TYPE,
@@ -1704,8 +1705,9 @@ export class ColumnarSession {
   }
 
   /**
-   * Requests the bootstrap plan, retrying a `NETWORK_ERROR` on
-   * `BOOTSTRAP_RETRY_DELAYS_MS` and a `503 ARTIFACT_PREPARING` or
+   * Requests the bootstrap plan, retrying a `NETWORK_ERROR` or a
+   * `503 INTERNAL_RETRYABLE` on `BOOTSTRAP_RETRY_DELAYS_MS` and a
+   * `503 ARTIFACT_PREPARING` or
    * `SCHEMA_SUSPENDED` on the server's
    * `Retry-After`, up to `MAX_PREPARING_WAIT_MS` from the first such answer,
    * while the status is `preparing`. The bound is wall time, because a server
@@ -1762,8 +1764,10 @@ export class ColumnarSession {
         attempt += 1;
         if (
           delayMs === undefined ||
-          !(error instanceof SyncError) ||
-          error.code !== "NETWORK_ERROR"
+          !(
+            error instanceof BootstrapUnavailableError ||
+            (error instanceof SyncError && error.code === "NETWORK_ERROR")
+          )
         )
           throw error;
         await delay(delayMs, epoch);

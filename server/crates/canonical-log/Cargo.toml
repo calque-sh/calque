@@ -26,6 +26,9 @@ sha2 = { version = "0.11.0", default-features = false }
 sync-protocol = { path = "../sync-protocol" }
 sync-types = { path = "../sync-types" }
 thiserror = "1"
+# Every PostgreSQL failure answers the one uncertain-result error, so the
+# failure itself is logged where it is discarded.
+tracing = "0.1.44"
 
 [dev-dependencies]
 postgres-connect = { path = "../postgres-connect", features = ["test-relay"] }

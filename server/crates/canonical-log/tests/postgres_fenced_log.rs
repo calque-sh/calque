@@ -457,6 +457,187 @@ fn an_append_whose_server_stops_answering_fails_once_the_reply_bound_runs_out() 
     remove_source(&mut control, &source_id);
 }
 
+/// Locks `source_id`'s row of `table` from another connection, as a lease
+/// renewal or a trim does through a commit PostgreSQL is slow to flush, and
+/// returns once the lock is held. After `hold` the holder runs `then`, unless
+/// it is empty, and commits.
+fn hold_row(
+    url: &str,
+    table: &'static str,
+    source_id: &SourceId,
+    hold: Duration,
+    then: &'static str,
+) -> thread::JoinHandle<()> {
+    let url = url.to_owned();
+    let source_id = source_id.as_str().to_owned();
+    let (locked, held) = mpsc::channel();
+    let holder = thread::spawn(move || {
+        let mut client = Client::connect(&url, NoTls).unwrap();
+        let mut transaction = client.transaction().unwrap();
+        transaction
+            .execute(
+                &format!("SELECT 1 FROM calque_control.{table} WHERE source_id = $1 FOR UPDATE"),
+                &[&source_id],
+            )
+            .unwrap();
+        locked.send(()).unwrap();
+        thread::sleep(hold);
+        if !then.is_empty() {
+            transaction.execute(then, &[&source_id]).unwrap();
+        }
+        transaction.commit().unwrap();
+    });
+    held.recv().unwrap();
+    holder
+}
+
+/// An append that meets a row another transaction holds past its 1 s
+/// `lock_timeout` runs again rather than failing, alone and as a group of two
+/// statements in one transaction.
+#[test]
+#[ignore = "requires CALQUE_CONTROL_DATABASE_URL"]
+fn an_append_behind_a_row_held_past_its_lock_timeout_runs_again() {
+    let url =
+        std::env::var("CALQUE_CONTROL_DATABASE_URL").expect("live control-store database URL");
+    let source_id = unique_source_id();
+    let epoch = SourceEpoch::new("epoch-1").unwrap();
+    let mut control = Client::connect(&url, NoTls).unwrap();
+    let datastore = PostgresDatastoreIdentity::inspect(&mut control).unwrap();
+    install_active_writer_fence(&mut control, &source_id, &epoch);
+    install_slot_enrollment(&mut control, &source_id, &epoch);
+    let log = PostgresFencedCanonicalLog::connect(
+        &url,
+        FencedWriterIdentity::new(source_id.clone(), epoch.clone(), 1, datastore).unwrap(),
+        state_dir(),
+    )
+    .unwrap();
+    log.append_group(barriers(&epoch, &[1]), Some(0x10))
+        .unwrap();
+
+    let hold = Duration::from_millis(1500);
+    let holder = hold_row(&url, "source_fence_lease", &source_id, hold, "");
+    let started = Instant::now();
+    let outcomes = log
+        .append_group(barriers(&epoch, &[2]), Some(0x20))
+        .unwrap();
+    let waited = started.elapsed();
+    holder.join().unwrap();
+    assert!(
+        waited >= Duration::from_millis(1400),
+        "the append returned after {waited:?}"
+    );
+    assert_eq!(outcome_sequences(&outcomes), [2]);
+
+    // A repeated key splits the group into two statements of one transaction.
+    let holder = hold_row(&url, "canonical_log_head", &source_id, hold, "");
+    let outcomes = log
+        .append_group(barriers(&epoch, &[3, 3, 4]), Some(0x40))
+        .unwrap();
+    holder.join().unwrap();
+    assert_eq!(outcome_sequences(&outcomes), [3, -3, 4]);
+    assert_eq!(
+        durable_state(&mut control, &source_id),
+        (
+            4,
+            vec![(1, 1), (2, 2), (3, 3), (4, 4)],
+            3,
+            "0/40".to_owned()
+        )
+    );
+
+    remove_source(&mut control, &source_id);
+}
+
+/// An append whose row stays held through every rerun fails after about four
+/// lock timeouts, before the holder lets go, and writes nothing.
+#[test]
+#[ignore = "requires CALQUE_CONTROL_DATABASE_URL"]
+fn an_append_behind_a_row_held_through_every_rerun_fails_and_writes_nothing() {
+    let url =
+        std::env::var("CALQUE_CONTROL_DATABASE_URL").expect("live control-store database URL");
+    let source_id = unique_source_id();
+    let epoch = SourceEpoch::new("epoch-1").unwrap();
+    let mut control = Client::connect(&url, NoTls).unwrap();
+    let datastore = PostgresDatastoreIdentity::inspect(&mut control).unwrap();
+    install_active_writer_fence(&mut control, &source_id, &epoch);
+    install_slot_enrollment(&mut control, &source_id, &epoch);
+    let log = PostgresFencedCanonicalLog::connect(
+        &url,
+        FencedWriterIdentity::new(source_id.clone(), epoch.clone(), 1, datastore).unwrap(),
+        state_dir(),
+    )
+    .unwrap();
+    log.append_group(barriers(&epoch, &[1]), Some(0x10))
+        .unwrap();
+    let before = durable_state(&mut control, &source_id);
+
+    let holder = hold_row(
+        &url,
+        "source_fence_lease",
+        &source_id,
+        Duration::from_secs(8),
+        "",
+    );
+    let started = Instant::now();
+    let result = log.append_group(barriers(&epoch, &[2]), Some(0x20));
+    let elapsed = started.elapsed();
+    holder.join().unwrap();
+    assert!(
+        matches!(result, Err(LogError::PostgresUnavailable)),
+        "{result:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(4) && elapsed < Duration::from_secs(7),
+        "the append returned after {elapsed:?}"
+    );
+    assert_eq!(durable_state(&mut control, &source_id), before);
+
+    remove_source(&mut control, &source_id);
+}
+
+/// A takeover that commits while an append waits on the lease row refuses the
+/// append's rerun.
+#[test]
+#[ignore = "requires CALQUE_CONTROL_DATABASE_URL"]
+fn a_takeover_committed_while_an_append_waits_refuses_its_rerun() {
+    let url =
+        std::env::var("CALQUE_CONTROL_DATABASE_URL").expect("live control-store database URL");
+    let source_id = unique_source_id();
+    let epoch = SourceEpoch::new("epoch-1").unwrap();
+    let mut control = Client::connect(&url, NoTls).unwrap();
+    let datastore = PostgresDatastoreIdentity::inspect(&mut control).unwrap();
+    install_active_writer_fence(&mut control, &source_id, &epoch);
+    install_slot_enrollment(&mut control, &source_id, &epoch);
+    let log = PostgresFencedCanonicalLog::connect(
+        &url,
+        FencedWriterIdentity::new(source_id.clone(), epoch.clone(), 1, datastore).unwrap(),
+        state_dir(),
+    )
+    .unwrap();
+    log.append_group(barriers(&epoch, &[1]), Some(0x10))
+        .unwrap();
+    let before = durable_state(&mut control, &source_id);
+
+    let holder = hold_row(
+        &url,
+        "source_fence_lease",
+        &source_id,
+        Duration::from_millis(1500),
+        "UPDATE calque_control.source_fence_lease
+            SET fence_token = 2, owner_id = 'owner-b'
+          WHERE source_id = $1",
+    );
+    let result = log.append_group(barriers(&epoch, &[2]), Some(0x20));
+    holder.join().unwrap();
+    assert!(
+        matches!(result, Err(LogError::FencedWriterRejected)),
+        "{result:?}"
+    );
+    assert_eq!(durable_state(&mut control, &source_id), before);
+
+    remove_source(&mut control, &source_id);
+}
+
 #[test]
 #[ignore = "requires CALQUE_CONTROL_DATABASE_URL"]
 fn a_group_that_fails_partway_commits_none_of_it_nor_its_checkpoint() {
@@ -1582,6 +1763,103 @@ fn postgres_plan_lease_racing_retention_is_atomic_and_fails_closed() {
         Err(error) => panic!("unexpected plan-retention race result: {error}"),
     }
 
+    remove_retained_source(&mut control, &source_id);
+}
+
+/// An append holds the head row until its commit returns, which takes over a
+/// second when PostgreSQL's WAL flush stalls. A plan's lease reads the head
+/// without waiting on it, so the bootstrap is not refused for the stall.
+#[test]
+#[ignore = "requires CALQUE_CONTROL_DATABASE_URL"]
+fn a_plan_lease_does_not_wait_on_an_append_holding_the_head() {
+    let url =
+        std::env::var("CALQUE_CONTROL_DATABASE_URL").expect("live control-store database URL");
+    let source_id = unique_source_id();
+    let epoch = SourceEpoch::new("epoch-1").unwrap();
+    let mut control = Client::connect(&url, NoTls).unwrap();
+    let datastore = PostgresDatastoreIdentity::inspect(&mut control).unwrap();
+    install_active_writer_fence(&mut control, &source_id, &epoch);
+    let mut log = PostgresFencedCanonicalLog::connect(
+        &url,
+        FencedWriterIdentity::new(source_id.clone(), epoch.clone(), 1, datastore).unwrap(),
+        state_dir(),
+    )
+    .unwrap();
+    for sequence in 1..=3 {
+        log.append_barrier(barrier(&epoch, sequence)).unwrap();
+    }
+
+    let mut holder = Client::connect(&url, NoTls).unwrap();
+    let mut append = holder.transaction().unwrap();
+    append
+        .execute(
+            "SELECT 1 FROM calque_control.canonical_log_head WHERE source_id = $1 FOR UPDATE",
+            &[&source_id.as_str()],
+        )
+        .unwrap();
+    let server_now_ms: i64 = control
+        .query_one(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    let leased = log.acquire_plan_retention_lease(
+        PlanId::new("plan-behind-an-append").unwrap(),
+        2,
+        server_now_ms + 60_000,
+        server_now_ms,
+    );
+    append.rollback().unwrap();
+    leased.unwrap();
+    assert!(matches!(
+        log.acquire_plan_retention_lease(
+            PlanId::new("plan-past-the-head").unwrap(),
+            5,
+            server_now_ms + 60_000,
+            server_now_ms,
+        ),
+        Err(LogError::InvalidRetentionLease)
+    ));
+
+    drop(log);
+    remove_retained_source(&mut control, &source_id);
+}
+
+/// Connecting takes no lock on the log's tables, so a log connects while
+/// another transaction reads the retention table, as every plan lease, append
+/// and trim does.
+#[test]
+#[ignore = "requires CALQUE_CONTROL_DATABASE_URL"]
+fn a_log_connects_while_another_transaction_reads_its_tables() {
+    let url =
+        std::env::var("CALQUE_CONTROL_DATABASE_URL").expect("live control-store database URL");
+    let source_id = unique_source_id();
+    let epoch = SourceEpoch::new("epoch-1").unwrap();
+    let mut control = Client::connect(&url, NoTls).unwrap();
+    let datastore = PostgresDatastoreIdentity::inspect(&mut control).unwrap();
+    install_active_writer_fence(&mut control, &source_id, &epoch);
+    install_slot_enrollment(&mut control, &source_id, &epoch);
+    let writer = FencedWriterIdentity::new(source_id.clone(), epoch.clone(), 1, datastore).unwrap();
+    // The first connect installs the tables.
+    PostgresFencedCanonicalLog::connect(&url, writer.clone(), state_dir()).unwrap();
+
+    let mut reader = Client::connect(&url, NoTls).unwrap();
+    let mut reading = reader.transaction().unwrap();
+    reading
+        .query(
+            "SELECT 1 FROM calque_control.canonical_log_retention LIMIT 1",
+            &[],
+        )
+        .unwrap();
+    let connected = PostgresFencedCanonicalLog::connect(&url, writer, state_dir());
+    reading.rollback().unwrap();
+    assert!(connected.is_ok(), "{:?}", connected.as_ref().err());
+
+    remove_source(&mut control, &source_id);
+}
+
+fn remove_retained_source(control: &mut Client, source_id: &SourceId) {
     let mut cleanup = control.transaction().unwrap();
     for table in [
         "canonical_log_plan_retention_lease",

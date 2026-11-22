@@ -224,10 +224,18 @@ impl ArtifactService {
 
     pub fn router(self) -> Router {
         Router::new()
-            .route("/v1/artifact-objects/{object_id}", get(get_artifact))
+            .route(
+                &format!("{ARTIFACT_OBJECTS_PREFIX}{{object_id}}"),
+                get(get_artifact),
+            )
             .with_state(self)
     }
 }
+
+/// Where artifact objects are served. Their bytes are published and checked
+/// against the capability alone, so they are served while the replication
+/// session is re-established.
+pub(crate) const ARTIFACT_OBJECTS_PREFIX: &str = "/v1/artifact-objects/";
 
 async fn get_artifact(
     State(service): State<ArtifactService>,

@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use postgres::{types::PgLsn, Client, GenericClient, Row, Statement, Transaction};
+use postgres::{error::SqlState, types::PgLsn, Client, GenericClient, Row, Statement, Transaction};
 use postgres_connect::DropOffRuntime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -583,6 +583,10 @@ impl FencedWriterIdentity {
 /// they all run `CREATE SCHEMA IF NOT EXISTS calque_control`.
 pub const CONTROL_SCHEMA_BOOTSTRAP_LOCK_KEY: i64 = 7_249_927_482_239_849_732;
 
+// Runs on every connect, under a 1 s lock timeout. On existing tables
+// `CREATE ... IF NOT EXISTS` takes no table lock, whereas `ALTER TABLE` takes
+// ACCESS EXCLUSIVE, and every plan lease, append and trim queues behind it, so
+// a column added since runs `ALTER TABLE` only while it is missing.
 const POSTGRES_LOG_INSTALL_SQL: &str = r#"
 CREATE SCHEMA IF NOT EXISTS calque_control;
 CREATE TABLE IF NOT EXISTS calque_control.canonical_log_head (
@@ -606,10 +610,20 @@ CREATE TABLE IF NOT EXISTS calque_control.canonical_log_retention (
     minimum_retained_sequence bigint NOT NULL DEFAULT 1
         CHECK (minimum_retained_sequence > 0),
     next_build_lease_token bigint NOT NULL DEFAULT 0
-        CHECK (next_build_lease_token >= 0)
+        CHECK (next_build_lease_token >= 0),
+    retired_compacted_through_lsn pg_lsn
 );
-ALTER TABLE calque_control.canonical_log_retention
-    ADD COLUMN IF NOT EXISTS retired_compacted_through_lsn pg_lsn;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_attribute
+         WHERE attrelid = 'calque_control.canonical_log_retention'::regclass
+           AND attname = 'retired_compacted_through_lsn' AND NOT attisdropped
+    ) THEN
+        ALTER TABLE calque_control.canonical_log_retention
+            ADD COLUMN retired_compacted_through_lsn pg_lsn;
+    END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS calque_control.canonical_log_plan_retention_lease (
     source_id text NOT NULL,
     source_epoch text NOT NULL,
@@ -1107,12 +1121,15 @@ impl PostgresFencedCanonicalLog {
         {
             return Err(LogError::InvalidRetentionLease);
         }
+        // Read without a lock, so a plan never waits on an append that holds
+        // the head through a slow commit. The head only grows within an
+        // epoch, so an older value only refuses more; the retention row's lock
+        // keeps the lease and a trim apart.
         let head = transaction
             .query_opt(
                 "SELECT source_epoch, head_sequence
                    FROM calque_control.canonical_log_head
-                  WHERE source_id = $1
-                  FOR UPDATE",
+                  WHERE source_id = $1",
                 &[&self.writer.source_id.as_str()],
             )
             .map_err(postgres_log_error)?;
@@ -1804,32 +1821,36 @@ impl PostgresFencedCanonicalLog {
             self.observer
                 .observe(PostgresAppendBoundary::BeforeCheckpoint);
         }
-        let mut outcomes = Vec::with_capacity(encoded.len());
-        if let [only] = statements.as_slice() {
-            outcomes.extend(self.run_append_statement(
-                &mut **client,
+        // A statement that waited out `lock_timeout` wrote nothing, and so did
+        // the transaction it ran in. Each rerun checks the fence again, and an
+        // entry already durable is reported present.
+        let mut pause = APPEND_LOCK_RETRY_PAUSE;
+        let mut retries = 0;
+        let outcomes = loop {
+            match self.attempt_append(
+                &mut client,
                 &statement,
-                &encoded[only.clone()],
+                &encoded,
+                &statements,
                 durable_lsn.as_deref(),
-            )?);
-        } else {
-            let mut transaction = client.transaction().map_err(postgres_log_error)?;
-            let last = statements.len() - 1;
-            for (index, range) in statements.into_iter().enumerate() {
-                let checkpoint = if index == last {
-                    durable_lsn.as_deref()
-                } else {
-                    None
-                };
-                outcomes.extend(self.run_append_statement(
-                    &mut transaction,
-                    &statement,
-                    &encoded[range],
-                    checkpoint,
-                )?);
+            ) {
+                Ok(outcomes) => break outcomes,
+                Err(AttemptError::Log(error)) => return Err(error),
+                Err(AttemptError::RowLocked) if retries < APPEND_LOCK_RETRIES => {
+                    retries += 1;
+                    tracing::info!(retries, "a canonical append met a locked row; retrying");
+                    std::thread::sleep(pause);
+                    pause = pause.saturating_mul(2);
+                }
+                Err(AttemptError::RowLocked) => {
+                    tracing::warn!(
+                        sqlstate = SqlState::LOCK_NOT_AVAILABLE.code(),
+                        "a canonical append met a locked row on every attempt"
+                    );
+                    return Err(LogError::PostgresUnavailable);
+                }
             }
-            transaction.commit().map_err(postgres_log_error)?;
-        }
+        };
         self.observer
             .observe(PostgresAppendBoundary::FenceAuthorized);
         if outcomes
@@ -1887,13 +1908,47 @@ impl PostgresFencedCanonicalLog {
         Ok(self.append_statement.get_or_init(|| statement).clone())
     }
 
+    /// One attempt at an append group: one statement, or a transaction of
+    /// several that commits all of them or none.
+    fn attempt_append(
+        &self,
+        client: &mut Client,
+        statement: &Statement,
+        encoded: &[EncodedAppend],
+        statements: &[Range<usize>],
+        durable_lsn: Option<&str>,
+    ) -> Result<Vec<AppendOutcome>, AttemptError> {
+        if let [only] = statements {
+            return self.run_append_statement(
+                client,
+                statement,
+                &encoded[only.clone()],
+                durable_lsn,
+            );
+        }
+        let mut outcomes = Vec::with_capacity(encoded.len());
+        let mut transaction = client.transaction().map_err(postgres_log_error)?;
+        let last = statements.len() - 1;
+        for (index, range) in statements.iter().enumerate() {
+            let checkpoint = if index == last { durable_lsn } else { None };
+            outcomes.extend(self.run_append_statement(
+                &mut transaction,
+                statement,
+                &encoded[range.clone()],
+                checkpoint,
+            )?);
+        }
+        transaction.commit().map_err(postgres_log_error)?;
+        Ok(outcomes)
+    }
+
     fn run_append_statement(
         &self,
         client: &mut impl GenericClient,
         statement: &Statement,
         entries: &[EncodedAppend],
         durable_lsn: Option<&str>,
-    ) -> Result<Vec<AppendOutcome>, LogError> {
+    ) -> Result<Vec<AppendOutcome>, AttemptError> {
         let identities: Vec<&str> = entries
             .iter()
             .map(|entry| entry.transaction_identity.as_str())
@@ -1921,21 +1976,27 @@ impl PostgresFencedCanonicalLog {
                     &end_lsns,
                 ],
             )
-            .map_err(postgres_log_error)?;
+            .map_err(|error| {
+                if error.code() == Some(&SqlState::LOCK_NOT_AVAILABLE) {
+                    AttemptError::RowLocked
+                } else {
+                    AttemptError::Log(postgres_log_error(error))
+                }
+            })?;
         let status: String = row.get(0);
         match status.as_str() {
-            "fenced" => return Err(LogError::FencedWriterRejected),
-            "corrupt" | "checkpoint_missing" => return Err(LogError::PostgresHeadCorrupt),
-            "duplicate_conflict" => return Err(LogError::DuplicateTransactionConflict),
-            "compacted" => return Err(LogError::ReplayBehindCompaction),
-            "exhausted" => return Err(LogError::SequenceExhausted),
+            "fenced" => return Err(LogError::FencedWriterRejected.into()),
+            "corrupt" | "checkpoint_missing" => return Err(LogError::PostgresHeadCorrupt.into()),
+            "duplicate_conflict" => return Err(LogError::DuplicateTransactionConflict.into()),
+            "compacted" => return Err(LogError::ReplayBehindCompaction.into()),
+            "exhausted" => return Err(LogError::SequenceExhausted.into()),
             "ok" => {}
-            _ => return Err(LogError::PostgresHeadCorrupt),
+            _ => return Err(LogError::PostgresHeadCorrupt.into()),
         }
         let statuses: Vec<String> = row.get(1);
         let sequences: Vec<Option<i64>> = row.get(2);
         if statuses.len() != entries.len() || sequences.len() != entries.len() {
-            return Err(LogError::PostgresHeadCorrupt);
+            return Err(LogError::PostgresHeadCorrupt.into());
         }
         statuses
             .into_iter()
@@ -1954,7 +2015,29 @@ impl PostgresFencedCanonicalLog {
                     _ => Err(LogError::PostgresHeadCorrupt),
                 }
             })
-            .collect()
+            .collect::<Result<_, LogError>>()
+            .map_err(AttemptError::Log)
+    }
+}
+
+/// How many times an append group that met a row locked past `lock_timeout`
+/// runs again, and the pause before the first rerun, doubled before each
+/// later one. A row stays locked that long behind a commit PostgreSQL is slow
+/// to flush; the four attempts wait out about 4.4 s before the group fails.
+const APPEND_LOCK_RETRIES: u32 = 3;
+const APPEND_LOCK_RETRY_PAUSE: Duration = Duration::from_millis(50);
+
+/// Why one attempt at an append group failed.
+enum AttemptError {
+    /// A statement waited out `lock_timeout` on a row another transaction
+    /// held. The attempt wrote nothing.
+    RowLocked,
+    Log(LogError),
+}
+
+impl From<LogError> for AttemptError {
+    fn from(error: LogError) -> Self {
+        Self::Log(error)
     }
 }
 
@@ -2718,7 +2801,13 @@ fn connect(connection_string: &str) -> Result<Client, LogError> {
         .map_err(postgres_log_error)
 }
 
-fn postgres_log_error(_error: postgres::Error) -> LogError {
+fn postgres_log_error(error: postgres::Error) -> LogError {
+    // PostgreSQL's own text can name source objects or hold SQL, so a
+    // server's error is logged by its SQLSTATE alone.
+    match error.code() {
+        Some(code) => tracing::warn!(sqlstate = code.code(), "a canonical log statement failed"),
+        None => tracing::warn!(%error, "a canonical log statement failed"),
+    }
     LogError::PostgresUnavailable
 }
 

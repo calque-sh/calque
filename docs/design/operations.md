@@ -682,7 +682,11 @@ fails closed on a dead or behind CDC session, a stale fence, a failed canonical
 write transaction, an unreachable catalog, or a fenced generation whose
 artifact failed to publish, which a restart retries. Application `/v1/`
 requests are rejected only while the CDC runtime is stopped or re-establishing
-its session. A source that is behind still serves them from the canonical
+its session: the bootstrap is answered `503` `INTERNAL_RETRYABLE`, which the
+client asks again for on its network-retry schedule, for up to 9.75 s, and
+every other `/v1/` route an empty `503`, except artifact objects, which are
+served. A page's change requests retry a `503` after 100 ms, doubling to 5 s.
+A source that is behind still serves them from the canonical
 log at the log's own cursor: a refusal would not make the client current,
 only add its retry delay to the lag.
 
@@ -690,7 +694,8 @@ only add its retry delay to the lag.
 
 The replication runtime reconnects. When the replication, fence-control or
 canonical-writer connection is lost, the source is recorded not-current, so
-`/readyz` and `/v1/` answer `503` while `/healthz` stays `204`. The runtime logs
+`/readyz` and `/v1/`, artifact objects aside, answer `503` while `/healthz`
+stays `204`. The runtime logs
 `CDC replication session failed; re-establishing it` and retries after a delay
 that starts at 100 ms and doubles to a 5 s cap, each delay drawn from the upper
 half of its step. Each attempt reacquires the fence lease, reopens replication at
