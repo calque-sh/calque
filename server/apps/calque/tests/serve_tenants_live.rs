@@ -935,6 +935,7 @@ fn change_request(plan: &Plan, from: &str) -> change::ChangeRequest {
         accept_revocation_barrier: true,
         plan_id: plan.plan_id.clone(),
         stream: false,
+        accept_compacted_batches: false,
     }
 }
 

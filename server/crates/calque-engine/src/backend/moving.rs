@@ -158,6 +158,7 @@ mod tests {
             accept_revocation_barrier: true,
             plan_id: "plan".to_owned(),
             stream: false,
+            accept_compacted_batches: false,
         })
         .unwrap()
     }

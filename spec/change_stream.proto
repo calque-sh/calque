@@ -65,6 +65,26 @@ message ChangeRequest {
   // field answers with one batch, which a streaming reader reads as a stream
   // that ended.
   bool stream = 15;
+  // Lets the batches of a fenced request carry folded transactions. Legal
+  // only with `through_cursor_inclusive` and
+  // `accept_transaction_fragmentation`. A folded batch carries one
+  // transaction in place of the transactions it covers, with each row they
+  // change once, as the batch's end leaves it: a row inserted there is one
+  // INSERT_FULL_ROW of its last values, a row updated there one
+  // UPDATE_PATCH of every column they change, a row deleted there one
+  // DELETE_BY_KEY, a row deleted and inserted again a DELETE_BY_KEY and then
+  // an INSERT_FULL_ROW, and a row inserted and deleted there nothing. The
+  // transaction's cursor and PostgreSQL provenance are those of the last
+  // transaction it covers, and the batch still ends on that exact cursor or
+  // after it. A batch is never folded across a TRUNCATE or an update that
+  // moves a row's primary key: such a transaction ends the fold before it,
+  // and is sent as committed, alone in its batch, when it comes first.
+  // Operations no receiver could apply in that order, such as a second
+  // insert of a row the batch inserted, make the batch committed, so the
+  // receiver refuses them as it would without folding. Absence keeps
+  // v1's meaning, so a server that ignores the field sends every transaction
+  // as committed.
+  bool accept_compacted_batches = 16;
 }
 
 message ChangeStreamFrame {

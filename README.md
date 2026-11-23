@@ -33,10 +33,9 @@ Measured over an emulated 100 Mbit/s link with 30 ms of latency, every sample
 checked row by row against PostgreSQL. The laptop was busy at the time, so the
 numbers are directional. [How they were measured](docs/benchmark.md).
 
-> [!WARNING]
-> Calque is pre-alpha. APIs, protocol and storage formats change between
-> releases, and there is no upgrade path yet: a new build asks you to clear
-> the old state and prepare again.
+> [!NOTE]
+> Calque is alpha. APIs and the protocol can still change between releases.
+> A release upgrades the state of the one before it in place.
 
 ## Why
 
@@ -148,7 +147,7 @@ Before you point it at your own schema:
 Calque is not offline-first, does not paginate or sync partial query results,
 and has no SQL endpoint, by design: [`MANIFESTO.md`](MANIFESTO.md) explains
 why.
-[Not built in the pre-alpha](docs/design/architecture-guidelines.md#not-built-in-the-pre-alpha)
+[Not built yet](docs/design/architecture-guidelines.md#not-built-in-the-pre-alpha)
 lists what is still missing.
 
 ## How it works

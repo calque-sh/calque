@@ -180,6 +180,7 @@ const PRODUCTION = {
   dataset: "content-v1",
   network: { megabitsPerSecond: 100, latencyMs: 30 },
   storedRows: true,
+  compactedCatchUp: true,
   returning: false,
 } as const;
 
@@ -344,6 +345,26 @@ test("--tail writes before the reference pass and leaves the run unjudged", () =
   assert.equal(parseTail("5000000"), 5_000_000);
   for (const bad of ["0", "5000001", "-5", "2.5", "1e3", "ten", ""])
     assert.throws(() => parseTail(bad), /whole number/u, bad);
+});
+
+test("--no-compacted-catch-up reaches calque dev and leaves the run unjudged", () => {
+  assert.equal(parseBenchArguments([]).compactedCatchUp, true);
+  const options = parseBenchArguments([
+    "--realtime-only",
+    "--cold-under-load",
+    "--no-compacted-catch-up",
+  ]);
+  assert.equal(options.compactedCatchUp, false);
+  assert.deepEqual(devArguments(options), ["--no-compacted-catch-up"]);
+  assert.ok(unjudgedReasons(options).includes("no compacted catch-up"));
+  assert.throws(
+    () =>
+      parseBenchArguments([
+        "--no-compacted-catch-up",
+        "--no-compacted-catch-up",
+      ]),
+    /usage: pnpm bench/u,
+  );
 });
 
 test("--no-stored-rows reaches calque dev, --returning takes returning visits, and both leave the run unjudged", () => {

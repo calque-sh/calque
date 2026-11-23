@@ -429,6 +429,17 @@ export function validateChangeRequest(request: ChangeRequest): void {
   // lifetime.
   if (request.stream && request.longPollTimeoutMs === 0)
     fail("changeRequest.stream", "requires a non-zero longPollTimeoutMs");
+  // Only a fenced catch-up has transactions to fold, and a folded transaction
+  // is as large as the rows it changes.
+  if (
+    request.acceptCompactedBatches &&
+    (request.throughCursorInclusive === undefined ||
+      !request.acceptTransactionFragmentation)
+  )
+    fail(
+      "changeRequest.acceptCompactedBatches",
+      "requires throughCursorInclusive and acceptTransactionFragmentation",
+    );
   requireClientIdentifier(
     request.clientInstanceId,
     "changeRequest.clientInstanceId",

@@ -918,6 +918,7 @@ interface ObservedRequest {
   readonly stream: boolean;
   readonly wait: number;
   readonly transactions: number;
+  readonly compacted: boolean;
 }
 
 /** The longest wait the protocol allows, which a fenced catch-up asks for. */
@@ -971,6 +972,7 @@ function changeEndpoint(
       stream: request.stream,
       wait: request.longPollTimeoutMs,
       transactions: request.maxTransactions,
+      compacted: request.acceptCompactedBatches,
     });
     // A live response is keyed by its cursor alone; a fenced one by
     // `from|through`.
@@ -1605,7 +1607,8 @@ describe("the live session catches up to the activation fence before going live"
     // artifact's snapshot cursor for every table; the live requests carry
     // neither, as the change endpoint requires. Both ask for an open
     // response: the fenced one for the longest wait, which only bounds how
-    // long it may run, and the live ones for the plan's.
+    // long it may run, and the live ones for the plan's. Only the fenced one
+    // asks for folded batches.
     expect(observed[0]).toEqual({
       from: "cursor-0",
       through: "cursor-1",
@@ -1614,6 +1617,7 @@ describe("the live session catches up to the activation fence before going live"
       stream: true,
       wait: MAX_WAIT_MS,
       transactions: BATCH_TRANSACTIONS,
+      compacted: true,
     });
     expect(observed[1]).toEqual({
       from: "cursor-1",
@@ -1623,6 +1627,7 @@ describe("the live session catches up to the activation fence before going live"
       stream: true,
       wait: 10,
       transactions: BATCH_TRANSACTIONS,
+      compacted: false,
     });
     // The fence is spent once the mount has stood at it. A mount that has
     // since moved past it is not "behind the fence" again: every later poll is
@@ -1707,6 +1712,7 @@ describe("the live session catches up to the activation fence before going live"
       stream: true,
       wait: 10,
       transactions: BATCH_TRANSACTIONS,
+      compacted: false,
     });
   });
 
@@ -1766,6 +1772,7 @@ describe("the live session catches up to the activation fence before going live"
       stream: true,
       wait: MAX_WAIT_MS,
       transactions: BATCH_TRANSACTIONS,
+      compacted: true,
     });
     expect(
       observed.slice(1).map((request) => [request.from, request.through]),

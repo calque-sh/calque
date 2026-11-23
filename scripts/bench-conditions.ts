@@ -101,6 +101,11 @@ export interface BenchOptions {
    */
   readonly storedRows: boolean;
   /**
+   * Whether a first visit's catch-up is folded; `--no-compacted-catch-up`
+   * passes `calque dev` its flag of that name.
+   */
+  readonly compactedCatchUp: boolean;
+  /**
    * `--returning`: every warm-up, judged and traced sample is a returning
    * visit, measured on a browser launched again on the profile one
    * unmeasured visit filled.
@@ -205,6 +210,7 @@ export function unjudgedReasons(options: BenchOptions): string[] {
           `older cuts kept to a log ratio of ${String(options.recutKeepRatio)}`,
         ]),
     ...(options.storedRows ? [] : ["no stored rows"]),
+    ...(options.compactedCatchUp ? [] : ["no compacted catch-up"]),
     ...(options.returning ? ["returning visits"] : []),
     ...(options.betweenVisits === undefined
       ? []
@@ -238,7 +244,7 @@ export function rendersPlan(options: Pick<BenchOptions, "network">): boolean {
 }
 
 const USAGE =
-  "usage: pnpm bench [-- --smoke] [--calque <path>] [--dataset <content-v1|v1>] [--network <off|Mbit/s/latency ms|shaped:Mbit/s/RTT ms>] [--diagnostic] [--hold-until-logged <text>] [--realtime-only] [--postgres-bin <dir>] [--no-edge] [--background-clients <n>] [--background-qos utility] [--load-rate <tx/s>] [--bootstrap-probe <narrow sets>] [--cold-under-load] [--tail <transactions>] [--recut-tail-ratio <ratio>] [--recut-min-interval <seconds>] [--recut-keep-ratio <ratio>] [--no-stored-rows] [--returning] [--between-visits <transactions>] [--schema-change <config-add|rewrite-whole|rename-suspend>]";
+  "usage: pnpm bench [-- --smoke] [--calque <path>] [--dataset <content-v1|v1>] [--network <off|Mbit/s/latency ms|shaped:Mbit/s/RTT ms>] [--diagnostic] [--hold-until-logged <text>] [--realtime-only] [--postgres-bin <dir>] [--no-edge] [--background-clients <n>] [--background-qos utility] [--load-rate <tx/s>] [--bootstrap-probe <narrow sets>] [--cold-under-load] [--tail <transactions>] [--recut-tail-ratio <ratio>] [--recut-min-interval <seconds>] [--recut-keep-ratio <ratio>] [--no-stored-rows] [--no-compacted-catch-up] [--returning] [--between-visits <transactions>] [--schema-change <config-add|rewrite-whole|rename-suspend>]";
 
 export function parseBenchArguments(
   arguments_: readonly string[],
@@ -263,6 +269,7 @@ export function parseBenchArguments(
   let recutMinIntervalSeconds: number | null = null;
   let recutKeepRatio: number | null = null;
   let storedRows = true;
+  let compactedCatchUp = true;
   let returning = false;
   let betweenVisits: number | null = null;
   let schemaChange: SchemaChange | null = null;
@@ -334,6 +341,8 @@ export function parseBenchArguments(
       index += 1;
     } else if (argument === "--no-stored-rows" && storedRows)
       storedRows = false;
+    else if (argument === "--no-compacted-catch-up" && compactedCatchUp)
+      compactedCatchUp = false;
     else if (argument === "--returning" && !returning) returning = true;
     else if (argument === "--between-visits" && betweenVisits === null) {
       betweenVisits = parseBetweenVisits(value(index));
@@ -403,6 +412,7 @@ export function parseBenchArguments(
     ...(recutMinIntervalSeconds === null ? {} : { recutMinIntervalSeconds }),
     ...(recutKeepRatio === null ? {} : { recutKeepRatio }),
     storedRows,
+    compactedCatchUp,
     returning,
     ...(betweenVisits === null ? {} : { betweenVisits }),
     ...(schemaChange === null ? {} : { schemaChange }),
@@ -498,10 +508,12 @@ export function devArguments(
     | "recutMinIntervalSeconds"
     | "recutKeepRatio"
     | "storedRows"
+    | "compactedCatchUp"
   >,
 ): string[] {
   return [
     ...(options.storedRows ? [] : ["--no-stored-rows"]),
+    ...(options.compactedCatchUp ? [] : ["--no-compacted-catch-up"]),
     ...(options.recutTailRatio === undefined
       ? []
       : ["--recut-tail-ratio", String(options.recutTailRatio)]),

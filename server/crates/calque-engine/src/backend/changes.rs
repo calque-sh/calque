@@ -58,15 +58,28 @@ pub(super) async fn build_change_batch<R: PooledLogReader + CanonicalLogRead>(
     if let Some((tail, view)) = reads.tail.and_then(|tail| {
         tail_view(tail, reads.activated, &request, ceiling).map(|view| (tail, view))
     }) {
+        // A folded batch is the client's own, as a batch from the log is, so
+        // it takes the same room.
+        let room = match request.accept_compacted_batches {
+            true => match take_room(&reads, plan, room, &request)? {
+                Some(room) => Some(room),
+                None => return Ok(None),
+            },
+            false => None,
+        };
         // The view's records stop at the head it was taken at, so the proof
         // read now covers every echo it holds.
         let authorization = authorize(plan_without_proof, acknowledgements).await?;
         let encoding = tail.encoding(ScopeEncodingKey::of(&authorization));
         let inline = view.runs_inline();
         let build = move || {
-            ChangeBatchBuilder::new(&view, &authorization)?
+            let mut batch = ChangeBatchBuilder::new(&view, &authorization)?
                 .with_shared_encoding(&encoding)?
-                .build_at(&request, now_unix_micros)
+                .build_at(&request, now_unix_micros)?;
+            if let Some(room) = room {
+                room.hold(&mut batch.chunks);
+            }
+            Ok(batch)
         };
         // Most live builds read one commit, and run where they are awaited.
         return if inline {
@@ -78,12 +91,8 @@ pub(super) async fn build_change_batch<R: PooledLogReader + CanonicalLogRead>(
                 .map(Some)
         };
     }
-    let room = match room.take() {
-        Some(room) => room,
-        None => match reads.room.try_reserve(plan, request.max_batch_bytes)? {
-            Some(room) => room,
-            None => return Ok(None),
-        },
+    let Some(room) = take_room(&reads, plan, room, &request)? else {
+        return Ok(None);
     };
     // A build holds a reader of its own from its first read to its last frame,
     // so builds for different browsers run side by side up to the pool's
@@ -130,6 +139,20 @@ pub(super) async fn build_change_batch<R: PooledLogReader + CanonicalLogRead>(
     .map_err(|_| ChangeBatchError::Log(canonical_log::LogError::PostgresUnavailable))?
 }
 
+/// The room a build waited for, or the room free now for the largest batch
+/// it may make. `None` is no room free.
+fn take_room<R: PooledLogReader>(
+    reads: &ChangeReads<'_, R>,
+    plan: &PlanRoom,
+    room: &mut Option<BatchRoom>,
+    request: &change_api::ChangeBatchRequest,
+) -> Result<Option<BatchRoom>, ChangeBatchError> {
+    match room.take() {
+        Some(room) => Ok(Some(room)),
+        None => reads.room.try_reserve(plan, request.max_batch_bytes),
+    }
+}
+
 async fn authorize(
     plan_without_proof: ScopedChangePlan,
     acknowledgements: Option<
@@ -160,7 +183,18 @@ pub(super) fn tail_view(
         Some(fence) => Some(codec.decode(fence).ok()?.sequence),
         None => None,
     };
-    tail.view(from, fence, ceiling, std::time::Instant::now())
+    let max_stored_bytes = if request.accept_compacted_batches {
+        change_api::MAX_FOLDED_SCAN_STORED_BYTES
+    } else {
+        change_api::MAX_SCAN_STORED_BYTES
+    };
+    tail.view_within(
+        from,
+        fence,
+        ceiling,
+        std::time::Instant::now(),
+        max_stored_bytes,
+    )
 }
 
 /// The canonical log as a plan of a fenced generation may see it: nothing past
@@ -700,12 +734,14 @@ impl LocalBackend {
         };
         let acknowledgements = (!incoming.pending_mutation_ids().is_empty())
             .then(|| self.resolve_acknowledgements(incoming, &grant.plan.scope));
+        let mut request = request.clone();
+        request.accept_compacted_batches &= self.inner.compacted_catch_up;
         Ok(
             match build_change_batch(
                 self.inner.change_reads(),
                 plan_without_proof,
                 acknowledgements,
-                request.clone(),
+                request,
                 now,
                 ceiling,
                 &grant.plan.room,

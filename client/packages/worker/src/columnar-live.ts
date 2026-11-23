@@ -41,8 +41,9 @@ const RETRY_INITIAL_MS = 100;
 const RETRY_MAX_MS = 5_000;
 /**
  * The most transactions a request asks for in one batch. A batch applies only
- * once all of it has arrived, so this bounds the work left after a catch-up's
- * last byte.
+ * once all of it has arrived, so this bounds the work left after a live
+ * batch's last byte. A folded catch-up batch carries one transaction, bounded
+ * by the batch's bytes.
  */
 const MAX_BATCH_TRANSACTIONS = 250;
 /**
@@ -556,6 +557,10 @@ function changeRequestBody(
     deviceId: options.deviceId,
     acceptTransactionFragmentation: true,
     acceptRevocationBarrier: options.acceptRevocationBarrier === true,
+    // A catch-up's batches may fold the transactions they cover, sending each
+    // row they change once, so a row written many times since the cut crosses
+    // the wire once.
+    acceptCompactedBatches: fence !== undefined,
     pendingMutationIds: [...new Set(pendingMutationIds)].sort(),
     // The wait is how long an open response may stay open, so a request
     // without one asks for one batch.

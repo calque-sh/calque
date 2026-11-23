@@ -814,6 +814,7 @@ mod tests {
             accept_revocation_barrier: true,
             plan_id: "plan-1".to_owned(),
             stream: false,
+            accept_compacted_batches: false,
         }
     }
 

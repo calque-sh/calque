@@ -24,8 +24,8 @@ use sync_protocol::{
     },
     encode_sealed_change_frame, verify_revocation_barrier, BatchFramesDigest, FrameEncodeError,
     RevocationBarrierVerificationKey, SealedChangeFrame, SealedChangeFrameError,
-    MAX_CHANGE_AUTHORIZATION_TOKEN_BYTES, MAX_CLIENT_INSTANCE_ID_BYTES, MAX_DEVICE_ID_BYTES,
-    MAX_LONG_POLL_TIMEOUT_MS, MAX_PENDING_MUTATION_IDS, MAX_REQUEST_TABLES,
+    FRAME_LENGTH_PREFIX_BYTES, MAX_CHANGE_AUTHORIZATION_TOKEN_BYTES, MAX_CLIENT_INSTANCE_ID_BYTES,
+    MAX_DEVICE_ID_BYTES, MAX_LONG_POLL_TIMEOUT_MS, MAX_PENDING_MUTATION_IDS, MAX_REQUEST_TABLES,
     MIN_LONG_POLL_TIMEOUT_MS, PROTOCOL_VERSION,
 };
 use sync_types::{
@@ -35,8 +35,10 @@ use sync_types::{
 use thiserror::Error;
 use uuid::Uuid;
 
+mod fold;
 mod scope_encoding;
 
+use fold::Fold;
 use scope_encoding::{EncodedTransaction, SharedFrame};
 pub use scope_encoding::{ScopeEncoding, ScopeEncodingKey};
 
@@ -52,6 +54,10 @@ const _: () = assert!(sync_types::MAX_CURSOR_TOKEN_BYTES == sync_protocol::MAX_C
 pub const MAX_SCAN_RECORDS: usize = 100_000;
 /// The most stored bytes of canonical records one build reads.
 pub const MAX_SCAN_STORED_BYTES: u64 = 64 * 1024 * 1024;
+/// The most stored bytes of canonical records one folded build reads. A fold
+/// sends each row once however often the records it reads change it, so what
+/// bounds its batch is the rows they change, not the records.
+pub const MAX_FOLDED_SCAN_STORED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CANONICAL_RECORD_BYTES: u64 = 64 * 1024 * 1024;
 const SCAN_PAGE_RECORDS: usize = 256;
 const END_FRAME_RESERVE: usize = 4096;
@@ -392,6 +398,11 @@ pub struct ChangeBatchRequest {
     /// fenced request's carries its batches back to back and ends at the
     /// fence.
     pub stream: bool,
+    /// Lets a fenced request's batches each carry one folded transaction in
+    /// place of the transactions it covers, so a row written many times
+    /// crosses the wire once. Only a fenced request that accepts
+    /// fragmentation may set it.
+    pub accept_compacted_batches: bool,
     device_id: String,
     pending_mutation_ids: BTreeSet<MutationId>,
 }
@@ -486,6 +497,13 @@ pub fn parse_change_request(
     if request.stream && request.long_poll_timeout_ms == 0 {
         return Err(ChangeBatchError::InvalidLimits);
     }
+    // A live batch carries what one wait found, so it has nothing to fold,
+    // and a folded transaction is as large as the rows it changes.
+    if request.accept_compacted_batches
+        && (request.through_cursor_inclusive.is_none() || !request.accept_transaction_fragmentation)
+    {
+        return Err(ChangeBatchError::InvalidLimits);
+    }
 
     let plan_id = PlanId::new(request.plan_id).map_err(|_| ChangeBatchError::InvalidPlanBinding)?;
     let from_cursor_exclusive = required_wire_cursor(request.from_cursor_exclusive)?;
@@ -532,6 +550,7 @@ pub fn parse_change_request(
             accept_transaction_fragmentation: request.accept_transaction_fragmentation,
             accept_revocation_barrier: request.accept_revocation_barrier,
             stream: request.stream,
+            accept_compacted_batches: request.accept_compacted_batches,
             device_id: request.device_id.clone(),
             pending_mutation_ids: pending_mutation_ids.clone(),
         },
@@ -682,6 +701,93 @@ fn owned_page(page: canonical_log::CanonicalPage) -> RecordPage {
     }
 }
 
+/// A folded build's batch, or how many transactions to send as committed
+/// instead.
+enum Folded {
+    Batch(ChangeBatch),
+    Committed { transactions: usize },
+}
+
+/// What a build settles before it reads past its first page.
+struct Begun<'a> {
+    scan: Scan,
+    from: u64,
+    scan_limit: u64,
+    subscriptions: BTreeMap<TableId, u64>,
+    shared: Option<&'a ScopeEncoding>,
+    frames: BatchFrames,
+    ending: Ending<'a>,
+}
+
+/// What ending a batch reads of where its build began.
+struct Ending<'a> {
+    server_time_unix_micros: u64,
+    live: bool,
+    fence: u64,
+    head: u64,
+    barrier: Option<&'a AuthorizedRevocationBarrier>,
+}
+
+/// A build's read of the log, page by page from its start, within the most
+/// records and stored bytes one build reads.
+struct Scan {
+    /// The sequence of the last record the batch covers.
+    scanned: u64,
+    records: usize,
+    stored_bytes: u64,
+    /// The page read with the log's bounds, which starts where the scan
+    /// starts, so it is the first page the scan reads.
+    first_page: Option<Result<RecordPage, LogError>>,
+}
+
+impl Scan {
+    /// The next page up to `scan_limit`, or `None` once the scan reached it
+    /// or spent its budget.
+    fn next_page<R: ChangeRecords + ?Sized>(
+        &mut self,
+        records: &R,
+        scan_limit: u64,
+        max_stored_bytes: u64,
+    ) -> Result<Option<RecordPage>, ChangeBatchError> {
+        if self.scanned >= scan_limit
+            || self.records >= MAX_SCAN_RECORDS
+            || self.stored_bytes >= max_stored_bytes
+        {
+            return Ok(None);
+        }
+        let read = match self.first_page.take() {
+            Some(read) => read,
+            None => records.read_page_after(
+                self.scanned,
+                Some(scan_limit),
+                (MAX_SCAN_RECORDS - self.records).min(SCAN_PAGE_RECORDS),
+                (max_stored_bytes - self.stored_bytes).min(MAX_CANONICAL_RECORD_BYTES),
+            ),
+        };
+        let page = match read {
+            Ok(page) => page,
+            Err(LogError::ReadLimitTooSmall { .. }) if self.records > 0 => return Ok(None),
+            // Trimmed past the scan between two of its pages.
+            Err(LogError::BeforeRetention { minimum, .. }) => {
+                return Err(ChangeBatchError::BeforeRetention { minimum })
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if page.records.is_empty() {
+            return Err(ChangeBatchError::CanonicalRangeIncomplete);
+        }
+        self.records = self
+            .records
+            .checked_add(page.records.len())
+            .ok_or(ChangeBatchError::CountOverflow)?;
+        self.stored_bytes = self
+            .stored_bytes
+            .checked_add(page.stored_bytes)
+            .ok_or(ChangeBatchError::CountOverflow)?;
+        Ok(Some(page))
+    }
+}
+
 pub struct ChangeBatchBuilder<'a, R: ChangeRecords + ?Sized> {
     records: &'a R,
     authorization: &'a ChangeAuthorization,
@@ -745,6 +851,34 @@ impl<'a, R: ChangeRecords + ?Sized> ChangeBatchBuilder<'a, R> {
         now_unix_micros: i64,
         stream_id: Vec<u8>,
     ) -> Result<ChangeBatch, ChangeBatchError> {
+        if request.accept_compacted_batches
+            && request.accept_transaction_fragmentation
+            && request.through_cursor_inclusive.is_some()
+        {
+            let begun = self.begin(request, now_unix_micros, stream_id.clone())?;
+            let transactions = match self.build_folded(request, begun)? {
+                Folded::Batch(batch) => return Ok(batch),
+                Folded::Committed { transactions } => transactions,
+            };
+            let committed = ChangeBatchRequest {
+                max_transactions: transactions,
+                ..request.clone()
+            };
+            let begun = self.begin(&committed, now_unix_micros, stream_id)?;
+            return self.build_committed(&committed, begun);
+        }
+        let begun = self.begin(request, now_unix_micros, stream_id)?;
+        self.build_committed(request, begun)
+    }
+
+    /// Checks the request against its authorization and the log, reads the
+    /// first page, and starts the batch's frames.
+    fn begin(
+        &self,
+        request: &ChangeBatchRequest,
+        now_unix_micros: i64,
+        stream_id: Vec<u8>,
+    ) -> Result<Begun<'a>, ChangeBatchError> {
         let server_time_unix_micros =
             u64::try_from(now_unix_micros).map_err(|_| ChangeBatchError::InvalidServerTime)?;
         if now_unix_micros >= self.authorization.expires_at_unix_micros {
@@ -887,52 +1021,53 @@ impl<'a, R: ChangeRecords + ?Sized> ChangeBatchBuilder<'a, R> {
             })),
             MAX_FRAME_BYTES,
         )?);
+        Ok(Begun {
+            scan: Scan {
+                scanned: from.sequence,
+                records: 0,
+                stored_bytes: 0,
+                first_page: Some(first_page),
+            },
+            from: from.sequence,
+            scan_limit,
+            subscriptions,
+            shared,
+            frames,
+            ending: Ending {
+                server_time_unix_micros,
+                live,
+                fence: fence.sequence,
+                head: head.sequence,
+                barrier,
+            },
+        })
+    }
 
-        let mut scanned = from.sequence;
-        let mut scanned_records = 0_usize;
-        let mut scanned_bytes = 0_u64;
+    /// One batch of the transactions as they were committed.
+    fn build_committed(
+        &self,
+        request: &ChangeBatchRequest,
+        begun: Begun<'a>,
+    ) -> Result<ChangeBatch, ChangeBatchError> {
+        let Begun {
+            mut scan,
+            from,
+            scan_limit,
+            subscriptions,
+            shared,
+            mut frames,
+            ending,
+        } = begun;
+        let acknowledgeable = &self.authorization.acknowledgeable_mutation_ids;
         let mut relevant_transactions = 0_u64;
         let mut relevant_operations = 0_u64;
         let mut acknowledged = Vec::<String>::new();
         let mut acknowledged_bytes = 0_usize;
-        // The scan's first page is the page read with the bounds: it starts
-        // where the scan starts, is bounded by `scan_limit` and has the whole
-        // scan budget, so it is the page the first pass would read.
-        let mut first_page = Some(first_page);
-        'scan: while scanned < scan_limit && relevant_transactions < request.max_transactions as u64
-        {
-            if scanned_records == MAX_SCAN_RECORDS || scanned_bytes == MAX_SCAN_STORED_BYTES {
+        'scan: while relevant_transactions < request.max_transactions as u64 {
+            let Some(page) = scan.next_page(self.records, scan_limit, MAX_SCAN_STORED_BYTES)?
+            else {
                 break;
-            }
-            let remaining_scan_bytes = MAX_SCAN_STORED_BYTES - scanned_bytes;
-            let remaining_scan_records = MAX_SCAN_RECORDS - scanned_records;
-            let read = match first_page.take() {
-                Some(read) => read,
-                None => self.records.read_page_after(
-                    scanned,
-                    Some(scan_limit),
-                    remaining_scan_records.min(SCAN_PAGE_RECORDS),
-                    remaining_scan_bytes.min(MAX_CANONICAL_RECORD_BYTES),
-                ),
             };
-            let page = match read {
-                Ok(page) => page,
-                Err(LogError::ReadLimitTooSmall { .. }) if scanned_records > 0 => break,
-                // Trimmed past the scan between two of its pages.
-                Err(LogError::BeforeRetention { minimum, .. }) => {
-                    return Err(ChangeBatchError::BeforeRetention { minimum })
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if page.records.is_empty() {
-                return Err(ChangeBatchError::CanonicalRangeIncomplete);
-            }
-            scanned_records = scanned_records
-                .checked_add(page.records.len())
-                .ok_or(ChangeBatchError::CountOverflow)?;
-            scanned_bytes = scanned_bytes
-                .checked_add(page.stored_bytes)
-                .ok_or(ChangeBatchError::CountOverflow)?;
             for record in page.records {
                 if relevant_transactions >= request.max_transactions as u64 {
                     break 'scan;
@@ -974,7 +1109,9 @@ impl<'a, R: ChangeRecords + ?Sized> ChangeBatchBuilder<'a, R> {
                         )
                     })?,
                     None => self
-                        .encode_for_request(record, &subscriptions)?
+                        .started_operations(record, &subscriptions)?
+                        .map(|(header, operations)| encoded_fragments(header, operations))
+                        .transpose()?
                         .map(Arc::new),
                 };
                 if let Some(transaction) = transaction {
@@ -985,7 +1122,7 @@ impl<'a, R: ChangeRecords + ?Sized> ChangeBatchBuilder<'a, R> {
                     }
                     if transaction.encoded_bytes > request.max_batch_bytes.saturating_sub(reserved)
                     {
-                        if scanned != from.sequence {
+                        if scan.scanned != from {
                             break 'scan;
                         }
                         return Err(ChangeBatchError::BatchLimitTooSmall);
@@ -999,21 +1136,169 @@ impl<'a, R: ChangeRecords + ?Sized> ChangeBatchBuilder<'a, R> {
                         .checked_add(transaction.operation_count)
                         .ok_or(ChangeBatchError::CountOverflow)?;
                 } else if reserved > request.max_batch_bytes {
-                    if scanned != from.sequence {
+                    if scan.scanned != from {
                         break 'scan;
                     }
                     return Err(ChangeBatchError::BatchLimitTooSmall);
                 }
                 acknowledged.extend(acknowledgements);
                 acknowledged_bytes += acknowledgement_bytes;
-                scanned = record_sequence;
+                scan.scanned = record_sequence;
             }
         }
+        self.end(
+            request,
+            ending,
+            frames,
+            &scan,
+            relevant_transactions,
+            relevant_operations,
+            acknowledged,
+        )
+    }
+
+    /// One batch whose transactions are folded into one, read until the rows
+    /// they change fill the batch.
+    fn build_folded(
+        &self,
+        request: &ChangeBatchRequest,
+        begun: Begun<'a>,
+    ) -> Result<Folded, ChangeBatchError> {
+        // A first transaction the fold cannot take is sent alone as
+        // committed, so the batch after it folds again.
+        let alone = Folded::Committed { transactions: 1 };
+        let Begun {
+            mut scan,
+            from,
+            scan_limit,
+            subscriptions,
+            shared: _,
+            mut frames,
+            ending,
+        } = begun;
+        let acknowledgeable = &self.authorization.acknowledgeable_mutation_ids;
+        let mut fold = Fold::default();
+        let mut last = None::<TransactionFragment>;
+        let mut acknowledged = Vec::<String>::new();
+        let mut acknowledged_bytes = 0_usize;
+        'scan: while let Some(page) =
+            scan.next_page(self.records, scan_limit, MAX_FOLDED_SCAN_STORED_BYTES)?
+        {
+            for record in page.records {
+                let record_sequence = record.record().position.sequence;
+                let acknowledgements =
+                    record_acknowledgements(record.record(), acknowledgeable, &acknowledged);
+                let acknowledgement_bytes = acknowledgements
+                    .iter()
+                    .map(|id| acknowledgement_len(id))
+                    .sum::<usize>();
+                let reserved = frames
+                    .len()
+                    .saturating_add(END_FRAME_RESERVE)
+                    .saturating_add(acknowledged_bytes)
+                    .saturating_add(acknowledgement_bytes);
+                if let Some((header, operations)) =
+                    self.started_operations(record, &subscriptions)?
+                {
+                    let operations = operations
+                        .into_iter()
+                        .map(wire_operation)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if !fold::foldable(&operations) {
+                        if scan.scanned == from {
+                            return Ok(alone);
+                        }
+                        break 'scan;
+                    }
+                    // Folding a transaction in adds at most its own operations,
+                    // and grows no operation by more than they take, so the
+                    // batch is checked before the fold changes.
+                    let added = operations
+                        .iter()
+                        .map(fold::embedded_operation_len)
+                        .sum::<usize>();
+                    let operation_count = fold
+                        .operation_count()
+                        .saturating_add(operations.len() as u64);
+                    let bound = folded_frames_bound(
+                        &header,
+                        fold.operation_bytes().saturating_add(added),
+                        operation_count,
+                        fold.largest_operation().saturating_add(added),
+                    )?;
+                    if operation_count > MAX_BATCH_OPERATIONS
+                        || bound > request.max_batch_bytes.saturating_sub(reserved)
+                    {
+                        if scan.scanned == from {
+                            return Ok(alone);
+                        }
+                        break 'scan;
+                    }
+                    // The batch is sent as committed, as far as it goes, so
+                    // the receiver refuses it where it would have.
+                    if fold.apply(operations).is_err() {
+                        return Ok(Folded::Committed {
+                            transactions: request.max_transactions,
+                        });
+                    }
+                    last = Some(header);
+                } else if reserved > request.max_batch_bytes {
+                    if scan.scanned == from {
+                        return Ok(alone);
+                    }
+                    break 'scan;
+                }
+                acknowledged.extend(acknowledgements);
+                acknowledged_bytes += acknowledgement_bytes;
+                scan.scanned = record_sequence;
+            }
+        }
+        let relevant_operations = fold.operation_count();
+        // Rows inserted and deleted by the batch's transactions send nothing,
+        // and a fold that sends nothing is no transaction.
+        let relevant_transactions = match last.filter(|_| relevant_operations > 0) {
+            Some(header) => {
+                let transaction = transaction_frames(header, fold.into_operations())?;
+                for frame in &transaction {
+                    frames.push_shared(frame);
+                }
+                1
+            }
+            None => 0,
+        };
+        self.end(
+            request,
+            ending,
+            frames,
+            &scan,
+            relevant_transactions,
+            relevant_operations,
+            acknowledged,
+        )
+        .map(Folded::Batch)
+    }
+
+    /// Ends the batch where the scan stopped, on the barrier when it stopped
+    /// there.
+    #[allow(clippy::too_many_arguments)]
+    fn end(
+        &self,
+        request: &ChangeBatchRequest,
+        ending: Ending<'a>,
+        mut frames: BatchFrames,
+        scan: &Scan,
+        relevant_transactions: u64,
+        relevant_operations: u64,
+        acknowledged: Vec<String>,
+    ) -> Result<ChangeBatch, ChangeBatchError> {
+        let scanned = scan.scanned;
         // The barrier is emitted only once the scan actually stands on it. A
         // batch cut short by its byte or transaction budget has not reached
         // the fence yet, so it ends where it stopped and the next request
         // carries on to the barrier.
-        let emitted_barrier = barrier.filter(|barrier| scanned == barrier.position.sequence);
+        let emitted_barrier = ending
+            .barrier
+            .filter(|barrier| scanned == barrier.position.sequence);
         // A client that did not negotiate the barrier body gets no barrier and
         // nothing past it: standing on it is the coarse expired authorization,
         // which `change-http` answers with 401 and `resnapshot_required`.
@@ -1039,8 +1324,9 @@ impl<'a, R: ChangeRecords + ?Sized> ChangeBatchBuilder<'a, R> {
             Some(barrier) => barrier.cursor.clone(),
             None => self.authorization.cursor_codec.encode(&through_position),
         };
-        let reached = !live && scanned == fence.sequence;
-        let currently_up_to_date = scanned == head.sequence;
+        let reached = !ending.live && scanned == ending.fence;
+        let currently_up_to_date = scanned == ending.head;
+        let server_time_unix_micros = ending.server_time_unix_micros;
         let (chunks, encoded_len) = frames.end(BatchEnd {
             through_cursor_inclusive: Some(cursor(&through_cursor)),
             reached_requested_fence: reached,
@@ -1064,68 +1350,67 @@ impl<'a, R: ChangeRecords + ?Sized> ChangeBatchBuilder<'a, R> {
             currently_up_to_date,
             revocation_barrier_emitted: emitted_barrier.is_some(),
             stats: ChangeBatchStats {
-                scanned_records: u64::try_from(scanned_records)
+                scanned_records: u64::try_from(scan.records)
                     .map_err(|_| ChangeBatchError::CountOverflow)?,
-                scanned_stored_bytes: scanned_bytes,
+                scanned_stored_bytes: scan.stored_bytes,
                 encoded_bytes: u64::try_from(encoded_len)
                     .map_err(|_| ChangeBatchError::CountOverflow)?,
             },
         })
     }
 
-    /// Encodes one record for this request alone, applying each table's own
-    /// start.
-    fn encode_for_request(
+    /// The operations of `record` this request is sent, with the transaction
+    /// they belong to: routed and projected for the scope, then past each
+    /// table's start. `None` when the record sends this request nothing.
+    fn started_operations(
         &self,
         record: PageRecord,
         subscriptions: &BTreeMap<TableId, u64>,
-    ) -> Result<Option<EncodedTransaction>, ChangeBatchError> {
+    ) -> Result<Option<(TransactionFragment, Vec<CanonicalOperation>)>, ChangeBatchError> {
         let scope = &self.authorization.scope;
+        let started = |operations: Vec<CanonicalOperation>, position: &CursorPosition| {
+            operations
+                .into_iter()
+                .filter(|operation| {
+                    subscriptions
+                        .get(&operation.table_id)
+                        .is_some_and(|start| position.sequence > *start)
+                })
+                .collect::<Vec<_>>()
+        };
+        let header = |transaction: &CanonicalTransaction, position: &CursorPosition| {
+            wire_transaction(
+                transaction,
+                self.authorization.cursor_codec.encode(position),
+            )
+        };
+        // Each transaction is routed and projected whole before per-table
+        // snapshot starts apply, which keeps policy violations fail-closed
+        // even for an operation that predates one table's activation cursor.
         match record {
             PageRecord::Owned(CanonicalRecord {
                 position,
                 entry: CanonicalEntry::Transaction(mut transaction),
             }) => {
-                // Route and project the complete transaction before applying
-                // per-table snapshot starts. This keeps policy violations
-                // fail-closed even for an operation that predates one table's
-                // activation cursor.
-                let operations =
-                    scope.route_owned_operations(std::mem::take(&mut transaction.operations))?;
-                self.encode_started(&transaction, &position, operations, subscriptions)
+                let operations = started(
+                    scope.route_owned_operations(std::mem::take(&mut transaction.operations))?,
+                    &position,
+                );
+                Ok((!operations.is_empty()).then(|| (header(&transaction, &position), operations)))
             }
             PageRecord::Shared(record) => {
                 let CanonicalEntry::Transaction(transaction) = &record.entry else {
                     return Ok(None);
                 };
-                let operations = scope.route_operations(&transaction.operations)?;
-                self.encode_started(transaction, &record.position, operations, subscriptions)
+                let operations = started(
+                    scope.route_operations(&transaction.operations)?,
+                    &record.position,
+                );
+                Ok((!operations.is_empty())
+                    .then(|| (header(transaction, &record.position), operations)))
             }
             PageRecord::Owned(_) => Ok(None),
         }
-    }
-
-    fn encode_started(
-        &self,
-        transaction: &CanonicalTransaction,
-        position: &CursorPosition,
-        operations: Vec<CanonicalOperation>,
-        subscriptions: &BTreeMap<TableId, u64>,
-    ) -> Result<Option<EncodedTransaction>, ChangeBatchError> {
-        let operations = operations
-            .into_iter()
-            .filter(|operation| {
-                subscriptions
-                    .get(&operation.table_id)
-                    .is_some_and(|start| position.sequence > *start)
-            })
-            .collect();
-        encoded_transaction(
-            transaction,
-            position,
-            operations,
-            &self.authorization.cursor_codec,
-        )
     }
 
     fn decode(&self, cursor: &OpaqueCursor) -> Result<CursorPosition, ChangeBatchError> {
@@ -1255,6 +1540,17 @@ fn encoded_transaction(
     if operations.is_empty() {
         return Ok(None);
     }
+    encoded_fragments(
+        wire_transaction(transaction, cursor_codec.encode(position)),
+        operations,
+    )
+    .map(Some)
+}
+
+fn encoded_fragments(
+    header: TransactionFragment,
+    operations: Vec<CanonicalOperation>,
+) -> Result<EncodedTransaction, ChangeBatchError> {
     let operation_count =
         u64::try_from(operations.len()).map_err(|_| ChangeBatchError::CountOverflow)?;
     if operation_count > MAX_BATCH_OPERATIONS {
@@ -1264,16 +1560,31 @@ fn encoded_transaction(
         .into_iter()
         .map(wire_operation)
         .collect::<Result<Vec<_>, _>>()?;
-    let frames = transaction_frames(
-        wire_transaction(transaction, cursor_codec.encode(position)),
-        operations,
-    )?;
+    let frames = transaction_frames(header, operations)?;
     let encoded_bytes = frames.iter().map(|frame| frame.bytes.len()).sum();
-    Ok(Some(EncodedTransaction {
+    Ok(EncodedTransaction {
         frames,
         operation_count,
         encoded_bytes,
-    }))
+    })
+}
+
+/// The most bytes the frames of a folded transaction under `header` take,
+/// for operations of `operation_bytes` in all, none over `largest_operation`.
+/// Each fragment but the last is cut only where the next operation does not
+/// fit, so it holds more than its room less that operation.
+fn folded_frames_bound(
+    header: &TransactionFragment,
+    operation_bytes: usize,
+    operation_count: u64,
+    largest_operation: usize,
+) -> Result<usize, ChangeBatchError> {
+    let room = fragment_operation_budget(header)?;
+    let overhead = FRAME_LENGTH_PREFIX_BYTES + (MAX_FRAME_BYTES - room);
+    let filled = room.saturating_sub(largest_operation).max(1);
+    let fragments = (1 + operation_bytes / filled)
+        .min(usize::try_from(operation_count.max(1)).unwrap_or(usize::MAX));
+    Ok(operation_bytes.saturating_add(fragments.saturating_mul(overhead)))
 }
 
 /// The pending mutations of this request that `record` committed and the
@@ -1327,6 +1638,13 @@ impl BatchFrames {
         } else {
             self.own.extend_from_slice(&frame.bytes);
         }
+    }
+
+    /// Adds one frame of a transaction this batch alone carries.
+    fn push_shared(&mut self, frame: &SharedFrame) {
+        self.len += frame.bytes.len();
+        self.digest.push(&frame.body_sha256);
+        self.own.extend_from_slice(&frame.bytes);
     }
 
     /// Adds a transaction's frames, as the shared buffers themselves when
@@ -1701,6 +2019,9 @@ impl ChangeBatchError {
 
 #[cfg(test)]
 mod tests {
+    mod folded;
+    pub(crate) mod receiver;
+
     use super::*;
     use authz::{AuthorizationPolicy, PolicyDefinition, TablePermitDefinition};
     use canonical_log::{
@@ -2090,6 +2411,7 @@ mod tests {
             accept_transaction_fragmentation: true,
             accept_revocation_barrier: true,
             stream: false,
+            accept_compacted_batches: false,
             device_id: "device-1".to_owned(),
             pending_mutation_ids: BTreeSet::new(),
         }
@@ -2117,6 +2439,7 @@ mod tests {
             accept_transaction_fragmentation: true,
             accept_revocation_barrier: true,
             stream: false,
+            accept_compacted_batches: false,
             device_id: "device-1".to_owned(),
             pending_mutation_ids: BTreeSet::new(),
         }
@@ -2142,6 +2465,7 @@ mod tests {
             accept_revocation_barrier: true,
             plan_id: plan_id().to_string(),
             stream: false,
+            accept_compacted_batches: false,
         }
     }
 
@@ -2998,6 +3322,7 @@ mod tests {
             accept_transaction_fragmentation: true,
             accept_revocation_barrier: true,
             stream: false,
+            accept_compacted_batches: false,
             device_id: "device-1".to_owned(),
             pending_mutation_ids: BTreeSet::new(),
         };
@@ -3809,6 +4134,7 @@ mod tests {
             accept_transaction_fragmentation: true,
             accept_revocation_barrier: true,
             stream: false,
+            accept_compacted_batches: false,
             device_id: "device-1".to_owned(),
             pending_mutation_ids: BTreeSet::from([
                 MutationId::new("mutation-owned").unwrap(),

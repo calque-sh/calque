@@ -183,12 +183,26 @@ impl ChangeTail {
     /// tail is fresh and holds all of them: `from` is held or is the floor, and
     /// the fence and the ceiling are at or below the head. A ceiling caps the
     /// head the build sees. The pin stops at the most one build reads.
+    #[cfg(test)]
     pub(crate) fn view(
         &self,
         from: u64,
         fence: Option<u64>,
         ceiling: Option<u64>,
         now: Instant,
+    ) -> Option<TailView> {
+        self.view_within(from, fence, ceiling, now, MAX_SCAN_STORED_BYTES)
+    }
+
+    /// A view of at most `max_stored_bytes` of the tail's records, which a
+    /// folded build reads more of than another.
+    pub(crate) fn view_within(
+        &self,
+        from: u64,
+        fence: Option<u64>,
+        ceiling: Option<u64>,
+        now: Instant,
+        max_stored_bytes: u64,
     ) -> Option<TailView> {
         let state = read(&self.state);
         if !state.fresh(now) || from < state.floor || from > state.head {
@@ -210,7 +224,7 @@ impl ChangeTail {
                 break;
             }
             let next = stored_bytes.saturating_add(record.stored_bytes);
-            if next > MAX_SCAN_STORED_BYTES {
+            if next > max_stored_bytes {
                 break;
             }
             stored_bytes = next;
@@ -613,7 +627,7 @@ fn write<T>(lock: &StdRwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::{Condvar, Mutex};
 
     use canonical_log::{
@@ -638,10 +652,10 @@ mod tests {
     };
 
     const RECORD_BYTES: u64 = 100;
-    const NOW: i64 = 1_000_000;
+    pub(crate) const NOW: i64 = 1_000_000;
 
     /// A canonical log in memory, which can trim, fail, and hang.
-    struct FakeLog {
+    pub(crate) struct FakeLog {
         source_id: SourceId,
         source_epoch: SourceEpoch,
         state: Mutex<FakeState>,
@@ -784,7 +798,7 @@ mod tests {
     }
 
     /// The log as the follower's pool hands it out.
-    struct FakeReader(Arc<FakeLog>);
+    pub(crate) struct FakeReader(pub(crate) Arc<FakeLog>);
 
     impl PooledLogReader for FakeReader {
         fn is_closed(&self) -> bool {
@@ -857,15 +871,15 @@ mod tests {
     }
 
     /// Two tables, `tasks` and `projects`, under one policy.
-    struct Fixture {
-        prepared: PreparedLocalSource,
-        log: Arc<FakeLog>,
-        tasks: TableId,
-        projects: TableId,
+    pub(crate) struct Fixture {
+        pub(crate) prepared: PreparedLocalSource,
+        pub(crate) log: Arc<FakeLog>,
+        pub(crate) tasks: TableId,
+        pub(crate) projects: TableId,
     }
 
     impl Fixture {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let columns = || {
                 vec![
                     column(1, "id", 2_950, "uuid", false, Some(1)),
@@ -919,7 +933,7 @@ mod tests {
 
         /// A tail started on the empty log, then caught up with `records`
         /// commits alternating between the two tables and both.
-        fn followed(&self, budget_bytes: u64, records: u64) -> ChangeTail {
+        pub(crate) fn followed(&self, budget_bytes: u64, records: u64) -> ChangeTail {
             let tail = self.tail(budget_bytes);
             assert!(!tail.catch_up(&*self.log, Instant::now()).unwrap());
             for index in 0..records {
@@ -955,7 +969,11 @@ mod tests {
 
         /// A plan whose catch-up ends at `fence`.
         fn fenced_authorization(&self, tables: &[&TableId], fence: u64) -> ChangeAuthorization {
-            ChangeAuthorization::new(ScopedChangePlan {
+            ChangeAuthorization::new(self.fenced_plan(tables, fence)).unwrap()
+        }
+
+        pub(crate) fn fenced_plan(&self, tables: &[&TableId], fence: u64) -> ScopedChangePlan {
+            ScopedChangePlan {
                 plan_id: PlanId::new("plan-1").unwrap(),
                 activated_scope: ActivatedChangeScope::new(
                     self.log.source_id.clone(),
@@ -972,15 +990,14 @@ mod tests {
                     .collect(),
                 acknowledgeable_mutation_ids: Default::default(),
                 revocation_barrier: None,
-            })
-            .unwrap()
+            }
         }
 
         fn request(&self, from: u64, tables: &[&TableId], max_transactions: u32) -> Incoming {
             self.fenced_request(from, None, tables, max_transactions)
         }
 
-        fn fenced_request(
+        pub(crate) fn fenced_request(
             &self,
             from: u64,
             fence: Option<u64>,
@@ -1014,6 +1031,7 @@ mod tests {
                     accept_revocation_barrier: true,
                     plan_id: "plan-1".to_owned(),
                     stream: false,
+                    accept_compacted_batches: false,
                 })
                 .unwrap(),
             )
@@ -1058,10 +1076,10 @@ mod tests {
         }
     }
 
-    struct Incoming(IncomingChangeRequest);
+    pub(crate) struct Incoming(IncomingChangeRequest);
 
     impl Incoming {
-        fn request(&self) -> &ChangeBatchRequest {
+        pub(crate) fn request(&self) -> &ChangeBatchRequest {
             self.0.request()
         }
     }

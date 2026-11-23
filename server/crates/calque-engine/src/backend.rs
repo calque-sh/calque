@@ -259,6 +259,7 @@ struct LocalBackendInner {
     /// The decoder this composition plans for; see `bootstrap`.
     decoder_profile: String,
     stored_rows: bool,
+    compacted_catch_up: bool,
     metrics: OperationsMetrics,
     /// Set once `LocalMutationBackend` mounts. Until then the change stream
     /// resolves no acknowledgements and a poll carrying pending ids fails
@@ -324,6 +325,9 @@ pub struct LocalBackendConfig {
     /// Whether plans carry the key a page encrypts the working set it keeps
     /// between visits under. Without one, no page keeps it.
     pub stored_rows: bool,
+    /// Whether a fenced request that accepts compacted batches gets them.
+    /// Without it, every transaction is sent as committed.
+    pub compacted_catch_up: bool,
     pub memory: LocalMemoryPolicy,
     pub metrics: OperationsMetrics,
     /// How the application may retire the generation `prepared` was compiled
@@ -472,6 +476,7 @@ impl LocalBackend {
                 memory: config.memory,
                 decoder_profile: crate::columnar::direct_columnar_decoder_profile(),
                 stored_rows: config.stored_rows,
+                compacted_catch_up: config.compacted_catch_up,
                 metrics: config.metrics,
                 mutations: OnceLock::new(),
             }),

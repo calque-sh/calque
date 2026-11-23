@@ -732,6 +732,7 @@ impl Fixture {
             accept_revocation_barrier: true,
             plan_id: plan_id.to_owned(),
             stream: false,
+            accept_compacted_batches: false,
         })
         .unwrap()
     }
@@ -2289,6 +2290,7 @@ async fn a_write_committed_while_a_poll_reads_its_receipts_is_acknowledged_with_
             accept_revocation_barrier: true,
             plan_id: "plan-1".to_owned(),
             stream: false,
+            accept_compacted_batches: false,
         })
         .unwrap();
         let plan = || ScopedChangePlan {
@@ -2413,4 +2415,50 @@ async fn a_write_committed_while_a_poll_reads_its_receipts_is_acknowledged_with_
     // Through the tail and from the log, every poll ran to the echo, and the
     // batch carrying it acknowledged the write.
     assert_eq!(outcomes, [(true, 2, Some(true)), (false, 2, Some(true))]);
+}
+
+/// A folded build from the change tail is the client's own bytes, as a build
+/// from the log is, so it holds the plan's room while its batch lives. A
+/// build of the scope's shared encoding holds none.
+#[tokio::test]
+async fn a_folded_build_from_the_tail_holds_the_plans_room_while_its_batch_lives() {
+    let fixture = crate::tail::tests::Fixture::new();
+    let tail = fixture.followed(u64::MAX, 6);
+    let log = Arc::clone(&fixture.log);
+    let readers = Arc::new(LogReaders::new(1, move || {
+        Ok(crate::tail::tests::FakeReader(Arc::clone(&log)))
+    }));
+    let room = LogBatchRoom::new(LOG_BATCH_ROOM_BYTES);
+    let plan_room = PlanRoom::new();
+    let tables = [&fixture.tasks, &fixture.projects];
+    let (fixture, tail, readers, room, plan_room) = (&fixture, &tail, &readers, &room, &plan_room);
+    let build = move |compacted: bool| async move {
+        let mut request = fixture
+            .fenced_request(0, Some(6), &tables, 100)
+            .request()
+            .clone();
+        request.max_batch_bytes = sync_protocol::MAX_CHANGE_BATCH_BYTES as usize;
+        request.accept_compacted_batches = compacted;
+        build_change_batch(
+            ChangeReads {
+                activated: &fixture.prepared.activated,
+                tail: Some(tail),
+                readers,
+                room,
+            },
+            fixture.fenced_plan(&tables, 6),
+            None::<std::future::Ready<Result<ResolvedMutationAcknowledgements, ChangeBatchError>>>,
+            request,
+            crate::tail::tests::NOW,
+            None,
+            plan_room,
+            &mut None,
+        )
+        .await
+    };
+    let held = build(true).await.unwrap().expect("the plan's room is free");
+    assert!(build(true).await.unwrap().is_none());
+    assert!(build(false).await.unwrap().is_some());
+    drop(held);
+    assert!(build(true).await.unwrap().is_some());
 }

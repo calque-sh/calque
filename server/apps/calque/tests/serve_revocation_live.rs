@@ -688,6 +688,7 @@ fn live_request(plan: &Plan, from: &str, wait: Duration) -> change::ChangeReques
         accept_revocation_barrier: true,
         plan_id: plan.plan_id.clone(),
         stream: false,
+        accept_compacted_batches: false,
     }
 }
 

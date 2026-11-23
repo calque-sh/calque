@@ -120,6 +120,7 @@ fn change_requests() -> Vec<u8> {
             device_id: "device-1".into(),
             pending_mutation_ids: Vec::new(),
             stream: false,
+            accept_compacted_batches: false,
         },
     );
     append_frame(
@@ -149,6 +150,7 @@ fn change_requests() -> Vec<u8> {
             device_id: "device-1".into(),
             pending_mutation_ids: vec!["mutation-1".into(), "mutation-2".into()],
             stream: false,
+            accept_compacted_batches: false,
         },
     );
     append_frame(
@@ -172,6 +174,7 @@ fn change_requests() -> Vec<u8> {
             device_id: "device-1".into(),
             pending_mutation_ids: Vec::new(),
             stream: true,
+            accept_compacted_batches: false,
         },
     );
     bytes
@@ -200,6 +203,7 @@ fn limit_change_request(authorization_token_bytes: usize) -> ChangeRequest {
         accept_transaction_fragmentation: true,
         accept_revocation_barrier: true,
         stream: false,
+        accept_compacted_batches: false,
         plan_id: "p".repeat(512),
         device_id: "d".repeat(1_024),
         pending_mutation_ids: (0..256).map(|index| format!("m{index}")).collect(),

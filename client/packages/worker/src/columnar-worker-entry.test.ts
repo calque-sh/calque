@@ -154,6 +154,37 @@ function deleteOperation(id: string): change.Operation {
   });
 }
 
+/** One `INSERT INTO users …` as the change stream spells it. */
+function insertOperation(user: (typeof USERS)[number]): change.Operation {
+  const table = WORKSPACE_CONTRACT.tables.find(
+    (candidate) => candidate.name === "users",
+  );
+  if (!table) throw new Error("the fixture has no users table");
+  const cell = (value: string | boolean) =>
+    create(change.CellValueSchema, {
+      kind:
+        typeof value === "boolean"
+          ? { case: "boolValue", value }
+          : { case: "textValue", value },
+    });
+  return create(change.OperationSchema, {
+    tableId: "public.users",
+    kind: change.OperationKind.INSERT_FULL_ROW,
+    primaryKey: renameOperation(user.id, "unused").primaryKey,
+    payload: {
+      case: "insert",
+      value: create(change.FullRowSchema, {
+        columns: table.columns.map((column, ordinal) =>
+          create(change.ColumnValueSchema, {
+            columnId: ordinal + 1,
+            value: cell(user[column.name as keyof typeof user]),
+          }),
+        ),
+      }),
+    },
+  });
+}
+
 /** The `mutate` request's bytes: one canonical encoded `Operation`. */
 function operationBytes(operation: change.Operation): Uint8Array {
   return toBinary(change.OperationSchema, operation);
@@ -380,5 +411,28 @@ describe("the engine worker routes mutate and drop through the mount", () => {
       "cursor-4",
     );
     expect((await userRow("user-1"))?.[1]).toBe("User 1, renewed");
+  });
+
+  test("a folded batch that deletes a row and inserts it again leaves the insert", async () => {
+    const user = USERS[1];
+    if (!user) throw new Error("the fixture has no second user");
+    const folded = await changeBatch(
+      { ...CONTRACT, planId: "plan-renewed" },
+      "cursor-4",
+      "cursor-5",
+      [
+        deleteOperation(user.id),
+        insertOperation({ ...user, display_name: "User 1, again" }),
+      ],
+      [],
+    );
+    const applied = await ask<"change">({
+      type: "change",
+      batches: [folded],
+      planId: "plan-renewed",
+    });
+    expect(applied.transactionCount).toBe(1);
+    expect(applied.operationCount).toBe(2);
+    expect((await userRow(user.id))?.[1]).toBe("User 1, again");
   });
 });

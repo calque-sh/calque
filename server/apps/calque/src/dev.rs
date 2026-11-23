@@ -489,8 +489,9 @@ impl GenerationSource for DevSource {
             max_active_plans: command.max_active_plans,
             max_open_streams: self.connections.max_open_streams,
             change_tail_bytes: command.change_tail_bytes,
-            max_change_batch_bytes: 8 * 1024 * 1024,
+            max_change_batch_bytes: 16 * 1024 * 1024,
             stored_rows: !command.no_stored_rows,
+            compacted_catch_up: !command.no_compacted_catch_up,
             memory: dev_memory_policy(),
             metrics: metrics.clone(),
             // One shared bearer is one principal: there is nothing to narrow
@@ -849,7 +850,7 @@ fn dev_memory_policy() -> LocalMemoryPolicy {
     LocalMemoryPolicy {
         active_artifact_capacity_bytes: LOCAL_ACTIVE_ARTIFACT_CAPACITY_BYTES,
         staging_overlap_bytes: LOCAL_ACTIVE_ARTIFACT_CAPACITY_BYTES,
-        catch_up_buffer_bytes: 16 * 1024 * 1024,
+        catch_up_buffer_bytes: 32 * 1024 * 1024,
         query_result_reserve_bytes: calque_engine::LOCAL_QUERY_RESULT_RESERVE_BYTES,
     }
 }
@@ -1309,6 +1310,7 @@ mod tests {
             max_open_streams: calque_engine::DEFAULT_MAX_OPEN_STREAMS,
             change_tail_bytes: calque_engine::DEFAULT_CHANGE_TAIL_BYTES,
             no_stored_rows: false,
+            no_compacted_catch_up: false,
             recut: crate::cli::RecutOptions::default(),
             tenant_column: None,
             tenant: None,

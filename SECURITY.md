@@ -4,8 +4,8 @@ Report a vulnerability through GitHub's private vulnerability reporting: open
 this repository's **Security** tab and choose **Report a vulnerability**.
 Please do not open a public issue for a security problem.
 
-Calque is pre-alpha. There is no release and no supported version yet, and a
-fix lands on `main` only.
+Calque is alpha. A fix lands on `main` and ships in the next release; no
+earlier release is patched.
 
 ## In scope
 

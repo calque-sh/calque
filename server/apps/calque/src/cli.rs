@@ -179,6 +179,11 @@ pub struct ServeCommand {
     /// key to encrypt a stored copy under, so every visit downloads it.
     #[arg(long)]
     pub no_stored_rows: bool,
+    /// Sends a first visit's catch-up as committed, each transaction whole,
+    /// instead of folding each batch's transactions into one that changes
+    /// each row once.
+    #[arg(long)]
+    pub no_compacted_catch_up: bool,
     #[command(flatten)]
     pub recut: RecutOptions,
     #[command(flatten)]
@@ -300,6 +305,11 @@ pub struct DevCommand {
     /// key to encrypt a stored copy under, so every visit downloads it.
     #[arg(long)]
     pub no_stored_rows: bool,
+    /// Sends a first visit's catch-up as committed, each transaction whole,
+    /// instead of folding each batch's transactions into one that changes
+    /// each row once.
+    #[arg(long)]
+    pub no_compacted_catch_up: bool,
     #[command(flatten)]
     pub recut: RecutOptions,
     /// Partitions the scope by this column, as `calque init --tenant-column`
@@ -719,6 +729,8 @@ mod tests {
         );
         assert!(!default.no_stored_rows);
         assert!(serve(&["--no-stored-rows"]).no_stored_rows);
+        assert!(!default.no_compacted_catch_up);
+        assert!(serve(&["--no-compacted-catch-up"]).no_compacted_catch_up);
         assert_eq!(default.expected_host, None);
         assert_eq!(default.port, 8787);
 

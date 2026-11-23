@@ -219,6 +219,41 @@ back to back and ends after the batch that reaches the fence.
   every batch until the response ends, which turns the stream's latency into
   its lifetime.
 
+## Compacted catch-up batches
+
+A fenced `ChangeRequest` that sets `accept_compacted_batches` lets each batch
+of its catch-up fold the transactions it covers into one. The server refuses
+the field as invalid (422, `REQUEST_INVALID`) on a request without
+`through_cursor_inclusive` or without `accept_transaction_fragmentation`, so
+a live request cannot ask: there, each transaction is its own realtime event.
+
+- A folded batch carries one transaction, sent as fragments, that changes each
+  row once, as the batch's end leaves it. The key's first operation in the
+  batch says whether the row stood before it:
+
+  | the batch                       | sends                                                            |
+  | ------------------------------- | ---------------------------------------------------------------- |
+  | inserts a row                   | `INSERT_FULL_ROW` of its last values                             |
+  | inserts and deletes it          | nothing                                                          |
+  | updates a row that stood        | one `UPDATE_PATCH` of every column changed, later values winning |
+  | deletes a row that stood        | `DELETE_BY_KEY`                                                  |
+  | deletes it and inserts it again | `DELETE_BY_KEY`, then `INSERT_FULL_ROW`                          |
+
+  Rows are sent in the order the batch first changes them.
+
+- The transaction's id, cursor and PostgreSQL provenance are those of the last
+  transaction the batch covers. `BatchEnd.through_cursor_inclusive` is that
+  cursor or a later one, and `acknowledged_mutation_ids` names every pending
+  mutation any covered transaction committed.
+- A TRUNCATE, or an update that moves a row's primary key, is never folded. A
+  batch ends its fold before such a transaction, and one that comes first is
+  sent as committed, alone in its batch.
+- A batch whose operations no receiver could apply in that order, such as a
+  second insert of a row the batch inserted, is sent as committed, so the
+  receiver refuses it exactly as it would without folding.
+- A server that does not know the field, or whose operator turned folding off,
+  sends every transaction as committed; a receiver applies both the same way.
+
 ## Revocation barrier
 
 `ChangeStreamFrame.revocation_barrier` (field 15) delivers an authorization

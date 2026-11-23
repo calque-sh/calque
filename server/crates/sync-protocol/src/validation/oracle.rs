@@ -276,6 +276,16 @@ pub fn validate_change_request(request: &ChangeRequest) -> Result<(), ProtocolVa
             "requires a non-zero longPollTimeoutMs",
         ));
     }
+    // Only a fenced catch-up has transactions to fold, and a folded
+    // transaction is as large as the rows it changes.
+    if request.accept_compacted_batches
+        && (request.through_cursor_inclusive.is_none() || !request.accept_transaction_fragmentation)
+    {
+        return Err(fail(
+            "changeRequest.acceptCompactedBatches",
+            "requires throughCursorInclusive and acceptTransactionFragmentation",
+        ));
+    }
     require_client_identifier(
         &request.client_instance_id,
         MAX_CLIENT_INSTANCE_ID_BYTES,
